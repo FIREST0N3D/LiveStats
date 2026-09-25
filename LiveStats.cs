@@ -10,7 +10,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStats", "FiREST0N3D", "1.9.816")]
+    [Info("LiveStats", "FiREST0N3D", "1.9.818")]
     [Description("Comprehensive player/NPC/animal stats, killfeed + optional idle kick. Dual wipe detection. Kill streak tracking (players/NPCs/animals) + isPlayerDead. Optional LiveStatsWorld extension for time/weather. CONFLICTS: none by default; idle kick is opt-in. Pair with LiveStatsWorld/LiveStatsEvents as a suite.")]
     class LiveStats : RustPlugin
     {
@@ -23,16 +23,17 @@ namespace Oxide.Plugins
         private Dictionary<string, int> environmentalDeaths = new Dictionary<string, int>();
         private readonly Dictionary<string, DateTime> loginTimes = new Dictionary<string, DateTime>(256);   // last bank point (for crash-safe incremental saves)
         private readonly Dictionary<string, DateTime> sessionStarts = new Dictionary<string, DateTime>(256); // true start of current continuous session
-        private readonly HashSet<ulong> processedDeaths = new HashSet<ulong>();
+        // Dedupe keyed by netId + prefab + time so recycled netIds do not suppress a later real death
+        private readonly Dictionary<ulong, DeathDedupeRecord> processedDeaths = new Dictionary<ulong, DeathDedupeRecord>(64);
         // Prevents NPCs from being awarded multiple kills for the same victim death
-        // (guards against rare double OnEntityDeath firings that slip past the main dedupe window)
-        private readonly HashSet<ulong> processedNpcKills = new HashSet<ulong>();
-        private readonly Dictionary<ulong, string> lastEnvironmentalCause = new Dictionary<ulong, string>();
-        private readonly Dictionary<ulong, string> lastNpcAttacker = new Dictionary<ulong, string>();
-        private readonly Dictionary<ulong, string> lastPlayerAttacker = new Dictionary<ulong, string>(); // display name
-        private readonly Dictionary<ulong, string> lastPlayerAttackerId = new Dictionary<ulong, string>(); // Steam UserIDString
-        // Last animal that damaged this entity (fallback when HitInfo.Initiator is null at death)
-        private readonly Dictionary<ulong, string> lastAnimalAttacker = new Dictionary<ulong, string>();
+        private readonly Dictionary<ulong, DeathDedupeRecord> processedNpcKills = new Dictionary<ulong, DeathDedupeRecord>(64);
+
+        // Last-attacker / last-cause fallbacks: value + timestamp so stale recycled-netId data is ignored
+        private readonly Dictionary<ulong, DamageTrackEntry> lastEnvironmentalCause = new Dictionary<ulong, DamageTrackEntry>();
+        private readonly Dictionary<ulong, DamageTrackEntry> lastNpcAttacker = new Dictionary<ulong, DamageTrackEntry>();
+        private readonly Dictionary<ulong, DamageTrackEntry> lastPlayerAttacker = new Dictionary<ulong, DamageTrackEntry>(); // display name
+        private readonly Dictionary<ulong, DamageTrackEntry> lastPlayerAttackerId = new Dictionary<ulong, DamageTrackEntry>(); // Steam UserIDString
+        private readonly Dictionary<ulong, DamageTrackEntry> lastAnimalAttacker = new Dictionary<ulong, DamageTrackEntry>();
 
         // Idle / AFK tracking
         private readonly Dictionary<string, float> lastActivity = new Dictionary<string, float>(256);
@@ -40,8 +41,23 @@ namespace Oxide.Plugins
 
         // Cap + prune for damage-tracking dicts (written on every hit; removed mainly on death)
         private const int MaxDamageTrackEntries = 512;
+        // Long enough for bleed-out / croc-drag deaths; prefab mismatch still rejects recycled netIds.
+        private const float DamageTrackFreshnessSeconds = 120f;
         private readonly List<ulong> _damageTrackPruneBuffer = new List<ulong>(64);
         private float _lastDamageTrackPrune = -999f;
+
+        private struct DeathDedupeRecord
+        {
+            public string Prefab;
+            public float Time;
+        }
+
+        private struct DamageTrackEntry
+        {
+            public string Value;
+            public string Prefab; // victim prefab at write time — rejects recycled netIds
+            public float Time;
+        }
 
         private ConfigData config;
 
@@ -69,6 +85,9 @@ namespace Oxide.Plugins
         {
             public string Identity = "";
             public string LastWipeDetected = "";
+            public string Seed = "";
+            public string WorldSize = "";
+            public string Level = "";
         }
 
         class PlayerStats
@@ -253,9 +272,16 @@ namespace Oxide.Plugins
                 { "goat", "Goat" },
                 { "kid", "Goat" },
                 { "babygoat", "Goat" },
-                // AUX01 critters merged from livestock branch (Sep 2026)
+                { "heifer", "Cow" },
+                { "steer", "Cow" },
+                { "ox", "Cow" },
+                { "wildcow", "Cow" },
+                { "wild_cow", "Cow" },
+                { "wether", "Sheep" },
+                // AUX01 critters + marine (Sep 2026 livestock / staging)
                 { "rabbit", "Rabbit" },
                 { "bunny", "Rabbit" },
+                { "hare", "Rabbit" },
                 { "squirrel", "Squirrel" },
                 { "frog", "Frog" },
                 { "toad", "Frog" },
@@ -266,6 +292,11 @@ namespace Oxide.Plugins
                 { "jelly", "Jellyfish" },
                 { "seagull", "Seagull" },
                 { "gull", "Seagull" },
+                { "crab", "Crab" },
+                { "crabs", "Crab" },
+                { "crabswarm", "Crab" },
+                { "crab_swarm", "Crab" },
+                { "foal", "Horse" },
                 { "snake", "Snake" },
                 { "shark", "Shark" },
                 { "simpleshark", "Shark" },
@@ -320,7 +351,7 @@ namespace Oxide.Plugins
             LoadDefaultMessages();
             LogLanguagePackInventory();
 
-            Puts("LiveStats v1.9.816 loaded (critters: rabbit/squirrel/frog/turtle + livestock)");
+            Puts("LiveStats v1.9.818 loaded (livestock + critters + crab swarm; last-hit/dedupe from 1.9.817)");
             LoadWipeIdentity();
             LoadStats();
             LoadNpcStats();
@@ -526,7 +557,7 @@ namespace Oxide.Plugins
             string[] animals = {
                 "Bear", "Polar Bear", "Wolf", "Boar", "Chicken", "Deer", "Horse",
                 "Cow", "Bull", "Calf", "Sheep", "Lamb", "Goat",
-                "Rabbit", "Squirrel", "Frog", "Sea Turtle", "Jellyfish", "Seagull",
+                "Rabbit", "Squirrel", "Frog", "Sea Turtle", "Jellyfish", "Seagull", "Crab",
                 "Snake", "Shark", "Crocodile", "Panther", "Tiger", "Bees", "Bee Hive"
             };
 
@@ -1059,35 +1090,48 @@ namespace Oxide.Plugins
         }
 
         /// <summary>
+        /// Single source of truth for playtime banking.
+        /// Advances loginTimes when persistBankPoint is true (periodic/crash-safe).
+        /// Never touches sessionStarts except when removeSession is true (disconnect).
+        /// </summary>
+        private int BankMinutes(string id, DateTime now, bool persistBankPoint, bool removeSession)
+        {
+            if (string.IsNullOrEmpty(id)) return 0;
+
+            int minutes = 0;
+            if (loginTimes.TryGetValue(id, out DateTime lastBank))
+            {
+                if (now < lastBank)
+                    now = lastBank; // clock skew / timezone jump — do not subtract
+                minutes = (int)(now - lastBank).TotalMinutes;
+                if (minutes > 0)
+                {
+                    if (!playerStats.TryGetValue(id, out var stats))
+                        stats = playerStats[id] = new PlayerStats();
+                    stats.totalMinutesPlayed += minutes;
+                    stats.lastSeen = now;
+                    SaveStats();
+                }
+                if (persistBankPoint && !removeSession)
+                    loginTimes[id] = now;
+            }
+
+            if (removeSession)
+            {
+                loginTimes.Remove(id);
+                sessionStarts.Remove(id);
+            }
+
+            return minutes;
+        }
+
+        /// <summary>
         /// Bank the remaining unbanked minutes for a single player into totalMinutesPlayed.
         /// Called on disconnect. Removes both banking point and true session start.
         /// </summary>
         private void SavePlayerTime(string id)
         {
-            if (string.IsNullOrEmpty(id)) return;
-
-            DateTime now = DateTime.UtcNow;
-            bool updated = false;
-
-            // Bank remaining time since last bank point
-            if (loginTimes.TryGetValue(id, out DateTime loginTime))
-            {
-                int sessionMinutes = (int)(now - loginTime).TotalMinutes;
-                if (sessionMinutes > 0)
-                {
-                    if (!playerStats.TryGetValue(id, out var stats))
-                        stats = playerStats[id] = new PlayerStats();
-                    stats.totalMinutesPlayed += sessionMinutes;
-                    stats.lastSeen = now;
-                    updated = true;
-                }
-            }
-
-            if (updated) SaveStats();
-
-            // Cleanup both dictionaries
-            loginTimes.Remove(id);
-            sessionStarts.Remove(id);
+            BankMinutes(id, DateTime.UtcNow, persistBankPoint: false, removeSession: true);
         }
 
         /// <summary>
@@ -1099,26 +1143,8 @@ namespace Oxide.Plugins
         private void SaveAllPlayerTimes()
         {
             DateTime now = DateTime.UtcNow;
-            bool any = false;
-
-            foreach (var kvp in new List<KeyValuePair<string, DateTime>>(loginTimes))
-            {
-                string id = kvp.Key;
-                DateTime lastBankTime = kvp.Value;
-                if (!playerStats.TryGetValue(id, out var stats))
-                    stats = playerStats[id] = new PlayerStats();
-
-                int sessionMinutes = (int)(now - lastBankTime).TotalMinutes;
-                if (sessionMinutes > 0)
-                {
-                    stats.totalMinutesPlayed += sessionMinutes;
-                    loginTimes[id] = now;   // only reset the banking point
-                    stats.lastSeen = now;
-                    any = true;
-                }
-            }
-
-            if (any) SaveStats();
+            foreach (var id in new List<string>(loginTimes.Keys))
+                BankMinutes(id, now, persistBankPoint: true, removeSession: false);
         }
 
         // ==================== IDLE / AFK KICK ====================
@@ -1155,6 +1181,7 @@ namespace Oxide.Plugins
             {
                 if (player == null || !player.userID.IsSteamId()) continue;
                 if (player.IsSleeping()) continue; // intentional sleepers are left alone
+                if (player.IsDead() || player.IsWounded()) continue; // death/wounded screens are not AFK
                 if (permission.UserHasPermission(player.UserIDString, config.IdleBypassPermission)) continue;
 
                 string id = player.UserIDString;
@@ -1260,7 +1287,10 @@ namespace Oxide.Plugins
                 Interface.Oxide.DataFileSystem.WriteObject(WipeDataFile, new WipeIdentity
                 {
                     Identity = identity,
-                    LastWipeDetected = wipeTime.ToString("o")
+                    LastWipeDetected = wipeTime.ToString("o"),
+                    Seed = ConVar.Server.seed.ToString(),
+                    WorldSize = ConVar.Server.worldsize.ToString(),
+                    Level = ConVar.Server.level ?? ""
                 });
                 _lastMapIdentity = identity;
             }
@@ -1344,15 +1374,16 @@ namespace Oxide.Plugins
             // Ignore buildings, deployables, barrels, corpses — only players / NPCs / animals are scored.
             if (!IsStatsRelevantVictim(entity)) return null;
             ulong netId = entity.net.ID.Value;
+            string victimPrefab = entity.ShortPrefabName ?? "";
 
-            if (info.damageTypes.Has(Rust.DamageType.Hunger)) lastEnvironmentalCause[netId] = "Starvation";
-            else if (info.damageTypes.Has(Rust.DamageType.Thirst)) lastEnvironmentalCause[netId] = "Dehydration";
-            else if (info.damageTypes.Has(Rust.DamageType.Cold)) lastEnvironmentalCause[netId] = "Freezing";
-            else if (info.damageTypes.Has(Rust.DamageType.Radiation)) lastEnvironmentalCause[netId] = "Radiation Poisoning";
-            else if (info.damageTypes.Has(Rust.DamageType.Heat)) lastEnvironmentalCause[netId] = "Heat";
-            else if (info.damageTypes.Has(Rust.DamageType.Drowned)) lastEnvironmentalCause[netId] = "Drowning";
-            else if (info.damageTypes.Has(Rust.DamageType.Poison)) lastEnvironmentalCause[netId] = "Poison";
-            else if (info.damageTypes.Has(Rust.DamageType.Fall)) lastEnvironmentalCause[netId] = "Fall Damage";
+            if (info.damageTypes.Has(Rust.DamageType.Hunger)) SetDamageTrack(lastEnvironmentalCause, netId, "Starvation", victimPrefab);
+            else if (info.damageTypes.Has(Rust.DamageType.Thirst)) SetDamageTrack(lastEnvironmentalCause, netId, "Dehydration", victimPrefab);
+            else if (info.damageTypes.Has(Rust.DamageType.Cold)) SetDamageTrack(lastEnvironmentalCause, netId, "Freezing", victimPrefab);
+            else if (info.damageTypes.Has(Rust.DamageType.Radiation)) SetDamageTrack(lastEnvironmentalCause, netId, "Radiation Poisoning", victimPrefab);
+            else if (info.damageTypes.Has(Rust.DamageType.Heat)) SetDamageTrack(lastEnvironmentalCause, netId, "Heat", victimPrefab);
+            else if (info.damageTypes.Has(Rust.DamageType.Drowned)) SetDamageTrack(lastEnvironmentalCause, netId, "Drowning", victimPrefab);
+            else if (info.damageTypes.Has(Rust.DamageType.Poison)) SetDamageTrack(lastEnvironmentalCause, netId, "Poison", victimPrefab);
+            else if (info.damageTypes.Has(Rust.DamageType.Fall)) SetDamageTrack(lastEnvironmentalCause, netId, "Fall Damage", victimPrefab);
 
             // Exclusive last-attacker: only the most recent damager type is kept so NPC,
             // animal, and player attribution stay consistent (true last-hit wins).
@@ -1361,17 +1392,16 @@ namespace Oxide.Plugins
             if (info.InitiatorPlayer != null && info.InitiatorPlayer.userID.IsSteamId()
                 && !IsSamePlayer(entity, info.InitiatorPlayer))
             {
-                lastPlayerAttacker[netId] = info.InitiatorPlayer.displayName;
-                lastPlayerAttackerId[netId] = info.InitiatorPlayer.UserIDString;
+                SetDamageTrack(lastPlayerAttacker, netId, info.InitiatorPlayer.displayName, victimPrefab);
+                SetDamageTrack(lastPlayerAttackerId, netId, info.InitiatorPlayer.UserIDString, victimPrefab);
                 lastNpcAttacker.Remove(netId);
                 lastAnimalAttacker.Remove(netId);
             }
             else if (info.Initiator != null)
             {
-                string initShort = info.Initiator.ShortPrefabName.ToLowerInvariant();
-                if (initShort.Contains("scientist") || initShort.Contains("ch47scientists") || initShort.Contains("npc") || initShort.Contains("raid") || initShort.Contains("bandit") || initShort.Contains("sentry") || initShort.Contains("cargo") || initShort.Contains("bradley") || initShort.Contains("tunneldweller"))
+                if (IsNpcCombatant(info.Initiator))
                 {
-                    lastNpcAttacker[netId] = GetKillerName(info.Initiator);
+                    SetDamageTrack(lastNpcAttacker, netId, GetKillerName(info.Initiator), victimPrefab);
                     lastPlayerAttacker.Remove(netId);
                     lastPlayerAttackerId.Remove(netId);
                     lastAnimalAttacker.Remove(netId);
@@ -1380,7 +1410,7 @@ namespace Oxide.Plugins
                 {
                     // Same pattern as NPCs — covers crocodile drag/bite and other cases
                     // where HitInfo.Initiator is null on the killing blow.
-                    lastAnimalAttacker[netId] = GetKillerName(info.Initiator);
+                    SetDamageTrack(lastAnimalAttacker, netId, GetKillerName(info.Initiator), victimPrefab);
                     lastPlayerAttacker.Remove(netId);
                     lastPlayerAttackerId.Remove(netId);
                     lastNpcAttacker.Remove(netId);
@@ -1417,21 +1447,97 @@ namespace Oxide.Plugins
             PruneDamageDict(lastAnimalAttacker);
         }
 
-        private void PruneDamageDict(Dictionary<ulong, string> dict)
+        private void SetDamageTrack(Dictionary<ulong, DamageTrackEntry> dict, ulong netId, string value, string victimPrefab)
+        {
+            if (dict == null || string.IsNullOrEmpty(value)) return;
+            dict[netId] = new DamageTrackEntry
+            {
+                Value = value,
+                Prefab = victimPrefab ?? "",
+                Time = Time.realtimeSinceStartup
+            };
+        }
+
+        /// <summary>
+        /// Returns a last-hit fallback only if it is still fresh and belongs to the same victim
+        /// prefab. Recycled netIds (different prefab) and expired bleed-out windows are dropped.
+        /// </summary>
+        private bool TryGetFreshTrack(Dictionary<ulong, DamageTrackEntry> dict, ulong netId, string victimPrefab, out string value)
+        {
+            value = null;
+            if (dict == null) return false;
+            if (!dict.TryGetValue(netId, out var entry) || string.IsNullOrEmpty(entry.Value))
+                return false;
+            if (Time.realtimeSinceStartup - entry.Time > DamageTrackFreshnessSeconds)
+            {
+                dict.Remove(netId);
+                return false;
+            }
+            if (!string.IsNullOrEmpty(entry.Prefab) && !string.IsNullOrEmpty(victimPrefab)
+                && !string.Equals(entry.Prefab, victimPrefab, StringComparison.OrdinalIgnoreCase))
+            {
+                dict.Remove(netId);
+                return false;
+            }
+            value = entry.Value;
+            return true;
+        }
+
+        private bool IsDuplicateDeath(Dictionary<ulong, DeathDedupeRecord> store, ulong netId, string prefab)
+        {
+            if (store == null) return false;
+            if (!store.TryGetValue(netId, out var rec)) return false;
+            float window = config != null ? Mathf.Max(0.5f, config.DeathDedupeWindow) : 3f;
+            if (Time.realtimeSinceStartup - rec.Time > window)
+            {
+                store.Remove(netId);
+                return false;
+            }
+            // Recycled netId for a different entity is a new death, not a duplicate
+            if (!string.IsNullOrEmpty(rec.Prefab) && !string.IsNullOrEmpty(prefab)
+                && !string.Equals(rec.Prefab, prefab, StringComparison.OrdinalIgnoreCase))
+                return false;
+            return true;
+        }
+
+        private void MarkProcessedDeath(Dictionary<ulong, DeathDedupeRecord> store, ulong netId, string prefab)
+        {
+            if (store == null) return;
+            store[netId] = new DeathDedupeRecord
+            {
+                Prefab = prefab ?? "",
+                Time = Time.realtimeSinceStartup
+            };
+            float window = config != null ? Mathf.Max(0.5f, config.DeathDedupeWindow) : 3f;
+            timer.Once(window, () =>
+            {
+                if (store.TryGetValue(netId, out var rec)
+                    && string.Equals(rec.Prefab, prefab ?? "", StringComparison.OrdinalIgnoreCase))
+                    store.Remove(netId);
+            });
+        }
+
+        private void PruneDamageDict(Dictionary<ulong, DamageTrackEntry> dict)
         {
             if (dict == null || dict.Count == 0) return;
+            float now = Time.realtimeSinceStartup;
             _damageTrackPruneBuffer.Clear();
-            foreach (var id in dict.Keys)
+            foreach (var kvp in dict)
             {
+                if (now - kvp.Value.Time > DamageTrackFreshnessSeconds)
+                {
+                    _damageTrackPruneBuffer.Add(kvp.Key);
+                    continue;
+                }
                 try
                 {
-                    var ent = BaseNetworkable.serverEntities.Find(new NetworkableId(id));
+                    var ent = BaseNetworkable.serverEntities.Find(new NetworkableId(kvp.Key));
                     if (ent == null || ent.IsDestroyed)
-                        _damageTrackPruneBuffer.Add(id);
+                        _damageTrackPruneBuffer.Add(kvp.Key);
                 }
                 catch
                 {
-                    _damageTrackPruneBuffer.Add(id);
+                    _damageTrackPruneBuffer.Add(kvp.Key);
                 }
             }
             for (int i = 0; i < _damageTrackPruneBuffer.Count; i++)
@@ -1467,9 +1573,8 @@ namespace Oxide.Plugins
             if (ShouldIgnoreDeath(entity, shortName, info, netId))
                 return null;
 
-            if (processedDeaths.Contains(netId)) return null;
-            processedDeaths.Add(netId);
-            timer.Once(config.DeathDedupeWindow, () => processedDeaths.Remove(netId));
+            if (IsDuplicateDeath(processedDeaths, netId, shortName)) return null;
+            MarkProcessedDeath(processedDeaths, netId, shortName);
 
             var classification = ClassifyDeath(entity, shortName, info);
 
@@ -1569,15 +1674,7 @@ namespace Oxide.Plugins
             bool isNpcEntity = false;
 
             if (!isRealPlayer && !isAnimal)
-            {
-                if (shortName.Contains("scientist") || shortName.Contains("ch47scientists") || shortName.Contains("npc") ||
-                    shortName.Contains("raid") || shortName.Contains("bandit") || shortName.Contains("sentry") ||
-                    shortName.Contains("cargo") || shortName.Contains("turret") || shortName.Contains("tunneldweller") ||
-                    entity.net.ID.Value.ToString().StartsWith("534922"))
-                {
-                    isNpcEntity = true;
-                }
-            }
+                isNpcEntity = IsNpcCombatant(entity, shortName);
 
             bool killerIsRealPlayer = killerPlayer != null && killerPlayer.userID.IsSteamId();
 
@@ -1633,10 +1730,7 @@ namespace Oxide.Plugins
             // and blocked the player's animalsKilled credit.
             if (initiator != null && initiator != entity)
             {
-                string initShort = initiator.ShortPrefabName.ToLowerInvariant();
-                if (initShort.Contains("scientist") || initShort.Contains("ch47scientists") || initShort.Contains("npc") ||
-                    initShort.Contains("raid") || initShort.Contains("bandit") || initShort.Contains("sentry") ||
-                    initShort.Contains("cargo") || initShort.Contains("bradley") || initShort.Contains("tunneldweller"))
+                if (IsNpcCombatant(initiator))
                 {
                     npcKillerTypeKey = GetKillerName(initiator);
                     killerNameRaw = npcKillerTypeKey;
@@ -1648,7 +1742,7 @@ namespace Oxide.Plugins
                 }
             }
 
-            if (lastEnvironmentalCause.TryGetValue(netId, out var lastCause))
+            if (TryGetFreshTrack(lastEnvironmentalCause, netId, shortName, out var lastCause))
             {
                 cause = lastCause;
                 lastEnvironmentalCause.Remove(netId);
@@ -1656,10 +1750,11 @@ namespace Oxide.Plugins
                 // animal/NPC/player initiator (e.g. drowning while being dragged by a croc).
             }
 
-            // Fallbacks when HitInfo.Initiator was null at death (exclusive last-attacker
-            // means at most one of these dicts will have an entry).
+            // Fallbacks when HitInfo.Initiator was null at death. Only accept fresh entries
+            // (written in the last DamageTrackFreshnessSeconds) so recycled netIds cannot
+            // attach a previous victim's attacker to this death.
             if ((killerNameRaw == "Environment" || string.IsNullOrEmpty(killerNameRaw)) &&
-                lastNpcAttacker.TryGetValue(netId, out var lastNpc))
+                TryGetFreshTrack(lastNpcAttacker, netId, shortName, out var lastNpc))
             {
                 killerNameRaw = lastNpc;
                 npcKillerTypeKey = lastNpc;
@@ -1667,7 +1762,7 @@ namespace Oxide.Plugins
             }
 
             if ((killerNameRaw == "Environment" || string.IsNullOrEmpty(killerNameRaw)) &&
-                lastAnimalAttacker.TryGetValue(netId, out var lastAnimal) &&
+                TryGetFreshTrack(lastAnimalAttacker, netId, shortName, out var lastAnimal) &&
                 !string.IsNullOrEmpty(lastAnimal))
             {
                 animalKiller = lastAnimal;
@@ -1687,13 +1782,13 @@ namespace Oxide.Plugins
             {
                 killerPlayerId = classification.KillerPlayer.UserIDString;
             }
-            else if (lastPlayerAttackerId.TryGetValue(netId, out var lastPid) && !string.IsNullOrEmpty(lastPid)
+            else if (TryGetFreshTrack(lastPlayerAttackerId, netId, shortName, out var lastPid) && !string.IsNullOrEmpty(lastPid)
                      && !IsSamePlayerId(victimSteamIdEarly, lastPid))
             {
                 killerPlayerId = lastPid;
                 lastPlayerAttackerId.Remove(netId);
 
-                if (lastPlayerAttacker.TryGetValue(netId, out var storedName) && !string.IsNullOrEmpty(storedName))
+                if (TryGetFreshTrack(lastPlayerAttacker, netId, shortName, out var storedName) && !string.IsNullOrEmpty(storedName))
                 {
                     if (killerNameRaw == "Environment" || string.IsNullOrEmpty(killerNameRaw))
                         killerNameRaw = storedName;
@@ -1708,7 +1803,7 @@ namespace Oxide.Plugins
                 }
             }
             else if ((killerNameRaw == "Environment" || string.IsNullOrEmpty(killerNameRaw)) &&
-                     lastPlayerAttacker.TryGetValue(netId, out var lastPlayerOnly))
+                     TryGetFreshTrack(lastPlayerAttacker, netId, shortName, out var lastPlayerOnly))
             {
                 // Name without ID (legacy / edge case) — ignore if it is the victim's own name
                 bool ownName = classification.VictimPlayer != null
@@ -1766,31 +1861,48 @@ namespace Oxide.Plugins
             }
             catch { }
 
-            // Self-inflicted: F1 /kill, shooting yourself, own grenade, or env ticks
-            // where Rust sets InitiatorPlayer to the victim. Never score these as PvP
-            // unless another player / NPC / animal was already identified as the killer.
-            if (classification.IsRealPlayer && !otherCombatKiller
-                && (initiatorIsVictim || killerIdIsVictim || suicideDamage))
+            // Attribution buckets:
+            //   1. Third-party killer (player/NPC/animal) wins — never suicide/env.
+            //   2. Definite suicide: Suicide damage type and no third-party killer.
+            //   3. Definite environment: env damage type and no third-party killer.
+            //   4. Ambiguous self-initiator (Rust often sets Initiator = victim on bleed ticks):
+            //      do not invent a suicide; keep cause and log when debugging.
+            if (classification.IsRealPlayer && otherCombatKiller)
+            {
+                // Fresh third-party last-hit already resolved — leave it.
+            }
+            else if (classification.IsRealPlayer && suicideDamage && !otherCombatKiller)
             {
                 killerPlayerId = null;
                 animalKiller = null;
                 npcKillerTypeKey = null;
-
-                if (isEnvSelfDamage)
-                {
-                    isSuicide = false;
-                    if (string.IsNullOrEmpty(cause) || cause == "Unknown" || cause == "Death")
-                        cause = "Environment";
-                    if (cause.IndexOf("drown", StringComparison.OrdinalIgnoreCase) >= 0)
-                        killerNameRaw = "Drowning";
-                    else
-                        killerNameRaw = cause;
-                }
+                isSuicide = true;
+                killerNameRaw = "Suicide";
+                cause = "Suicide";
+            }
+            else if (classification.IsRealPlayer && isEnvSelfDamage && !otherCombatKiller)
+            {
+                killerPlayerId = null;
+                animalKiller = null;
+                npcKillerTypeKey = null;
+                isSuicide = false;
+                if (string.IsNullOrEmpty(cause) || cause == "Unknown" || cause == "Death")
+                    cause = "Environment";
+                if (cause.IndexOf("drown", StringComparison.OrdinalIgnoreCase) >= 0)
+                    killerNameRaw = "Drowning";
                 else
+                    killerNameRaw = cause;
+            }
+            else if (classification.IsRealPlayer && !otherCombatKiller
+                     && (initiatorIsVictim || killerIdIsVictim))
+            {
+                killerPlayerId = null;
+                if (config != null && config.DebugMode)
+                    Puts($"[Debug] Ambiguous self-death for {classification.VictimPlayer?.displayName}: cause={cause} initiatorIsVictim={initiatorIsVictim}");
+                if (string.IsNullOrEmpty(killerNameRaw) || killerNameRaw == "Environment")
                 {
-                    isSuicide = true;
-                    killerNameRaw = "Suicide";
-                    cause = "Suicide";
+                    if (!string.IsNullOrEmpty(cause) && cause != "Unknown" && cause != "Death")
+                        killerNameRaw = cause;
                 }
             }
             else if (info != null)
@@ -2031,15 +2143,15 @@ namespace Oxide.Plugins
             {
                 // Guard against double-counting: the same victim netId must only award
                 // one kill to an NPC type, even if OnEntityDeath fires more than once.
-                if (processedNpcKills.Contains(netId))
+                string npcDedupeKey = details.NpcTypeKey ?? details.AnimalVictim ?? victimName ?? "";
+                if (IsDuplicateDeath(processedNpcKills, netId, npcDedupeKey))
                 {
                     if (config.DebugMode)
                         Puts($"[Debug] Skipped duplicate NPC kill award for {details.NpcKillerTypeKey} (victim netId {netId})");
                 }
                 else
                 {
-                    processedNpcKills.Add(netId);
-                    timer.Once(config.DeathDedupeWindow, () => processedNpcKills.Remove(netId));
+                    MarkProcessedDeath(processedNpcKills, netId, npcDedupeKey);
 
                     if (!npcStats.TryGetValue(details.NpcKillerTypeKey, out var nStats))
                         nStats = npcStats[details.NpcKillerTypeKey] = new NpcStats { prefabName = details.NpcKillerTypeKey };
@@ -2170,8 +2282,10 @@ namespace Oxide.Plugins
                 case "sheep": return "KillerNameSheep";
                 case "lamb": return "KillerNameLamb";
                 case "goat": return "KillerNameGoat";
+                case "crab": return "KillerNameCrab";
                 case "rabbit":
-                case "bunny": return "KillerNameRabbit";
+                case "bunny":
+                case "hare": return "KillerNameRabbit";
                 case "squirrel": return "KillerNameSquirrel";
                 case "frog":
                 case "toad": return "KillerNameFrog";
@@ -2489,6 +2603,7 @@ private void LoadDefaultMessages()
         ["KillerNameSeaTurtle"] = "Sea Turtle",
         ["KillerNameJellyfish"] = "Jellyfish",
         ["KillerNameSeagull"] = "Seagull",
+        ["KillerNameCrab"] = "Crab",
         ["KillerNameSnake"] = "Snake",
         ["KillerNameShark"] = "Shark",
         ["KillerNameCrocodile"] = "Crocodile",
@@ -2575,8 +2690,9 @@ private void LoadDefaultMessages()
                 return lang.GetMessage("CauseDeath", this);
 
             ulong netId = info.HitEntity?.net?.ID.Value ?? 0;
+            string hitPrefab = info.HitEntity?.ShortPrefabName;
 
-            if (netId != 0 && lastEnvironmentalCause.TryGetValue(netId, out string storedCause))
+            if (netId != 0 && TryGetFreshTrack(lastEnvironmentalCause, netId, hitPrefab, out string storedCause))
             {
                 // Accept both the canonical display names and any legacy raw keys
                 switch (storedCause)
@@ -2702,14 +2818,18 @@ private void LoadDefaultMessages()
                 || name.IndexOf("sheep", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("lamb", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("goat", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("heifer", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("rabbit", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("bunny", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("hare", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("squirrel", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("frog", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("toad", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("turtle", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("jellyfish", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("seagull", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("crab", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("foal", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("snake", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("shark", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("crocodile", StringComparison.OrdinalIgnoreCase) >= 0
@@ -2718,6 +2838,32 @@ private void LoadDefaultMessages()
                 || name.IndexOf("panther", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("tiger", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("bee", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>
+        /// Type-first NPC classification. Prefab text is a fallback only after entity type checks.
+        /// Avoids treating generic "npc" fragments in modded prefabs as scientists.
+        /// </summary>
+        private static bool IsNpcCombatant(BaseEntity entity, string shortName = null)
+        {
+            if (entity == null) return false;
+            if (entity is BaseAnimalNPC) return false;
+            if (entity is BasePlayer bp)
+            {
+                // Scientists / bandits / dwellers are BasePlayers without a Steam ID
+                if (bp.userID.IsSteamId()) return false;
+                return true;
+            }
+
+            string name = shortName ?? entity.ShortPrefabName;
+            if (string.IsNullOrEmpty(name)) return false;
+            // Specific tokens only — do not match the generic fragment "npc" by itself
+            return name.IndexOf("scientist", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("tunneldweller", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("underwaterdweller", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("bandit", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("ch47scientists", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("scarecrow", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
 private string GetKillerName(BaseEntity entity)
@@ -2749,7 +2895,8 @@ private string GetKillerName(BaseEntity entity)
     if (config.CustomKillerNames != null && config.CustomKillerNames.TryGetValue(lowerName, out string configName))
         return configName;
 
-    // 2. Try partial match from config
+    // 2. Longest-key partial match. Skip overly broad keys unless they are an exact match
+    //    (already handled above) so "npc" / "car" / "train" cannot swallow a more specific prefab.
     if (config.CustomKillerNames != null)
     {
         string bestMatch = null;
@@ -2757,9 +2904,14 @@ private string GetKillerName(BaseEntity entity)
 
         foreach (var kvp in config.CustomKillerNames)
         {
-            if (lowerName.Contains(kvp.Key.ToLowerInvariant()))
+            string key = kvp.Key.ToLowerInvariant();
+            if (key.Length < 4) continue;
+            if (key == "npc" || key == "scientist" || key == "vehicle" || key == "car"
+                || key == "train" || key == "barrel" || key == "turret")
+                continue;
+            if (lowerName.Contains(key))
             {
-                int score = (kvp.Key.Length * 10) + (kvp.Key.Count(c => c == '_') * 5);
+                int score = (key.Length * 10) + (key.Count(c => c == '_') * 5);
                 if (score > bestScore)
                 {
                     bestScore = score;
@@ -2787,20 +2939,23 @@ private string GetKillerName(BaseEntity entity)
         if (lowerName.Contains("lamb")) return lang.GetMessage("KillerNameLamb", this);
         if (lowerName.Contains("sheep") || lowerName.Contains("ewe") || lowerName.Contains("ram")) return lang.GetMessage("KillerNameSheep", this);
         if (lowerName.Contains("goat") || lowerName.Contains("kid")) return lang.GetMessage("KillerNameGoat", this);
-        if (lowerName.Contains("rabbit") || lowerName.Contains("bunny")) return lang.GetMessage("KillerNameRabbit", this);
+        if (lowerName.Contains("heifer") || lowerName.Contains("steer") || lowerName.Contains("ox")) return lang.GetMessage("KillerNameCow", this);
+        if (lowerName.Contains("rabbit") || lowerName.Contains("bunny") || lowerName.Contains("hare")) return lang.GetMessage("KillerNameRabbit", this);
         if (lowerName.Contains("squirrel")) return lang.GetMessage("KillerNameSquirrel", this);
         if (lowerName.Contains("frog") || lowerName.Contains("toad")) return lang.GetMessage("KillerNameFrog", this);
         if (lowerName.Contains("turtle")) return lang.GetMessage("KillerNameSeaTurtle", this);
         if (lowerName.Contains("jellyfish") || lowerName.Contains("jelly")) return lang.GetMessage("KillerNameJellyfish", this);
         if (lowerName.Contains("seagull") || lowerName.Contains("gull")) return lang.GetMessage("KillerNameSeagull", this);
+        if (lowerName.Contains("crab")) return lang.GetMessage("KillerNameCrab", this);
+        if (lowerName.Contains("foal")) return lang.GetMessage("KillerNameHorse", this);
         if (lowerName.Contains("snake")) return lang.GetMessage("KillerNameSnake", this);
         if (lowerName.Contains("shark")) return lang.GetMessage("KillerNameShark", this);
         if (lowerName.Contains("crocodile") || lowerName.Contains("croc") || lowerName.Contains("alligator"))
             return lang.GetMessage("KillerNameCrocodile", this);
         if (lowerName.Contains("panther")) return lang.GetMessage("KillerNamePanther", this);
         if (lowerName.Contains("tiger")) return lang.GetMessage("KillerNameTiger", this);
-        if (lowerName.Contains("bee")) return lang.GetMessage("KillerNameBees", this);
         if (lowerName.Contains("beehive")) return lang.GetMessage("KillerNameBeeHive", this);
+        if (lowerName.Contains("bee")) return lang.GetMessage("KillerNameBees", this);
     }
 
     // Scientists / NPCs
