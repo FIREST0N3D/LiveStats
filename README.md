@@ -6,15 +6,23 @@ Oxide plugins for Rust dedicated servers.
 
 **LiveStatsWorld** is an optional extension: real-world date/time, moon, solar lighting, and Open-Meteo weather. Weather and the time system stay **off** until you turn them on.
 
+**LiveStatsEvents** is the custom event engine. It owns the schedule and the classic world events (cargo, supply plane, patrol heli, Chinook, Bradley, F-15, hackable crates). NPC and vehicle types are spawned by companion plugins when those files are present.
+
 Author in `[Info]`: **FiREST0N3D**  
 Server this was built for: [rustjawn.com](https://www.rustjawn.com)
 
 | Plugin | Version | Requires |
 |--------|---------|----------|
-| LiveStats | 1.9.816 | Oxide / Rust dedicated |
-| LiveStatsWorld | 1.1.48 | LiveStats |
+| LiveStats | 1.9.818 | Oxide / Rust dedicated |
+| LiveStatsWorld | 1.1.51 | LiveStats |
+| LiveStatsEvents | 1.13.59 | LiveStatsWorld |
+| LiveStatsEventsNPC | 1.4.81 | LiveStatsEvents (optional companion) |
+| LiveStatsEventsVehicles | 1.0.39 | LiveStatsEvents (optional companion) |
+| LiveStatsEventFeed | 1.3.75 | LiveStatsEvents (optional dashboard pins) |
 
-Drop the `.cs` files in `oxide/plugins`. Oxide compiles them on load. **Load LiveStats first.**
+Drop the `.cs` files in `oxide/plugins`. Oxide compiles them on load. **Load LiveStats first, then World, then Events.** Companions can load in any order after Events.
+
+Vanilla `server.events` and `cargoship.event_enabled` should stay **false** on the command line if Events is going to own cargo / heli / Bradley. Set `DisableVanillaEvents` in the Events config only when you want the plugin to force that at runtime.
 
 ---
 
@@ -24,14 +32,14 @@ Drop the `.cs` files in `oxide/plugins`. Oxide compiles them on load. **Load Liv
 - Kill streaks (players + NPCs + animals, no death in between)
 - Personal PvP log (who you killed / who killed you)
 - Server kill feed with optional grid + headshot tag
-- NPC and animal type stats (Heavy Scientist, bear, crocodile, livestock, …)
+- NPC and animal type stats (Heavy Scientist, bear, crocodile, livestock, crab, …)
 - Environmental deaths (drown, fall, starve, freeze, heat, rad) — drown is **not** counted as suicide
 - Dual wipe detection: Oxide `OnNewSave` plus a stored map identity (`level|seed|worldsize`)
 - Optional AFK warning + kick (off by default)
 - Writes `oxide/data/live_stats.json` on a timer for an external dashboard (online players, streaks, wipe day, recent deaths)
 - Language packs under `oxide/lang/<code>/LiveStats.json`, with `/lslang` per player
 
-LiveStats does **not** spawn events, change weather, or move NPCs. That is the rest of the suite (not in this first drop).
+LiveStats does **not** spawn events, change weather, or move NPCs.
 
 ---
 
@@ -44,7 +52,7 @@ World only starts after it sees LiveStats. If LiveStats is missing it logs an er
 - `UseLocalWeather` — drive `weather.*` from [Open-Meteo](https://open-meteo.com)
 - `TimeSystem.Enabled` — lock in-game date (and optionally hour) to real local time at your coordinates
 
-**v1.1.48:** high-only cirrus (low/mid cloud ≈ 0, high cloud only) no longer holds the Overcast cloud mesh. Thin cirrus stays on a clearer deck while the blend still targets RainMild/Clear from the forecast.
+**v1.1.51:** three extra sky decks — Clear, Few Clouds, Partly Cloudy — so light cover is not forced onto RainMild/Overcast. High-only cirrus still leaves the thick Overcast mesh. Cloud dissolve hops between decks instead of snapping.
 
 **When you enable them:**
 
@@ -56,23 +64,66 @@ World only starts after it sees LiveStats. If LiveStats is missing it logs an er
 - Polar day/night handling for high latitudes
 - Optional split-day: pack N in-game days into one real day
 - Optional short suppress of vanilla cargo/heli/CH47 right after a forced time jump (`SuppressCatchUpEvents`, default **false**)
-- Writes world snapshot fields for the same dashboard LiveStats already feeds
 
 **Conflicts (only after you enable TimeSystem or UseLocalWeather):**  
 TimeOfDay, RealTime, other weather controllers, and event plugins that spawn on sudden time jumps.
 
 ---
 
+## What LiveStatsEvents does
+
+Events is the scheduler. It does **not** replace LiveStats or World.
+
+**Core-owned (no companion required):**
+
+- Supply drop / cargo plane
+- Cargo ship
+- Patrol helicopter
+- Chinook (vanilla AI inbound, crate chat after a real drop, egress to deep water)
+- Bradley APC (road intersection hops; last ends banned so it does not loop the same path)
+- F-15 flyby
+- Hackable crates that the core is allowed to track
+
+**Companion-owned (core only decides *when*):**
+
+| Type | Companion |
+|------|-----------|
+| Heavy scientists, peacekeepers, rail / subway / tunnel squads, mine guard, road ambush, base raid | `LiveStatsEventsNPC` |
+| Tugboat, submarine, minicopter, scrap heli | `LiveStatsEventsVehicles` |
+
+If `Modules.RequireCompanionPlugins` is true (default) and the companion is missing, those types are skipped. Core will not spawn them itself.
+
+**Cadence**
+
+- Global gap between *any* two events: random in `[MinMinutesBetweenAnyEvent, MaxMinutesBetweenAnyEvent]` (default 5–20 minutes)
+- Optional `MinPlayersOnline` gate (default 2)
+- `UseScheduledEvents false` = weighted random from the `Events[]` list (default)
+- Soft reload keeps the schedule clock instead of resetting it
+- Boot cleanup of leftover vanilla cargo planes / queued event ents when `DisableVanillaEvents` is on
+
+**Chat** announces inbound (ETA) then spawn. Cancelled events (example: base raid with no TC) tell the server why.
+
+**LiveStatsEventFeed** (optional) writes `oxide/data/live_events.json` for map pins and the site event list. It is not required for in-game events to run.
+
+---
+
 ## Install
 
 1. Rust dedicated server with Oxide 2.
-2. Copy `LiveStats.cs` into `oxide/plugins`.
-3. Wait until the console prints `LiveStats v1.9.816 loaded`.
-4. Copy `LiveStatsWorld.cs` into `oxide/plugins`.
-5. Console should print that the LiveStats host was detected.
-6. Edit the generated configs under `oxide/config/` **before** turning weather or time on.
+2. Copy `LiveStats.cs` into `oxide/plugins`. Wait for `LiveStats v1.9.818 loaded`.
+3. Copy `LiveStatsWorld.cs`. Console should print that the LiveStats host was detected.
+4. Copy `LiveStatsEvents.cs`. Console should print `LiveStatsEvents v1.13.59` and an `Enabled events (N): …` line.
+5. Optional: `LiveStatsEventsNPC.cs`, `LiveStatsEventsVehicles.cs`, `LiveStatsEventFeed.cs`.
+6. Edit configs under `oxide/config/` **before** turning weather, time, or `DisableVanillaEvents` on.
 
-First World boot writes whatever defaults are in the `.cs`. The current source defaults latitude/longitude to **39.95, -75.16** (Philadelphia). Change those to your server before `UseLocalWeather true`.
+Command-line (recommended when Events owns the map):
+
+```text
++server.events false
++cargoship.event_enabled false
+```
+
+First World boot writes defaults in the `.cs`. Current source defaults latitude/longitude to **39.95, -75.16** (Philadelphia). Change those to your server before `UseLocalWeather true`.
 
 ---
 
@@ -83,12 +134,15 @@ First World boot writes whatever defaults are in the `.cs`. The current source d
 | `livestats.admin` | LiveStats | `/clearallstats`, `/livestats cleanup`, World admin fallback |
 | `livestats.idle.bypass` | LiveStats | Skip AFK kick (only if idle kick is enabled) |
 | `livestatsworld.admin` | LiveStatsWorld | `/worldtime`, `/weatherreload`, `/weatherseed`, `/weatherstatus` |
+| `livestatsevents.admin` | LiveStatsEvents | `/event`, `/supplydrop`, console `livestats.event` |
+| `livestats.event` | LiveStatsEvents | Same as Events admin (also accepted) |
 
 Grant:
 
 ```text
 oxide.grant group admin livestats.admin
 oxide.grant group admin livestatsworld.admin
+oxide.grant group admin livestatsevents.admin
 ```
 
 ---
@@ -110,7 +164,7 @@ oxide.grant group admin livestatsworld.admin
 | `/lslang <code>` | everyone | Set your Oxide lang folder (`en`, `es`, `pt-BR`, …) |
 | `/lstestlang` | everyone | Debug which pack Oxide resolved |
 
-Each command can be disabled in `oxide/config/LiveStats.json` (`MyStatsCommandEnabled`, `TopCommandEnabled`, …).
+Each command can be disabled in `oxide/config/LiveStats.json`.
 
 ---
 
@@ -140,6 +194,31 @@ livestats.weatherseed
 
 ---
 
+## Chat / console commands — LiveStatsEvents
+
+| Command | Who | What |
+|---------|-----|------|
+| `/event status` | admin | What’s live, next gap, module handshake |
+| `/event reload` | admin | Re-read config without unloading |
+| `/event <type>` | admin | Force that type (respects companion gates) |
+| `/supplydrop` `/airdrop` | admin | Alias for supply plane |
+
+**Type aliases:** `supply` / `drop` / `plane` → supplydrop · `ship` → cargo · `heli` / `patrol` → patrol heli · `ch47` → chinook · `tank` → bradley · `flyby` → f15
+
+NPC / vehicle names match the config `Type` field (`peacekeeperpatrol`, `heavyscientists`, `tugboat`, `submarine`, …).
+
+Console:
+
+```text
+livestats.event status
+livestats.event cargo
+livestats.spawnf15e
+```
+
+`/event` and `/event status` work even when the engine is not fully ready so you can see why (World missing, `Enabled false`, …).
+
+---
+
 ## Config — LiveStats (`oxide/config/LiveStats.json`)
 
 | Key | Default | Notes |
@@ -152,19 +231,12 @@ livestats.weatherseed
 | `KillStreakStart` | `5` | Chat announce threshold |
 | `AnnounceKillStreaks` | `true` | |
 | `AnnouncePlayerDeaths` | `true` | Server chat |
-| `AnnounceNpcDeaths` / `AnnounceAnimalKills` / `AnnounceAnimalDeaths` / `AnnounceEnvironmentalDeaths` | `true` | Toggle per category |
 | `PlayersOnlyEnv` | `true` | Only real players count toward `/envstats` |
 | `ClearStatsOnWipe` | `true` | |
 | `WipeTimezone` | `Eastern Standard Time` | Windows ID. Linux often `America/New_York` |
 | `WipeHour` / `WipeMinute` | `14` / `15` | Local wipe clock used for “day of wipe” |
 | `EnableIdleKick` | `false` | |
-| `IdleWarningMinutes` | `10` | |
-| `IdleKickMinutes` | `15` | |
-| `IdleBypassPermission` | `livestats.idle.bypass` | |
-| `LanguageSyncFromClient` | `true` | Map Rust client language → Oxide pack |
-| `LanguageForce` | `""` | Force one pack for everyone if set |
-| `DebugMode` | `false` | Extra `Puts` |
-| `CustomKillerNames` | map of prefab → label | Override chat names |
+| `CustomKillerNames` | map of prefab → label | Override chat names (includes livestock + crab in 1.9.818) |
 
 ---
 
@@ -181,22 +253,34 @@ Leave weather and time **false** until lat/lon are yours.
 | `WeatherBlendSeconds` | `50` | How long a profile fade takes |
 | `PersistWeatherState` | `true` | Survive `o.reload` |
 | `QuietWeatherConvars` | `false` | Set `true` on public servers to stop `weather.*` log spam |
-| `CollectWorldStats` | `true` | Moon/sun/weather snapshot |
-| `EnableLightningStrikes` | `true` | |
-| `LightningSoundOnly` | `true` | No bolt entity |
-| `LightningFlash` | `true` | Brief brightness pop |
-| `EnableRealLightning` | `false` | Prefab bolt |
 | `TimeSystem.Enabled` | `false` | Master time switch |
-| `TimeSystem.SyncHourToRealTime` | `true` | Used only if TimeSystem is on |
-| `TimeSystem.SyncDateToRealDate` | `true` | |
-| `TimeSystem.UseRealSolarAtmosphere` | `true` | Dawn/dusk from real sunrise |
 | `TimeSystem.SuppressCatchUpEvents` | `false` | Kill vanilla cargo/heli/CH47 for a few seconds after a time jump |
-| `TimeSystem.SplitDay.Enabled` | `false` | |
-| `TimeSystem.SplitDay.InGameDaysPerRealDay` | `3` | |
-| `Tournament.Enabled` | `false` | |
 | `DebugMode` | `false` | |
 
 Open-Meteo is fetched with Oxide `webrequest` (no API key). The server needs outbound HTTPS.
+
+---
+
+## Config — LiveStatsEvents (`oxide/config/LiveStatsEvents.json`)
+
+| Key | Default | Notes |
+|-----|---------|--------|
+| `Enabled` | `true` | Master switch |
+| `DisableVanillaEvents` | `false` | When true, plugin kills leftover vanilla cargo/heli/Bradley schedules |
+| `Modules.RequireCompanionPlugins` | `true` | NPC/vehicle types need their module |
+| `Modules.Vehicles` | `true` | Allow vehicle types when Vehicles is loaded |
+| `Modules.Npc` | `true` | Allow NPC types when NPC is loaded |
+| `MinPlayersOnline` | `2` | 0 = run on an empty server |
+| `CheckIntervalSeconds` | `75` | Scheduler tick |
+| `MinMinutesBetweenAnyEvent` | `5` | Global cooldown floor |
+| `MaxMinutesBetweenAnyEvent` | `20` | Global cooldown ceiling |
+| `UseScheduledEvents` | `false` | `false` = weighted random from `Events[]` |
+| `Debug` | `false` | Cooldown / spawn `Puts` — leave off on live boxes |
+| `Events` | list | Each row: `Type`, `Enabled`, `Weight`, duration / announce fields |
+
+Do **not** pre-seed `Events[]` in a way that duplicates rows. Newtonsoft appends onto a pre-filled list and you will see every type twice.
+
+NPC lifetimes, shore/road weights, and vehicle coastal rules live in `LiveStatsEventsNPC.json` and `LiveStatsEventsVehicles.json`, not in the core file.
 
 ---
 
@@ -208,11 +292,13 @@ Open-Meteo is fetched with Oxide `webrequest` (no API key). The server needs out
 | `oxide/data/livestats_wipe.json` (name may vary) | LiveStats | Only if you want wipe identity reset |
 | Player / NPC / animal / env JSON under `oxide/data/` | LiveStats | Wipes tracked stats |
 | Weather persist file (when `PersistWeatherState`) | LiveStatsWorld | Next poll rebuilds weather |
+| `oxide/data/live_events.json` | LiveStatsEventFeed | Yes — rebuilt on the next pin tick |
 
+Do not commit `oxide/data/` or live `oxide/config/*.json` to git.
 
 ---
 
-## Dashboard JSON (LiveStats)
+## Dashboard JSON
 
 `live_stats.json` includes:
 
@@ -222,7 +308,9 @@ Open-Meteo is fetched with Oxide `webrequest` (no API key). The server needs out
 - `wipeDay`, `wipeStartUtc`, timezone + wipe clock
 - `timestamp` / `lastUpdateUnix`
 
-Point any site you want at that file. This repo does not include the rustjawn.com frontend.
+`live_events.json` (Feed) includes `active`, `recent` (max 10), `inbound`, pin percents, map size / seed. Air and cargo pins update about twice a second; NPC pins about once a second.
+
+Point any site you want at those files. This repo does not include the rustjawn.com frontend.
 
 ---
 
@@ -234,7 +322,7 @@ LiveStats ships English via `LoadDefaultMessages` and extra packs on disk as `ox
 - `LanguageForce` in config — whole server
 - `LanguageSyncFromClient` — uses the Rust client language on connect
 
-World has its own `lang` keys for `/worldstats` and `/worldtime`.
+World and Events have their own `lang` keys for `/worldstats`, `/worldtime`, and `/event`.
 
 ---
 
@@ -243,21 +331,52 @@ World has its own `lang` keys for `/worldstats` and `/worldtime`.
 - Reloading LiveStats while World is loaded: World pauses, then `OnPluginLoaded` starts it again.
 - Unloading LiveStats: World stops timers and restores vanilla `DayLengthInMinutes` if it changed them.
 - Unloading LiveStats: `live_stats.json` is marked `serverRunning: false` so a dashboard can show offline.
+- Reloading Events: schedule clock is kept (soft reload). NPC module kills leftover event scientists on load.
 - Idle input hook is **unsubscribed** when `EnableIdleKick` is false.
 - World’s `OnEntitySpawned` catch-up hook is **unsubscribed** unless `SuppressCatchUpEvents` is true.
 
 ---
 
-## What this first drop is not
+## What else exists on the production box
 
-These plugins exist on the production server but are **not** part of this README’s install:
+Documented above when you ship the file:
 
-- LiveStatsEvents / LiveStatsEventsNPC / LiveStatsEventsVehicles — custom event engine
+- LiveStatsEventsNPC — scientist patrols, tunnels, mine guard, ambush, base raid
+- LiveStatsEventsVehicles — tug / sub / mini / scrap + player-owned hulls
 - LiveStatsEventFeed — map pins JSON
-- LiveStatsSystem — help, board inbox, restart schedule
+- LiveStatsSystem — help, board inbox, Steam build check, restart schedule
 - MapImageSaver — map image export
 
-They will land in this repo later. They are not required for stats or weather.
+LiveStats + World still run without any of those.
+
+---
+
+## Changelog
+
+### LiveStatsEventFeed 1.3.75
+- Reused write / dedup / NPC scratch buffers so Oxide memory no longer climbs hundreds of MB over a long boot
+- Live-file read throttled; core index sync every 20s
+- Pin rates unchanged (air 0.5s, NPC ~1.2s)
+
+### LiveStatsEventsNPC 1.4.81
+- Reject origin / M12 teleports on drive
+- No `PositionToGrid` or `ResolveRustNav` on the walk tick
+- Debug strings only built when `Debug` is true
+
+### LiveStatsEvents 1.13.59
+- Bradley random intersection hops; last four route ends banned
+- Chinook crate chat only after a real drop; void egress is Deep Sea
+- Companion handshake: NPC / Vehicles register once with core
+
+### LiveStatsWorld 1.1.51
+- Added Clear / Few Clouds / Partly Cloudy cloud decks so light cover is not forced onto RainMild or Overcast
+- High-only cirrus does not hold the thick Overcast mesh
+- WeatherRuntimeState, timer hub, and CloudSwapPhase dissolve
+
+### LiveStats 1.9.818
+- Livestock + critter aliases (heifer, steer, wether, hare, foal)
+- Crab / crab swarm killer names
+- Keeps 1.9.817 last-hit attribution, death dedupe, unified playtime bank
 
 ---
 
