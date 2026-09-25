@@ -209,7 +209,6 @@ Open-Meteo is fetched with Oxide `webrequest` (no API key). The server needs out
 | Player / NPC / animal / env JSON under `oxide/data/` | LiveStats | Wipes tracked stats |
 | Weather persist file (when `PersistWeatherState`) | LiveStatsWorld | Next poll rebuilds weather |
 
-Do not commit `oxide/data/` or live `oxide/config/*.json` to git. Example configs belong in the repo; live configs stay on the box.
 
 ---
 
