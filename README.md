@@ -337,20 +337,6 @@ World and Events have their own `lang` keys for `/worldstats`, `/worldtime`, and
 
 ---
 
-## What else exists on the production box
-
-Documented above when you ship the file:
-
-- LiveStatsEventsNPC — scientist patrols, tunnels, mine guard, ambush, base raid
-- LiveStatsEventsVehicles — tug / sub / mini / scrap + player-owned hulls
-- LiveStatsEventFeed — map pins JSON
-- LiveStatsSystem — help, board inbox, Steam build check, restart schedule
-- MapImageSaver — map image export
-
-LiveStats + World still run without any of those.
-
----
-
 ## Changelog
 
 ### LiveStatsEventFeed 1.3.75
