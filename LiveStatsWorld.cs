@@ -9,10 +9,157 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.48")]
-    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.48: high-only cirrus deck no longer keeps Overcast mesh.")]
+    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.51")]
+    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.51: Clear vs Few Clouds vs Partly Cloudy.")]
     class LiveStatsWorld : RustPlugin
     {
+        private enum CloudSwapPhase
+        {
+            Idle = 0,
+            FadeOut = 1,
+            Hold = 2,
+            FadeIn = 3
+        }
+
+        private enum LogArea
+        {
+            Time,
+            Weather,
+            Lightning,
+            Stats
+        }
+        /// <summary>
+        /// Live weather channels. Blend, dissolve, and lightning flash all read/write
+        /// this object instead of a pile of sibling fields on the plugin.
+        /// Cloud-swap phase / hop queue stay on the plugin until CloudSwapController.
+        /// </summary>
+        private sealed class WeatherRuntimeState
+        {
+            public string currentWeatherProfile = "clear";
+            public string pendingWeatherProfile = "clear";
+            public string currentCloudConfig = "";
+            public string hysteresisCandidate = null;
+            public int hysteresisVotes = 0;
+
+            public float targetClouds = 0f, currentClouds = 0f;
+            public float targetMie = 0f, currentMie = 0f;
+            public float targetBrightness = 1f, currentBrightness = 1f;
+
+            public float targetRain = 0f, currentRain = 0f;
+            public float targetWind = 0f, currentWind = 0f;
+            public float targetFog = 0f, currentFog = 0f;
+            public float targetFogMultiplier = 1.0f, currentFogMultiplier = 1.0f;
+            public float targetFogRampStart = 50f, currentFogRampStart = 50f;
+            public float targetFogRampEnd = 800f, currentFogRampEnd = 800f;
+            public float targetFogHeightFalloff = 0.5f, currentFogHeightFalloff = 0.5f;
+            public float targetThunder = 0f, currentThunder = 0f;
+            public float targetRainbow = 0f, currentRainbow = 0f;
+            public float targetWetness = 0.15f, currentWetness = 0.15f;
+            public float targetWetnessSnow = 0.1f, currentWetnessSnow = 0.1f;
+            public float targetDust = 0f, currentDust = 0f;
+            public float targetRayleigh = 1.0f, currentRayleigh = 1.0f;
+            public float targetContrast = 1.0f, currentContrast = 1.0f;
+            public float targetDirectionality = 0.7f, currentDirectionality = 0.7f;
+            public float targetAttenuation = 0.6f, currentAttenuation = 0.6f;
+
+            public float targetCloudBrightness = 1.0f, currentCloudBrightness = 1.0f;
+            public float targetCloudSharpness = 0.5f, currentCloudSharpness = 0.5f;
+            public float targetCloudScattering = 1.0f, currentCloudScattering = 1.0f;
+            public float targetCloudColoring = 1.0f, currentCloudColoring = 1.0f;
+            public float targetCloudSize = 1.0f, currentCloudSize = 1.0f;
+            public float targetCloudSaturation = 1.0f, currentCloudSaturation = 1.0f;
+            public float targetCloudOpacity = 0.9f, currentCloudOpacity = 0.9f;
+
+            public int lastWeatherCode = 0;
+            public float lastCloudLow = 0f;
+            public float lastCloudMid = 0f;
+            public float lastCloudHigh = 0f;
+
+            public float appliedClouds = float.NaN, appliedRain = float.NaN, appliedWind = float.NaN;
+            public float appliedFog = float.NaN, appliedFogMultiplier = float.NaN;
+            public float appliedFogRampStart = float.NaN, appliedFogRampEnd = float.NaN;
+            public float appliedFogHeightFalloff = float.NaN;
+            public float appliedThunder = float.NaN, appliedRainbow = float.NaN;
+            public float appliedWetness = float.NaN, appliedWetnessSnow = float.NaN;
+            public float appliedDust = float.NaN;
+            public float appliedMie = float.NaN, appliedRayleigh = float.NaN;
+            public float appliedBrightness = float.NaN, appliedContrast = float.NaN;
+            public float appliedDirectionality = float.NaN, appliedAttenuation = float.NaN;
+            public float appliedCloudBrightness = float.NaN, appliedCloudSharpness = float.NaN;
+            public float appliedCloudScattering = float.NaN, appliedCloudColoring = float.NaN;
+            public float appliedCloudSize = float.NaN, appliedCloudSaturation = float.NaN;
+            public float appliedCloudOpacity = float.NaN;
+            public float appliedDirLight = float.NaN, appliedAmbLight = float.NaN;
+            public float appliedVCloudSun = float.NaN, appliedVCloudMoon = float.NaN;
+            public float appliedSunMesh = float.NaN, appliedMoonMesh = float.NaN;
+            public float appliedReflection = float.NaN;
+            public float appliedNightlightBri = float.NaN, appliedNightlightDist = float.NaN, appliedNightlightFade = float.NaN;
+            public float targetDirLight = 1f, currentDirLight = 1f;
+            public float targetAmbLight = 1f, currentAmbLight = 1f;
+            public float targetVCloudSun = 1f, currentVCloudSun = 1f;
+            public float targetVCloudMoon = 1f, currentVCloudMoon = 1f;
+            public float targetSunMesh = 1f, currentSunMesh = 1f;
+            public float targetMoonMesh = 1f, currentMoonMesh = 1f;
+            public float targetReflection = 1f, currentReflection = 1f;
+
+            public float lastOmCape = 0f, lastOmShortwave = 0f, lastOmHumidity = 50f, lastOmVisibility = 10000f;
+            public bool lastOmIsDay = true;
+
+            public float WeatherBlendFactor = 0.045f;
+            public float WeatherBlendInterval = 1.5f;
+            public float _dynamicBlendSeconds = 90f;
+            public bool _weatherInitialized = false;
+
+            public float _lastLightningTime = 0f;
+            public float _lightningFlashUntil = 0f;
+            public float _lightningFlashBri = float.NaN;
+            public float _lightningFlashCon = float.NaN;
+            public float _lightningFlashCloudBri = float.NaN;
+            public float _lightningFlashRayleigh = float.NaN;
+            public float _nextLightningEarliest = 0f;
+            public float _lightningWobbleSeed = 0f;
+
+            public float currentCcn = 0.35f;
+            public float targetCcn = 0.35f;
+            public float currentInstability = 0f;
+            public float targetInstability = 0f;
+            public float _seedBias = 0f;
+            public float _seedBiasEnd = 0f;
+            public float _lastCcnUpdate = 0f;
+
+            public float _lastWeatherSuccessTime = 0f;
+            public int _consecutiveWeatherFails = 0;
+            public float _pressureTendency = 0f;
+            public float _rainLatch = 0f;
+            public float _lastGustValue = 0f;
+            public float _lookAheadRain = 0f;
+            public float _lookAheadHours = 0f;
+            public string _lookAheadLabel = "none";
+            public string _lastInterpLogProfile = null;
+
+            public void InvalidateAppliedSky()
+            {
+                appliedClouds = appliedCloudOpacity = appliedAttenuation = float.NaN;
+                appliedBrightness = appliedContrast = appliedRayleigh = float.NaN;
+                appliedMie = appliedDirectionality = float.NaN;
+                appliedCloudBrightness = appliedCloudSharpness = appliedCloudScattering = float.NaN;
+                appliedCloudColoring = appliedCloudSize = appliedCloudSaturation = float.NaN;
+                appliedDirLight = appliedAmbLight = float.NaN;
+                appliedVCloudSun = appliedVCloudMoon = float.NaN;
+                appliedSunMesh = appliedMoonMesh = appliedReflection = float.NaN;
+            }
+
+            public void InvalidateAppliedAll()
+            {
+                InvalidateAppliedSky();
+                appliedRain = appliedWind = appliedFog = float.NaN;
+                appliedFogMultiplier = appliedFogRampStart = appliedFogRampEnd = float.NaN;
+                appliedFogHeightFalloff = appliedThunder = appliedRainbow = float.NaN;
+                appliedWetness = appliedWetnessSnow = appliedDust = float.NaN;
+            }
+        }
+
+
         [PluginReference]
         private Plugin LiveStats;
 
@@ -68,13 +215,9 @@ namespace Oxide.Plugins
 
         // ==================== LOCAL WEATHER ====================
         private Timer _weatherBlendTimer;
-        private string currentWeatherProfile = "clear";
-        private string pendingWeatherProfile = "clear";
-        private string currentCloudConfig = "";
-        private string hysteresisCandidate = null;
-        private int hysteresisVotes = 0;
+        private readonly WeatherRuntimeState wx = new WeatherRuntimeState();
 
-        private int _cloudSwapPhase = 0;
+        private CloudSwapPhase _cloudSwapPhase = CloudSwapPhase.Idle;
         private string _cloudSwapDesired = null;
         private float _cloudSwapPhaseStart = 0f;
         private float _cloudSwapSavedOpacity = 0.5f;
@@ -110,85 +253,10 @@ namespace Oxide.Plugins
         private const float CloudSwapFloor = 0.08f;
         private const float CloudSwapFloorCoverage = 0.10f;
 
-        private float targetClouds = 0f, currentClouds = 0f;
-        private float targetMie = 0f, currentMie = 0f;
-        private float targetBrightness = 1f, currentBrightness = 1f;
-
-        private float targetRain = 0f, currentRain = 0f;
-        private float targetWind = 0f, currentWind = 0f;
-        private float targetFog = 0f, currentFog = 0f;
-        private float targetFogMultiplier = 1.0f, currentFogMultiplier = 1.0f;
-        private float targetFogRampStart = 50f, currentFogRampStart = 50f;
-        private float targetFogRampEnd = 800f, currentFogRampEnd = 800f;
-        private float targetFogHeightFalloff = 0.5f, currentFogHeightFalloff = 0.5f;
-        private float targetThunder = 0f, currentThunder = 0f;
-        private float targetRainbow = 0f, currentRainbow = 0f;
-        private float targetWetness = 0.15f, currentWetness = 0.15f;
-        private float targetWetnessSnow = 0.1f, currentWetnessSnow = 0.1f;
-        private float targetDust = 0f, currentDust = 0f;
-        private float targetRayleigh = 1.0f, currentRayleigh = 1.0f;
-        private float targetContrast = 1.0f, currentContrast = 1.0f;
-        private float targetDirectionality = 0.7f, currentDirectionality = 0.7f;
-        private float targetAttenuation = 0.6f, currentAttenuation = 0.6f;
-
-        private float targetCloudBrightness = 1.0f, currentCloudBrightness = 1.0f;
-        private float targetCloudSharpness = 0.5f, currentCloudSharpness = 0.5f;
-        private float targetCloudScattering = 1.0f, currentCloudScattering = 1.0f;
-        private float targetCloudColoring = 1.0f, currentCloudColoring = 1.0f;
-        private float targetCloudSize = 1.0f, currentCloudSize = 1.0f;
-        private float targetCloudSaturation = 1.0f, currentCloudSaturation = 1.0f;
-        private float targetCloudOpacity = 0.9f, currentCloudOpacity = 0.9f;
-
-        private int lastWeatherCode = 0;
-        private float lastCloudLow = 0f;
-        private float lastCloudMid = 0f;
-        private float lastCloudHigh = 0f;
-
-        private float appliedClouds = float.NaN, appliedRain = float.NaN, appliedWind = float.NaN;
-        private float appliedFog = float.NaN, appliedFogMultiplier = float.NaN;
-        private float appliedFogRampStart = float.NaN, appliedFogRampEnd = float.NaN;
-        private float appliedFogHeightFalloff = float.NaN;
-        private float appliedThunder = float.NaN, appliedRainbow = float.NaN;
-        private float appliedWetness = float.NaN, appliedWetnessSnow = float.NaN;
-        private float appliedDust = float.NaN;
-        private float appliedMie = float.NaN, appliedRayleigh = float.NaN;
-        private float appliedBrightness = float.NaN, appliedContrast = float.NaN;
-        private float appliedDirectionality = float.NaN, appliedAttenuation = float.NaN;
-        private float appliedCloudBrightness = float.NaN, appliedCloudSharpness = float.NaN;
-        private float appliedCloudScattering = float.NaN, appliedCloudColoring = float.NaN;
-        private float appliedCloudSize = float.NaN, appliedCloudSaturation = float.NaN;
-        private float appliedCloudOpacity = float.NaN;
-        private float appliedDirLight = float.NaN, appliedAmbLight = float.NaN;
-        private float appliedVCloudSun = float.NaN, appliedVCloudMoon = float.NaN;
-        private float appliedSunMesh = float.NaN, appliedMoonMesh = float.NaN;
-        private float appliedReflection = float.NaN;
-        private float appliedNightlightBri = float.NaN, appliedNightlightDist = float.NaN, appliedNightlightFade = float.NaN;
-        private float targetDirLight = 1f, currentDirLight = 1f;
-        private float targetAmbLight = 1f, currentAmbLight = 1f;
-        private float targetVCloudSun = 1f, currentVCloudSun = 1f;
-        private float targetVCloudMoon = 1f, currentVCloudMoon = 1f;
-        private float targetSunMesh = 1f, currentSunMesh = 1f;
-        private float targetMoonMesh = 1f, currentMoonMesh = 1f;
-        private float targetReflection = 1f, currentReflection = 1f;
         private float _cloudSwapSavedVSun = 1f, _cloudSwapSavedVMoon = 1f;
-        private float lastOmCape = 0f, lastOmShortwave = 0f, lastOmHumidity = 50f, lastOmVisibility = 10000f;
-        private bool lastOmIsDay = true;
-
-        private float WeatherBlendFactor = 0.045f;
-        private float WeatherBlendInterval = 1.5f;
-        private float _dynamicBlendSeconds = 90f;
         private const float WeatherApplyEpsilon = 0.02f;
-        private bool _weatherInitialized = false;
-        private float _lastLightningTime = 0f;
-        private float _lightningFlashUntil = 0f;
-        private float _lightningFlashBri = float.NaN;
-        private float _lightningFlashCon = float.NaN;
-        private float _lightningFlashCloudBri = float.NaN;
-        private float _lightningFlashRayleigh = float.NaN;
-        private float _nextLightningEarliest = 0f;
         private Timer _lightningFlashTimer;
         private readonly List<LightningStroke> _lightningStrokes = new List<LightningStroke>(8);
-        private float _lightningWobbleSeed = 0f;
 
         private struct LightningStroke
         {
@@ -198,23 +266,7 @@ namespace Oxide.Plugins
             public float Softness; // 0 = hard white spike, 1 = milky cloud flash
         }
 
-        private float currentCcn = 0.35f;
-        private float targetCcn = 0.35f;
-        private float currentInstability = 0f;
-        private float targetInstability = 0f;
-        private float _seedBias = 0f;
-        private float _seedBiasEnd = 0f;
-        private float _lastCcnUpdate = 0f;
-
-        private float _lastWeatherSuccessTime = 0f;
-        private int _consecutiveWeatherFails = 0;
         private Timer _weatherRetryTimer;
-        private float _pressureTendency = 0f;
-        private float _rainLatch = 0f;
-        private float _lastGustValue = 0f;
-        private float _lookAheadRain = 0f;
-        private float _lookAheadHours = 0f;
-        private string _lookAheadLabel = "none";
 
         private struct WeatherSample
         {
@@ -247,7 +299,6 @@ namespace Oxide.Plugins
         private readonly List<WeatherSample> _anchorScratch = new List<WeatherSample>(128);
         // Pre-parsed hourly timestamps (filled once per poll, not per minutely sample).
         private readonly List<DateTime> _hourlyTimeScratch = new List<DateTime>(128);
-        private string _lastInterpLogProfile = null;
         private double lastServerUptimeMinutes = 0;
 
         // ==================== INIT / LIFECYCLE ====================
@@ -256,7 +307,7 @@ namespace Oxide.Plugins
         {
             permission.RegisterPermission(AdminPermission, this);
             LoadDefaultMessages();
-            Puts("LiveStatsWorld v1.1.48 loaded (deck mixer: high-only cirrus leaves Overcast)");
+            Puts("LiveStatsWorld v1.1.51 loaded (Clear / Few Clouds / Partly Cloudy)");
         }
 
         private void OnPlayerConnected(BasePlayer player)
@@ -307,29 +358,29 @@ namespace Oxide.Plugins
 
             if (config.UseLocalWeather)
             {
-                WeatherBlendInterval = Mathf.Clamp(config.WeatherBlendInterval, 0.5f, 5f);
+                wx.WeatherBlendInterval = Mathf.Clamp(config.WeatherBlendInterval, 0.5f, 5f);
                 float blendSec = Mathf.Clamp(config.WeatherBlendSeconds, 25f, 180f);
-                _dynamicBlendSeconds = blendSec;
-                WeatherBlendFactor = Mathf.Clamp(WeatherBlendInterval / blendSec, 0.02f, 0.28f);
+                wx._dynamicBlendSeconds = blendSec;
+                wx.WeatherBlendFactor = Mathf.Clamp(wx.WeatherBlendInterval / blendSec, 0.02f, 0.28f);
 
                 if (config.PersistWeatherState)
                     LoadWeatherState();
 
                 Puts($"LocalWeather enabled (poll every {Mathf.Max(5, config.LocalWeatherUpdateIntervalMinutes)}m, " +
-                     $"blend tick {WeatherBlendInterval:F1}s, blend base {blendSec:F0}s)");
+                     $"blend tick {wx.WeatherBlendInterval:F1}s, blend base {blendSec:F0}s)");
 
                 // First poll after bootstrap so navmesh / asset warmup does not
                 // starve Unity's HTTP stream (timeoutReached on a 200 body).
                 timer.Once(25f, SyncLocalWeather);
                 float pollInterval = Mathf.Max(5, config.LocalWeatherUpdateIntervalMinutes) * 60f;
-                _weatherPollTimer = timer.Every(pollInterval, SyncLocalWeather);
-                _weatherBlendTimer = timer.Every(WeatherBlendInterval, BlendLocalWeather);
+                RestartEvery(ref _weatherPollTimer, pollInterval, SyncLocalWeather);
+                RestartEvery(ref _weatherBlendTimer, wx.WeatherBlendInterval, BlendLocalWeather);
             }
 
             if (config.CollectWorldStats)
             {
                 float interval = Mathf.Max(5f, config.WorldStatsUpdateInterval);
-                _worldTimer = timer.Every(interval, CollectWorldStats);
+                RestartEvery(ref _worldTimer, interval, CollectWorldStats);
                 timer.Once(5f, CollectWorldStats);
                 Puts($"World stats collection enabled (every {interval:F0}s)");
             }
@@ -362,29 +413,14 @@ namespace Oxide.Plugins
             {
                 Puts("LiveStats host unloaded -- pausing all timers.");
                 _ready = false;
-                _worldTimer?.Destroy();
-                _worldTimer = null;
-                _weatherBlendTimer?.Destroy();
-                _weatherBlendTimer = null;
-                _weatherPollTimer?.Destroy();
-                _weatherPollTimer = null;
-                _timeSyncTimer?.Destroy();
-                _timeSyncTimer = null;
-                _lightningFlashTimer?.Destroy();
-                _lightningFlashTimer = null;
-                StopCloudSwapTicker();
+                StopManagedTimers();
                 RestoreVanillaTimeProgression();
             }
         }
 
         void Unload()
         {
-            _worldTimer?.Destroy();
-            _weatherBlendTimer?.Destroy();
-            _weatherPollTimer?.Destroy();
-            _timeSyncTimer?.Destroy();
-            _lightningFlashTimer?.Destroy();
-            StopCloudSwapTicker();
+            StopManagedTimers();
             RestoreVanillaTimeProgression();
 
             if (config != null && config.UseLocalWeather && config.PersistWeatherState)
@@ -393,12 +429,7 @@ namespace Oxide.Plugins
 
         void OnServerShutdown()
         {
-            _worldTimer?.Destroy();
-            _weatherBlendTimer?.Destroy();
-            _weatherPollTimer?.Destroy();
-            _timeSyncTimer?.Destroy();
-            _lightningFlashTimer?.Destroy();
-            StopCloudSwapTicker();
+            StopManagedTimers();
             RestoreVanillaTimeProgression();
             if (config != null && config.UseLocalWeather && config.PersistWeatherState)
                 SaveWeatherState();
@@ -457,13 +488,48 @@ namespace Oxide.Plugins
                 Puts($"[Time] Event suppress active for {secs:F0}s");
         }
 
+        // ==================== TIMER HUB / LOGGING ====================
+
+        private void StopTimer(ref Timer slot)
+        {
+            slot?.Destroy();
+            slot = null;
+        }
+
+        private void RestartEvery(ref Timer slot, float interval, Action action)
+        {
+            StopTimer(ref slot);
+            slot = timer.Every(interval, action);
+        }
+
+        private void StopManagedTimers()
+        {
+            StopTimer(ref _worldTimer);
+            StopTimer(ref _weatherBlendTimer);
+            StopTimer(ref _weatherPollTimer);
+            StopTimer(ref _timeSyncTimer);
+            StopTimer(ref _lightningFlashTimer);
+            StopTimer(ref _weatherRetryTimer);
+            StopCloudSwapTicker();
+        }
+
+        private void Log(LogArea area, string message)
+        {
+            Puts($"[{area}] {message}");
+        }
+
+        private void LogDebug(LogArea area, string message)
+        {
+            if (config != null && config.DebugMode)
+                Puts($"[{area}] {message}");
+        }
+
         // ==================== REAL TIME / DATE SYSTEM ====================
 
         private void StartTimeSystem()
         {
             if (config.TimeSystem == null || !config.TimeSystem.Enabled) return;
-            _timeSyncTimer?.Destroy();
-            _timeSyncTimer = null;
+            StopTimer(ref _timeSyncTimer);
 
             // RTC (SyncHourToRealTime): own the clock — freeze vanilla progression.
             // RTC off: leave ProgressTime on so the in-game hour still cycles at game
@@ -515,7 +581,7 @@ namespace Oxide.Plugins
             float interval = SplitDayActive()
                 ? Mathf.Clamp(config.TimeSystem.SplitDay.UpdateIntervalSeconds, 1f, 10f)
                 : Mathf.Max(10f, config.TimeSystem.UpdateIntervalSeconds);
-            _timeSyncTimer = timer.Every(interval, SyncRealTimeAndDate);
+            RestartEvery(ref _timeSyncTimer, interval, SyncRealTimeAndDate);
 
             // When local weather is enabled the first successful Open-Meteo response
             // already has the real TZ offset + sunrise/sunset and will call
@@ -818,7 +884,7 @@ namespace Oxide.Plugins
 
         /// <summary>
         /// Lightweight brightness push used when UseLocalWeather is false.
-        /// Full weather path already modulates targetBrightness via GetSolarDayFactor.
+        /// Full weather path already modulates wx.targetBrightness via GetSolarDayFactor.
         /// </summary>
         private void ApplyStandaloneSolarBrightness(DateTime localNow)
         {
@@ -831,11 +897,11 @@ namespace Oxide.Plugins
 
             float bri = Mathf.Lerp(nightScale, 1.05f, factor);
             // Only write when it actually changed enough to matter
-            if (float.IsNaN(appliedBrightness) || Mathf.Abs(bri - appliedBrightness) >= 0.02f)
+            if (float.IsNaN(wx.appliedBrightness) || Mathf.Abs(bri - wx.appliedBrightness) >= 0.02f)
             {
-                SetWeatherConvar("weather.atmosphere_brightness", bri, ref appliedBrightness, 0.02f);
-                currentBrightness = bri;
-                targetBrightness = bri;
+                SetWeatherConvar("weather.atmosphere_brightness", bri, ref wx.appliedBrightness, 0.02f);
+                wx.currentBrightness = bri;
+                wx.targetBrightness = bri;
             }
         }
 
@@ -1133,9 +1199,9 @@ namespace Oxide.Plugins
                         EnqueueOpenMeteo(urlMin, (c2, r2) => HandleResponse(c2, r2, false));
                         return;
                     }
-                    _consecutiveWeatherFails++;
-                    float age = _lastWeatherSuccessTime > 0f ? Time.realtimeSinceStartup - _lastWeatherSuccessTime : -1f;
-                    Puts($"[Weather] Poll failed (x{_consecutiveWeatherFails}); continuing with {_weatherAnchors.Count} stale anchors" +
+                    wx._consecutiveWeatherFails++;
+                    float age = wx._lastWeatherSuccessTime > 0f ? Time.realtimeSinceStartup - wx._lastWeatherSuccessTime : -1f;
+                    Puts($"[Weather] Poll failed (x{wx._consecutiveWeatherFails}); continuing with {_weatherAnchors.Count} stale anchors" +
                          (age >= 0 ? $" (last success {age:F0}s ago)" : ""));
                     ScheduleWeatherRetry();
                     return;
@@ -1147,7 +1213,7 @@ namespace Oxide.Plugins
                     if (data == null)
                     {
                         Puts("[Weather] Open-Meteo JSON deserialized to null -- keeping existing anchors");
-                        _consecutiveWeatherFails++;
+                        wx._consecutiveWeatherFails++;
                         return;
                     }
 
@@ -1377,17 +1443,16 @@ namespace Oxide.Plugins
                     if (anchors.Count == 0)
                     {
                         Puts("[Weather] Parsed 0 anchors -- keeping previous forecast");
-                        _consecutiveWeatherFails++;
+                        wx._consecutiveWeatherFails++;
                         return;
                     }
 
                     // Swap into live list (still on this frame — cheap Clear/AddRange)
                     _weatherAnchors.Clear();
                     _weatherAnchors.AddRange(anchors);
-                    _lastWeatherSuccessTime = Time.realtimeSinceStartup;
-                    _consecutiveWeatherFails = 0;
-                    _weatherRetryTimer?.Destroy();
-                    _weatherRetryTimer = null;
+                    wx._lastWeatherSuccessTime = Time.realtimeSinceStartup;
+                    wx._consecutiveWeatherFails = 0;
+                    StopTimer(ref _weatherRetryTimer);
 
                     int anchorCount = _weatherAnchors.Count;
                     string tzName = _cachedTimezone;
@@ -1431,10 +1496,11 @@ namespace Oxide.Plugins
 
         private void ScheduleWeatherRetry()
         {
-            if (_consecutiveWeatherFails > 3) return;
+            if (wx._consecutiveWeatherFails > 3) return;
             if (_weatherRetryTimer != null && !_weatherRetryTimer.Destroyed) return;
-            float delay = _consecutiveWeatherFails <= 1 ? 20f : 45f;
-            Puts($"[Weather] Retrying poll in {delay:F0}s");
+            float delay = wx._consecutiveWeatherFails <= 1 ? 20f : 45f;
+            Log(LogArea.Weather, $"Retrying poll in {delay:F0}s");
+            StopTimer(ref _weatherRetryTimer);
             _weatherRetryTimer = timer.Once(delay, () =>
             {
                 _weatherRetryTimer = null;
@@ -1546,14 +1612,14 @@ namespace Oxide.Plugins
                 idealSeconds *= Mathf.Lerp(1.0f, 0.62f, windFactor);
                 if (dDir > 0.5f) idealSeconds *= 0.85f;
                 float configBase = Mathf.Clamp(config.WeatherBlendSeconds, 25f, 180f);
-                _dynamicBlendSeconds = Mathf.Clamp(idealSeconds, 20f, Mathf.Min(configBase * 1.6f, 180f));
-                WeatherBlendFactor = Mathf.Clamp(WeatherBlendInterval / _dynamicBlendSeconds, 0.02f, 0.30f);
+                wx._dynamicBlendSeconds = Mathf.Clamp(idealSeconds, 20f, Mathf.Min(configBase * 1.6f, 180f));
+                wx.WeatherBlendFactor = Mathf.Clamp(wx.WeatherBlendInterval / wx._dynamicBlendSeconds, 0.02f, 0.30f);
             }
             else
             {
                 float blendSec = Mathf.Clamp(config.WeatherBlendSeconds, 25f, 180f);
-                _dynamicBlendSeconds = blendSec;
-                WeatherBlendFactor = Mathf.Clamp(WeatherBlendInterval / blendSec, 0.02f, 0.28f);
+                wx._dynamicBlendSeconds = blendSec;
+                wx.WeatherBlendFactor = Mathf.Clamp(wx.WeatherBlendInterval / blendSec, 0.02f, 0.28f);
             }
 
             int weatherCode = u < 0.5f ? a.WeatherCode : b.WeatherCode;
@@ -1578,7 +1644,7 @@ namespace Oxide.Plugins
             float visibilityM = Mathf.Lerp(a.VisibilityM, b.VisibilityM, u);
             bool isDay = u < 0.5f ? a.IsDay : b.IsDay;
 
-            _pressureTendency = b.Pressure - a.Pressure;
+            wx._pressureTendency = b.Pressure - a.Pressure;
 
             ComputeTargetsFromRaw(weatherCode, cloudPercent, cloudLow, cloudMid, cloudHigh,
                 temperature, dewPoint, humidity, pressure, rainMm, snowMm, showersMm,
@@ -1596,7 +1662,7 @@ namespace Oxide.Plugins
             float windKmh = Mathf.Max(windSustained, windGust * 0.7f);
             float gustValue = Mathf.Clamp01(Mathf.InverseLerp(0f, 80f, windGust));
             float sustainedValue = Mathf.Clamp01(Mathf.InverseLerp(0f, 55f, windSustained));
-            _lastGustValue = gustValue;
+            wx._lastGustValue = gustValue;
             float tempDewSpread = Mathf.Abs(temperature - dewPoint);
 
             float calculatedFog = 0f;
@@ -1626,8 +1692,8 @@ namespace Oxide.Plugins
             if (pressure > 0)
                 pressureFactor = Mathf.Clamp01(Mathf.InverseLerp(1020f, 990f, pressure));
             float tendFactor = 0f;
-            if (Mathf.Abs(_pressureTendency) > 0.3f)
-                tendFactor = Mathf.Clamp(_pressureTendency / 8f, -1f, 1f);
+            if (Mathf.Abs(wx._pressureTendency) > 0.3f)
+                tendFactor = Mathf.Clamp(wx._pressureTendency / 8f, -1f, 1f);
 
             float cloudDensityModifier = Mathf.Lerp(0.95f, 1.35f, pressureFactor);
             if (tendFactor < 0f) cloudDensityModifier *= Mathf.Lerp(1f, 1.12f, -tendFactor);
@@ -1673,14 +1739,14 @@ namespace Oxide.Plugins
             // 0.08 used to eat 0.1 mm/h drizzle (rainValue ≈ 0.03).
             const float rainOn = 0.03f;
             const float rainOff = 0.015f;
-            if (_rainLatch < 0.5f)
+            if (wx._rainLatch < 0.5f)
             {
-                if (rainValue >= rainOn) _rainLatch = 1f;
+                if (rainValue >= rainOn) wx._rainLatch = 1f;
                 else rainValue = 0f;
             }
             else
             {
-                if (rainValue <= rainOff) { _rainLatch = 0f; rainValue = 0f; }
+                if (rainValue <= rainOff) { wx._rainLatch = 0f; rainValue = 0f; }
                 else rainValue = Mathf.Max(rainValue, rainOff + 0.01f);
             }
 
@@ -1694,7 +1760,7 @@ namespace Oxide.Plugins
 
             if (config.EnableCcnPhysics && rainValue > 0.02f)
             {
-                float eff = RainEfficiencyFromCcn(currentCcn);
+                float eff = RainEfficiencyFromCcn(wx.currentCcn);
                 rainValue = Mathf.Clamp01(rainValue * eff);
             }
 
@@ -1725,10 +1791,10 @@ namespace Oxide.Plugins
             bool moderatePrecip = rainValue >= 0.22f || (rainRaw >= 1.5f);
             // Instability is computed moisture/shear/CAPE mix — do NOT also OR cape>=700 here.
             // That made every veryHighCape hour count as unstable and lock Storm_VClouds with Rain:0.
-            bool unstable = currentInstability >= 0.55f;
+            bool unstable = wx.currentInstability >= 0.55f;
             bool pressureSupport = pressure > 0f && pressure < 1008f;
-            bool fallingPressure = _pressureTendency < -1.2f;
-            bool lookAheadStorm = _lookAheadLabel == "storm" || (_lookAheadRain > 0.40f && _lookAheadHours > 0f && _lookAheadHours < 6f);
+            bool fallingPressure = wx._pressureTendency < -1.2f;
+            bool lookAheadStorm = wx._lookAheadLabel == "storm" || (wx._lookAheadRain > 0.40f && wx._lookAheadHours > 0f && wx._lookAheadHours < 6f);
             bool gusty = windGust >= 45f || gustValue >= 0.55f;
             bool wetSignal = moderatePrecip || heavyPrecip || weatherCode >= 51;
             bool convectiveSupport = fallingPressure || lookAheadStorm || gusty || wetSignal;
@@ -1737,6 +1803,7 @@ namespace Oxide.Plugins
             bool stormSkyOk = weatherCode >= 80 || rainValue >= 0.12f || rainRaw >= 0.8f;
 
             string profile = earlyProfile; // start from WMO mapping; may be promoted below
+            profile = RefineFairSkyProfile(profile, weatherCode, cloudLow + cloudMid + cloudHigh, cloudPercent, rainValue);
             bool aggressivePromo = false; // true when we forced storm without WMO 95+
 
             if (config.EnableAggressiveStormDetection && profile != "storm" && profile != "snow")
@@ -1769,7 +1836,7 @@ namespace Oxide.Plugins
             if ((config.ForceRainWithSyntheticStorm || !config.AllowDryLightning) && aggressivePromo && weatherCode < 95)
             {
                 float rainFloor = lookAheadStorm
-                    ? Mathf.Lerp(0.35f, 0.55f, Mathf.Clamp01(_lookAheadRain))
+                    ? Mathf.Lerp(0.35f, 0.55f, Mathf.Clamp01(wx._lookAheadRain))
                     : (veryHighCape ? 0.45f : 0.35f);
                 if (rainValue < rainFloor)
                     rainValue = rainFloor;
@@ -1781,13 +1848,13 @@ namespace Oxide.Plugins
                 if (weatherCode >= 95)
                 {
                     thunderValue = weatherCode >= 96 ? 0.85f : 0.70f;
-                    thunderValue = Mathf.Clamp01(thunderValue + rainValue * 0.25f + windValue * 0.12f + currentInstability * 0.20f);
+                    thunderValue = Mathf.Clamp01(thunderValue + rainValue * 0.25f + windValue * 0.12f + wx.currentInstability * 0.20f);
                 }
                 else if (config.AllowDryLightning)
                 {
                     // Thermal storms can flash with little/no rain. Rain still adds punch.
                     float thermal = veryHighCape ? 0.52f : highCape ? 0.32f : 0.18f;
-                    float inst = currentInstability * 0.38f;
+                    float inst = wx.currentInstability * 0.38f;
                     float rainPart = rainValue * 0.32f;
                     thunderValue = Mathf.Clamp01(thermal + inst + rainPart + windValue * 0.10f);
                 }
@@ -1795,7 +1862,7 @@ namespace Oxide.Plugins
                 {
                     float rainDriven = Mathf.Lerp(0.12f, 0.72f, Mathf.Clamp01(rainValue / 0.55f));
                     float capeBoost = highCape ? Mathf.Lerp(0f, 0.18f, Mathf.Clamp01(rainValue / 0.40f)) : 0f;
-                    thunderValue = Mathf.Clamp01(rainDriven + capeBoost + windValue * 0.10f + currentInstability * 0.12f);
+                    thunderValue = Mathf.Clamp01(rainDriven + capeBoost + windValue * 0.10f + wx.currentInstability * 0.12f);
                 }
             }
             else if (!isSnow && (highCape || veryHighCape) && (unstable || gusty || fallingPressure || rainValue > 0.20f))
@@ -1804,12 +1871,12 @@ namespace Oxide.Plugins
                     ? (veryHighCape ? 0.42f : 0.24f)
                     : (rainValue * 0.35f);
                 float rainGate = config.AllowDryLightning ? 1f : Mathf.Clamp01(rainValue / 0.30f);
-                thunderValue = Mathf.Clamp01((thermal + currentInstability * 0.32f + rainValue * 0.28f + windValue * 0.10f) * Mathf.Lerp(0.35f, 1f, rainGate));
+                thunderValue = Mathf.Clamp01((thermal + wx.currentInstability * 0.32f + rainValue * 0.28f + windValue * 0.10f) * Mathf.Lerp(0.35f, 1f, rainGate));
             }
-            else if (config.EnableInstability && currentInstability > 0.60f && (highCape || rainValue > 0.12f || gusty))
+            else if (config.EnableInstability && wx.currentInstability > 0.60f && (highCape || rainValue > 0.12f || gusty))
             {
                 float rainGate = config.AllowDryLightning ? 1f : Mathf.Clamp01(rainValue / 0.25f);
-                thunderValue = Mathf.Clamp01(((currentInstability - 0.40f) * 0.90f + rainValue * 0.20f + (highCape ? 0.12f : 0f)) * Mathf.Lerp(0.40f, 1f, rainGate));
+                thunderValue = Mathf.Clamp01(((wx.currentInstability - 0.40f) * 0.90f + rainValue * 0.20f + (highCape ? 0.12f : 0f)) * Mathf.Lerp(0.40f, 1f, rainGate));
             }
 
             float rainbowValue = 0f;
@@ -1848,7 +1915,7 @@ namespace Oxide.Plugins
             float atmosphereMie = Mathf.Clamp01(humidityFactor * 0.55f + visibilityFactor * 0.70f + dewFactor * 0.45f);
             if (fogValue > 0.35f) atmosphereMie = Mathf.Max(atmosphereMie, fogValue * 1.15f);
             if (config.EnableCcnPhysics)
-                atmosphereMie = Mathf.Clamp(atmosphereMie + currentCcn * 0.28f, 0f, 1.7f);
+                atmosphereMie = Mathf.Clamp(atmosphereMie + wx.currentCcn * 0.28f, 0f, 1.7f);
             atmosphereMie = Mathf.Clamp(atmosphereMie * 1.10f, 0f, 1.70f);
 
             float atmosphereRayleigh = Mathf.Lerp(1.20f, 0.60f, atmosphereMie * 0.85f + pressureFactor * 0.15f);
@@ -1928,7 +1995,7 @@ namespace Oxide.Plugins
                     visCue = Mathf.InverseLerp(config.DustVisibilityMaxM, 500f, visibilityM) * 0.35f;
                 dustIntensity = Mathf.Clamp01(dry * windy + visCue * dry);
                 if (config.EnableCcnPhysics)
-                    dustIntensity = Mathf.Clamp01(dustIntensity + currentCcn * 0.15f * dry);
+                    dustIntensity = Mathf.Clamp01(dustIntensity + wx.currentCcn * 0.15f * dry);
             }
 
             float cloudDensity = cloudsValue;
@@ -1959,62 +2026,62 @@ namespace Oxide.Plugins
 
             float finalAttenuation = Mathf.Clamp(cloudAttenuation * (1.0f + (cloudDensity - 0.5f) * 0.45f), 0.50f, 1.95f);
 
-            targetClouds = cloudDensity;
-            targetCloudOpacity = cloudOpacity;
-            targetMie = atmosphereMie;
-            targetBrightness = atmosphereBrightness;
-            targetRain = rainValue;
-            targetWind = windValue;
-            targetFog = fogValue;
-            targetFogMultiplier = fogMultiplier;
-            targetFogRampStart = fogRampStart;
-            targetFogRampEnd = fogRampEnd;
-            targetFogHeightFalloff = fogHeightFalloff;
-            targetThunder = thunderValue;
-            targetRainbow = rainbowValue;
-            targetWetness = wetnessRain;
-            targetWetnessSnow = wetnessSnow;
-            targetDust = dustIntensity;
-            targetRayleigh = atmosphereRayleigh;
-            targetContrast = atmosphereContrast;
-            targetDirectionality = atmosphereDirectionality;
-            targetAttenuation = finalAttenuation;
-            targetCloudBrightness = cloudBrightness;
-            targetCloudSharpness = cloudSharpness;
-            targetCloudScattering = cloudScattering;
-            targetCloudColoring = cloudColoring;
-            targetCloudSize = cloudSize;
-            targetCloudSaturation = cloudSaturation;
-            lastWeatherCode = weatherCode;
-            lastCloudLow = cloudLow;
-            lastCloudMid = cloudMid;
-            lastCloudHigh = cloudHigh;
-            pendingWeatherProfile = profile;
-            lastOmCape = cape;
-            lastOmShortwave = shortwave;
-            lastOmHumidity = humidity;
-            lastOmVisibility = visibilityM;
-            lastOmIsDay = isDay;
+            wx.targetClouds = cloudDensity;
+            wx.targetCloudOpacity = cloudOpacity;
+            wx.targetMie = atmosphereMie;
+            wx.targetBrightness = atmosphereBrightness;
+            wx.targetRain = rainValue;
+            wx.targetWind = windValue;
+            wx.targetFog = fogValue;
+            wx.targetFogMultiplier = fogMultiplier;
+            wx.targetFogRampStart = fogRampStart;
+            wx.targetFogRampEnd = fogRampEnd;
+            wx.targetFogHeightFalloff = fogHeightFalloff;
+            wx.targetThunder = thunderValue;
+            wx.targetRainbow = rainbowValue;
+            wx.targetWetness = wetnessRain;
+            wx.targetWetnessSnow = wetnessSnow;
+            wx.targetDust = dustIntensity;
+            wx.targetRayleigh = atmosphereRayleigh;
+            wx.targetContrast = atmosphereContrast;
+            wx.targetDirectionality = atmosphereDirectionality;
+            wx.targetAttenuation = finalAttenuation;
+            wx.targetCloudBrightness = cloudBrightness;
+            wx.targetCloudSharpness = cloudSharpness;
+            wx.targetCloudScattering = cloudScattering;
+            wx.targetCloudColoring = cloudColoring;
+            wx.targetCloudSize = cloudSize;
+            wx.targetCloudSaturation = cloudSaturation;
+            wx.lastWeatherCode = weatherCode;
+            wx.lastCloudLow = cloudLow;
+            wx.lastCloudMid = cloudMid;
+            wx.lastCloudHigh = cloudHigh;
+            wx.pendingWeatherProfile = profile;
+            wx.lastOmCape = cape;
+            wx.lastOmShortwave = shortwave;
+            wx.lastOmHumidity = humidity;
+            wx.lastOmVisibility = visibilityM;
+            wx.lastOmIsDay = isDay;
             ComputeOptionalLightingFromMeteo(rainValue, cloudsValue, fogValue, thunderValue,
                 wetnessRain, cape, shortwave, humidity, visibilityM, isDay);
             ClampWeatherTargets();
 
-            if (!_weatherInitialized)
+            if (!wx._weatherInitialized)
             {
-                currentClouds = targetClouds; currentCloudOpacity = targetCloudOpacity;
-                currentMie = targetMie; currentBrightness = targetBrightness;
-                currentRain = targetRain; currentWind = targetWind; currentFog = targetFog;
-                currentFogMultiplier = targetFogMultiplier;
-                currentFogRampStart = targetFogRampStart; currentFogRampEnd = targetFogRampEnd;
-                currentFogHeightFalloff = targetFogHeightFalloff;
-                currentThunder = targetThunder; currentRainbow = targetRainbow; currentWetness = targetWetness;
-                currentWetnessSnow = targetWetnessSnow; currentDust = targetDust;
-                currentRayleigh = targetRayleigh; currentContrast = targetContrast;
-                currentDirectionality = targetDirectionality; currentAttenuation = targetAttenuation;
-                currentCloudBrightness = targetCloudBrightness; currentCloudSharpness = targetCloudSharpness;
-                currentCloudScattering = targetCloudScattering; currentCloudColoring = targetCloudColoring;
-                currentCloudSize = targetCloudSize; currentCloudSaturation = targetCloudSaturation;
-                _weatherInitialized = true;
+                wx.currentClouds = wx.targetClouds; wx.currentCloudOpacity = wx.targetCloudOpacity;
+                wx.currentMie = wx.targetMie; wx.currentBrightness = wx.targetBrightness;
+                wx.currentRain = wx.targetRain; wx.currentWind = wx.targetWind; wx.currentFog = wx.targetFog;
+                wx.currentFogMultiplier = wx.targetFogMultiplier;
+                wx.currentFogRampStart = wx.targetFogRampStart; wx.currentFogRampEnd = wx.targetFogRampEnd;
+                wx.currentFogHeightFalloff = wx.targetFogHeightFalloff;
+                wx.currentThunder = wx.targetThunder; wx.currentRainbow = wx.targetRainbow; wx.currentWetness = wx.targetWetness;
+                wx.currentWetnessSnow = wx.targetWetnessSnow; wx.currentDust = wx.targetDust;
+                wx.currentRayleigh = wx.targetRayleigh; wx.currentContrast = wx.targetContrast;
+                wx.currentDirectionality = wx.targetDirectionality; wx.currentAttenuation = wx.targetAttenuation;
+                wx.currentCloudBrightness = wx.targetCloudBrightness; wx.currentCloudSharpness = wx.targetCloudSharpness;
+                wx.currentCloudScattering = wx.targetCloudScattering; wx.currentCloudColoring = wx.targetCloudColoring;
+                wx.currentCloudSize = wx.targetCloudSize; wx.currentCloudSaturation = wx.targetCloudSaturation;
+                wx._weatherInitialized = true;
                 SetWeatherProfile(profile, rainValue);
             }
             else if (forceLog)
@@ -2025,46 +2092,46 @@ namespace Oxide.Plugins
             string forecastName = profile switch
             {
                 "storm" => "Storm", "rain" => "Rain", "snow" => "Snow", "dust" => "Dust", "fog" => "Fog",
-                "overcast" => "Overcast", "partly_cloudy" => "Partly Cloudy", _ => "Clear"
+                "overcast" => "Overcast", "partly_cloudy" => "Partly Cloudy", "few" => "Few Clouds", _ => "Clear"
             };
 
-            if (forceLog || forecastName != _lastInterpLogProfile)
+            if (forceLog || forecastName != wx._lastInterpLogProfile)
             {
-                _lastInterpLogProfile = forecastName;
+                wx._lastInterpLogProfile = forecastName;
                 string wantAsset = DesiredCloudConfig(profile, rainValue);
-                string haveAsset = string.IsNullOrEmpty(currentCloudConfig) ? "?" : currentCloudConfig;
+                string haveAsset = string.IsNullOrEmpty(wx.currentCloudConfig) ? "?" : wx.currentCloudConfig;
                 string deck = (config != null && config.UseDeckMixer) ? "deck" : "wmo";
-                Puts($"[Weather] Targets -> {forecastName} | {deck} loaded:{haveAsset} want:{wantAsset} | code={weatherCode} cape={cape:F0} Rain:{targetRain:F2} Clouds:{targetClouds:F2} L/M/H:{cloudLow:F2}/{cloudMid:F2}/{cloudHigh:F2} | CCN:{currentCcn:F2} instab:{currentInstability:F2} | blend~{_dynamicBlendSeconds:F0}s");
+                Puts($"[Weather] Targets -> {forecastName} | {deck} loaded:{haveAsset} want:{wantAsset} | code={weatherCode} cape={cape:F0} Rain:{wx.targetRain:F2} Clouds:{wx.targetClouds:F2} L/M/H:{cloudLow:F2}/{cloudMid:F2}/{cloudHigh:F2} | CCN:{wx.currentCcn:F2} instab:{wx.currentInstability:F2} | blend~{wx._dynamicBlendSeconds:F0}s");
             }
         }
 
         private void TryCommitWeatherProfile(string profile, float rainIntensity)
         {
-            currentWeatherProfile = profile;
-            if (!config.AllowCloudConfigSwap || _cloudSwapPhase != 0) return;
+            wx.currentWeatherProfile = profile;
+            if (!config.AllowCloudConfigSwap || _cloudSwapPhase != CloudSwapPhase.Idle) return;
             string desiredConfig = DesiredCloudConfig(profile, rainIntensity);
-            if (string.IsNullOrEmpty(desiredConfig) || desiredConfig == currentCloudConfig)
+            if (string.IsNullOrEmpty(desiredConfig) || desiredConfig == wx.currentCloudConfig)
             {
-                hysteresisCandidate = null;
-                hysteresisVotes = 0;
+                wx.hysteresisCandidate = null;
+                wx.hysteresisVotes = 0;
                 return;
             }
-            if (desiredConfig == hysteresisCandidate) hysteresisVotes++;
-            else { hysteresisCandidate = desiredConfig; hysteresisVotes = 1; }
+            if (desiredConfig == wx.hysteresisCandidate) wx.hysteresisVotes++;
+            else { wx.hysteresisCandidate = desiredConfig; wx.hysteresisVotes = 1; }
             // Soft-sky swaps (Clear / RainMild / Overcast): need 2+ agreeing polls so we don't thrash
             // Exception: no asset loaded yet this session → apply immediately
-            bool leavingHeavy = currentCloudConfig == "Storm_VClouds" || currentCloudConfig == "RainHeavy_VClouds";
+            bool leavingHeavy = wx.currentCloudConfig == "Storm_VClouds" || wx.currentCloudConfig == "RainHeavy_VClouds";
             bool softSkySwap = !leavingHeavy
                 && IsSoftSkyCloudConfig(desiredConfig)
-                && IsSoftSkyCloudConfig(currentCloudConfig);
+                && IsSoftSkyCloudConfig(wx.currentCloudConfig);
             int required = softSkySwap ? Mathf.Max(2, config.HysteresisRequiredVotes) : Mathf.Max(1, config.HysteresisRequiredVotes);
-            if (string.IsNullOrEmpty(currentCloudConfig) || leavingHeavy)
+            if (string.IsNullOrEmpty(wx.currentCloudConfig) || leavingHeavy)
                 required = 1;
-            if (hysteresisVotes >= required)
+            if (wx.hysteresisVotes >= required)
             {
                 BeginCloudAssetDissolve(desiredConfig);
-                hysteresisCandidate = null;
-                hysteresisVotes = 0;
+                wx.hysteresisCandidate = null;
+                wx.hysteresisVotes = 0;
             }
         }
 
@@ -2088,11 +2155,11 @@ namespace Oxide.Plugins
         private bool IsLowAltitudeCloudDeck()
         {
             float minLow = config != null && config.LowDeckCloudMin > 0f ? config.LowDeckCloudMin : 0.50f;
-            if (lastCloudLow < minLow) return false;
+            if (wx.lastCloudLow < minLow) return false;
             // Low must be the main layer, not just present under a thick mid/high stack.
-            if (lastCloudLow + 0.08f < lastCloudMid) return false;
-            if (lastCloudLow + 0.05f < lastCloudHigh) return false;
-            return lastCloudMid < 0.62f;
+            if (wx.lastCloudLow + 0.08f < wx.lastCloudMid) return false;
+            if (wx.lastCloudLow + 0.05f < wx.lastCloudHigh) return false;
+            return wx.lastCloudMid < 0.62f;
         }
 
         private bool ThunderBlocksClearSky()
@@ -2100,7 +2167,7 @@ namespace Oxide.Plugins
             float floor = 0.20f;
             if (config != null && config.LightningThunderThreshold > 0f)
                 floor = Mathf.Min(floor, config.LightningThunderThreshold);
-            return Mathf.Max(currentThunder, targetThunder) >= floor;
+            return Mathf.Max(wx.currentThunder, wx.targetThunder) >= floor;
         }
 
         private string DesiredCloudConfig(string profile, float rainIntensity)
@@ -2121,17 +2188,17 @@ namespace Oxide.Plugins
         /// </summary>
         private string PickDeckCloudConfig(string profile, float rainIntensity)
         {
-            float low = lastCloudLow;
-            float mid = lastCloudMid;
-            float high = lastCloudHigh;
+            float low = wx.lastCloudLow;
+            float mid = wx.lastCloudMid;
+            float high = wx.lastCloudHigh;
             float stack = low + mid + high;
             bool lowDeck = (config == null || config.UseFogCloudsForLowDeck) && IsLowAltitudeCloudDeck();
             bool highOnly = high > 0.40f && (low + mid) < 0.22f;
             bool cirrus = highOnly || (high > 0.45f && (low + mid) < 0.35f);
             bool midThick = mid >= 0.72f && mid >= low - 0.02f;
-            bool broken = stack < 0.28f && rainIntensity < 0.05f && lastWeatherCode <= 1;
+            bool broken = stack < 0.28f && rainIntensity < 0.05f && wx.lastWeatherCode <= 1;
 
-            if (profile == "storm" && (rainIntensity >= 0.12f || lastWeatherCode >= 80))
+            if (profile == "storm" && (rainIntensity >= 0.12f || wx.lastWeatherCode >= 80))
                 return "Storm_VClouds";
             if (profile == "rain" && rainIntensity > 0.55f)
                 return "RainHeavy_VClouds";
@@ -2139,7 +2206,7 @@ namespace Oxide.Plugins
                 return "Fog_VClouds";
             if (profile == "dust")
                 return "Overcast_VClouds";
-            if (broken || (profile == "clear" && stack < 0.22f))
+            if (profile == "few" || broken || (profile == "clear" && stack < 0.22f))
                 return "Clear_VClouds";
             // WMO 3 + 99% high is still a cirrus deck — do not keep Overcast_VClouds.
             if (cirrus && rainIntensity < 0.08f)
@@ -2159,7 +2226,7 @@ namespace Oxide.Plugins
             if (config != null && config.PreferOvercastOnly)
             {
                 if (profile == "storm")
-                    return (rainIntensity >= 0.12f || lastWeatherCode >= 80) ? "Storm_VClouds" : "RainMild_VClouds";
+                    return (rainIntensity >= 0.12f || wx.lastWeatherCode >= 80) ? "Storm_VClouds" : "RainMild_VClouds";
                 if (profile == "rain") return rainIntensity > 0.55f ? "RainHeavy_VClouds" : "RainMild_VClouds";
                 if (profile == "fog" || lowDeck) return "Fog_VClouds";
                 return "Overcast_VClouds";
@@ -2168,11 +2235,12 @@ namespace Oxide.Plugins
             switch (profile)
             {
                 case "storm":
-                    return (rainIntensity >= 0.12f || lastWeatherCode >= 80) ? "Storm_VClouds" : "RainMild_VClouds";
+                    return (rainIntensity >= 0.12f || wx.lastWeatherCode >= 80) ? "Storm_VClouds" : "RainMild_VClouds";
                 case "rain":
                     if (rainIntensity > 0.55f) return "RainHeavy_VClouds";
                     return lowDeck ? "Fog_VClouds" : "RainMild_VClouds";
                 case "partly_cloudy": return lowDeck ? "Fog_VClouds" : "RainMild_VClouds";
+                case "few": return "Clear_VClouds";
                 case "snow":
                     if (lowDeck) return "Fog_VClouds";
                     return rainIntensity > 0.4f ? "RainMild_VClouds" : "Overcast_VClouds";
@@ -2229,11 +2297,27 @@ namespace Oxide.Plugins
                 cloudOpacity = Mathf.Clamp01(0.45f + dustIntensity * 0.40f);
                 cloudColoring = Mathf.Min(cloudColoring, 0.55f);
             }
-            else if (profile == "clear" && thick < 0.22f)
+            else if (profile == "clear")
             {
-                cloudDensity = Mathf.Clamp01(Mathf.Lerp(0.02f, 0.18f, cloudsValue));
-                cloudOpacity = Mathf.Clamp01(0.08f + humidityFactor * 0.12f);
+                // Empty dome — same mesh as "few", sliders off so the wisps disappear.
+                cloudDensity = 0f;
+                cloudOpacity = 0f;
+                cloudAttenuation = Mathf.Min(cloudAttenuation, 0.40f);
+                cloudSize = 0.70f;
+                cloudSharpness = 0.65f;
+                cloudScattering = 0.70f;
+                cloudBrightness = Mathf.Max(cloudBrightness, 1.12f);
+            }
+            else if (profile == "few")
+            {
+                // Clear_VClouds at visible-wisp strength.
+                cloudDensity = Mathf.Clamp01(Mathf.Lerp(0.06f, 0.20f, thick));
+                cloudOpacity = Mathf.Clamp01(Mathf.Lerp(0.14f, 0.30f, thick) + humidityFactor * 0.08f);
                 cloudAttenuation = Mathf.Min(cloudAttenuation, 0.50f);
+                cloudSize = Mathf.Clamp(Mathf.Lerp(0.70f, 0.95f, thick), 0.40f, 1.10f);
+                cloudSharpness = 0.60f;
+                cloudScattering = 0.75f;
+                cloudBrightness = Mathf.Max(cloudBrightness, 1.14f);
             }
 
             // High-only deck: thin the sliders so RainMild does not read as a mid overcast slab.
@@ -2256,10 +2340,17 @@ namespace Oxide.Plugins
             switch (profile)
             {
                 case "clear":
-                    cloudDensity = Mathf.Clamp01(Mathf.Lerp(0.02f, 0.18f, cloudsValue));
-                    cloudOpacity = Mathf.Clamp01(0.08f + humidityFactor * 0.12f);
-                    cloudBrightness = 1.20f; cloudSharpness = 0.62f; cloudScattering = 0.70f;
+                    cloudDensity = 0f;
+                    cloudOpacity = 0f;
+                    cloudBrightness = 1.20f; cloudSharpness = 0.65f; cloudScattering = 0.70f;
                     cloudColoring = 1.00f; cloudSize = 0.70f; cloudSaturation = 1.00f;
+                    cloudAttenuation = Mathf.Min(cloudAttenuation, 0.40f);
+                    break;
+                case "few":
+                    cloudDensity = Mathf.Clamp01(Mathf.Lerp(0.06f, 0.20f, cloudsValue));
+                    cloudOpacity = Mathf.Clamp01(0.14f + humidityFactor * 0.10f);
+                    cloudBrightness = 1.16f; cloudSharpness = 0.60f; cloudScattering = 0.75f;
+                    cloudColoring = 1.00f; cloudSize = 0.82f; cloudSaturation = 1.00f;
                     cloudAttenuation = Mathf.Min(cloudAttenuation, 0.50f);
                     break;
                 case "partly_cloudy":
@@ -2339,8 +2430,8 @@ namespace Oxide.Plugins
 
         private void BeginCloudAssetDissolve(string desiredConfig)
         {
-            if (string.IsNullOrEmpty(desiredConfig) || desiredConfig == currentCloudConfig || _cloudSwapPhase != 0) return;
-            BuildSoftSkySwapPath(currentCloudConfig, desiredConfig, _cloudSwapQueue);
+            if (string.IsNullOrEmpty(desiredConfig) || desiredConfig == wx.currentCloudConfig || _cloudSwapPhase != CloudSwapPhase.Idle) return;
+            BuildSoftSkySwapPath(wx.currentCloudConfig, desiredConfig, _cloudSwapQueue);
             if (_cloudSwapQueue.Count == 0) return;
             _cloudSwapHopsTotal = _cloudSwapQueue.Count;
             string first = _cloudSwapQueue[0];
@@ -2348,7 +2439,7 @@ namespace Oxide.Plugins
             string pathLog = first;
             for (int i = 0; i < _cloudSwapQueue.Count; i++)
                 pathLog += " -> " + _cloudSwapQueue[i];
-            Puts($"[Weather] Cloud dissolve path {currentCloudConfig} -> {pathLog}");
+            Puts($"[Weather] Cloud dissolve path {wx.currentCloudConfig} -> {pathLog}");
             StartCloudSwapHop(first);
         }
 
@@ -2356,22 +2447,22 @@ namespace Oxide.Plugins
         {
             if (string.IsNullOrEmpty(hopConfig)) return;
             _cloudSwapDesired = hopConfig;
-            _cloudSwapSavedOpacity = Mathf.Max(CloudSwapFloor, currentCloudOpacity);
-            _cloudSwapSavedCoverage = Mathf.Max(CloudSwapFloorCoverage, currentClouds);
-            _cloudSwapSavedBri = currentBrightness;
-            _cloudSwapSavedCon = currentContrast;
-            _cloudSwapSavedCloudBri = currentCloudBrightness;
-            _cloudSwapSavedRay = currentRayleigh;
-            _cloudSwapSavedAtten = currentAttenuation;
-            _cloudSwapSavedMie = currentMie;
-            _cloudSwapSavedScatter = currentCloudScattering;
-            _cloudSwapSavedColor = currentCloudColoring;
-            _cloudSwapSavedSharp = currentCloudSharpness;
-            _cloudSwapSavedSize = currentCloudSize;
-            _cloudSwapSavedSat = currentCloudSaturation;
-            _cloudSwapSavedDir = currentDirectionality;
-            _cloudSwapSavedVSun = currentVCloudSun;
-            _cloudSwapSavedVMoon = currentVCloudMoon;
+            _cloudSwapSavedOpacity = Mathf.Max(CloudSwapFloor, wx.currentCloudOpacity);
+            _cloudSwapSavedCoverage = Mathf.Max(CloudSwapFloorCoverage, wx.currentClouds);
+            _cloudSwapSavedBri = wx.currentBrightness;
+            _cloudSwapSavedCon = wx.currentContrast;
+            _cloudSwapSavedCloudBri = wx.currentCloudBrightness;
+            _cloudSwapSavedRay = wx.currentRayleigh;
+            _cloudSwapSavedAtten = wx.currentAttenuation;
+            _cloudSwapSavedMie = wx.currentMie;
+            _cloudSwapSavedScatter = wx.currentCloudScattering;
+            _cloudSwapSavedColor = wx.currentCloudColoring;
+            _cloudSwapSavedSharp = wx.currentCloudSharpness;
+            _cloudSwapSavedSize = wx.currentCloudSize;
+            _cloudSwapSavedSat = wx.currentCloudSaturation;
+            _cloudSwapSavedDir = wx.currentDirectionality;
+            _cloudSwapSavedVSun = wx.currentVCloudSun;
+            _cloudSwapSavedVMoon = wx.currentVCloudMoon;
 
             int hopsThisChain = Mathf.Max(1, _cloudSwapHopsTotal);
             float chain = Mathf.Clamp(config.CloudSwapDissolveSeconds, 2.5f, 12f);
@@ -2381,7 +2472,7 @@ namespace Oxide.Plugins
             _cloudSwapHoldDuration = Mathf.Clamp(hop * 0.12f, multi ? 0.18f : 0.25f, multi ? 0.40f : 0.60f);
             _cloudSwapInDuration = Mathf.Max(multi ? 0.90f : 1.6f, hop * 0.50f);
 
-            _cloudSwapPhase = 1;
+            _cloudSwapPhase = CloudSwapPhase.FadeOut;
             _cloudSwapPhaseStart = Time.realtimeSinceStartup;
             StartCloudSwapTicker();
             TickCloudAssetDissolve();
@@ -2395,7 +2486,7 @@ namespace Oxide.Plugins
             if (_cloudSwapTimer != null) return;
             _cloudSwapTimer = timer.Every(CloudSwapTickInterval, () =>
             {
-                if (_cloudSwapPhase == 0)
+                if (_cloudSwapPhase == CloudSwapPhase.Idle)
                 {
                     StopCloudSwapTicker();
                     return;
@@ -2407,43 +2498,35 @@ namespace Oxide.Plugins
 
         private void StopCloudSwapTicker()
         {
-            _cloudSwapTimer?.Destroy();
-            _cloudSwapTimer = null;
+            StopTimer(ref _cloudSwapTimer);
         }
 
         private void InvalidateAppliedSkyConvars()
         {
             // load_cloud_config silently resets engine lighting to the asset defaults.
-            // Forget our last-written cache so the next SetWeatherConvar actually pushes.
-            appliedClouds = appliedCloudOpacity = appliedAttenuation = float.NaN;
-            appliedBrightness = appliedContrast = appliedCloudBrightness = float.NaN;
-            appliedRayleigh = appliedMie = appliedDirectionality = float.NaN;
-            appliedCloudScattering = appliedCloudColoring = appliedCloudSharpness = float.NaN;
-            appliedCloudSize = appliedCloudSaturation = float.NaN;
-            appliedDirLight = appliedAmbLight = appliedVCloudSun = appliedVCloudMoon = float.NaN;
-            appliedSunMesh = appliedMoonMesh = appliedReflection = float.NaN;
+            wx.InvalidateAppliedSky();
         }
 
         private void ApplyCloudSwapConvars()
         {
             var climate = SingletonComponent<global::Climate>.Instance;
             if (climate != null)
-                climate.Overrides.Clouds = currentClouds;
+                climate.Overrides.Clouds = wx.currentClouds;
             // Quiet: 10 Hz writes would flood the dedicated log. Values still reach clients.
-            SetWeatherConvar("weather.cloud_coverage", currentClouds, ref appliedClouds, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.cloud_opacity", currentCloudOpacity, ref appliedCloudOpacity, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.cloud_attenuation", currentAttenuation, ref appliedAttenuation, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.cloud_brightness", currentCloudBrightness, ref appliedCloudBrightness, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.cloud_scattering", currentCloudScattering, ref appliedCloudScattering, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.cloud_coloring", currentCloudColoring, ref appliedCloudColoring, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.cloud_sharpness", currentCloudSharpness, ref appliedCloudSharpness, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.cloud_size", currentCloudSize, ref appliedCloudSize, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.cloud_saturation", currentCloudSaturation, ref appliedCloudSaturation, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.atmosphere_brightness", currentBrightness, ref appliedBrightness, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.atmosphere_contrast", currentContrast, ref appliedContrast, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.atmosphere_rayleigh", currentRayleigh, ref appliedRayleigh, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.atmosphere_mie", currentMie, ref appliedMie, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.atmosphere_directionality", currentDirectionality, ref appliedDirectionality, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.cloud_coverage", wx.currentClouds, ref wx.appliedClouds, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.cloud_opacity", wx.currentCloudOpacity, ref wx.appliedCloudOpacity, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.cloud_attenuation", wx.currentAttenuation, ref wx.appliedAttenuation, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.cloud_brightness", wx.currentCloudBrightness, ref wx.appliedCloudBrightness, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.cloud_scattering", wx.currentCloudScattering, ref wx.appliedCloudScattering, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.cloud_coloring", wx.currentCloudColoring, ref wx.appliedCloudColoring, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.cloud_sharpness", wx.currentCloudSharpness, ref wx.appliedCloudSharpness, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.cloud_size", wx.currentCloudSize, ref wx.appliedCloudSize, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.cloud_saturation", wx.currentCloudSaturation, ref wx.appliedCloudSaturation, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.atmosphere_brightness", wx.currentBrightness, ref wx.appliedBrightness, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.atmosphere_contrast", wx.currentContrast, ref wx.appliedContrast, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.atmosphere_rayleigh", wx.currentRayleigh, ref wx.appliedRayleigh, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.atmosphere_mie", wx.currentMie, ref wx.appliedMie, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.atmosphere_directionality", wx.currentDirectionality, ref wx.appliedDirectionality, WeatherApplyEpsilon, "F2", true);
             ApplyOptionalLightingConvars(true);
         }
 
@@ -2453,47 +2536,47 @@ namespace Oxide.Plugins
         /// </summary>
         private void ApplyDissolveLighting(float fadeIn01)
         {
-            bool flashLive = _lightningFlashUntil > Time.realtimeSinceStartup;
+            bool flashLive = wx._lightningFlashUntil > Time.realtimeSinceStartup;
             if (fadeIn01 <= 0f)
             {
-                currentAttenuation = _cloudSwapSavedAtten;
-                currentMie = _cloudSwapSavedMie;
-                currentCloudScattering = _cloudSwapSavedScatter;
-                currentCloudColoring = _cloudSwapSavedColor;
-                currentCloudSharpness = _cloudSwapSavedSharp;
-                currentCloudSize = _cloudSwapSavedSize;
-                currentCloudSaturation = _cloudSwapSavedSat;
-                currentDirectionality = _cloudSwapSavedDir;
+                wx.currentAttenuation = _cloudSwapSavedAtten;
+                wx.currentMie = _cloudSwapSavedMie;
+                wx.currentCloudScattering = _cloudSwapSavedScatter;
+                wx.currentCloudColoring = _cloudSwapSavedColor;
+                wx.currentCloudSharpness = _cloudSwapSavedSharp;
+                wx.currentCloudSize = _cloudSwapSavedSize;
+                wx.currentCloudSaturation = _cloudSwapSavedSat;
+                wx.currentDirectionality = _cloudSwapSavedDir;
                 if (!flashLive)
                 {
-                    currentBrightness = _cloudSwapSavedBri;
-                    currentContrast = _cloudSwapSavedCon;
-                    currentCloudBrightness = _cloudSwapSavedCloudBri;
-                    currentRayleigh = _cloudSwapSavedRay;
+                    wx.currentBrightness = _cloudSwapSavedBri;
+                    wx.currentContrast = _cloudSwapSavedCon;
+                    wx.currentCloudBrightness = _cloudSwapSavedCloudBri;
+                    wx.currentRayleigh = _cloudSwapSavedRay;
                 }
-                currentVCloudSun = _cloudSwapSavedVSun;
-                currentVCloudMoon = _cloudSwapSavedVMoon;
+                wx.currentVCloudSun = _cloudSwapSavedVSun;
+                wx.currentVCloudMoon = _cloudSwapSavedVMoon;
                 return;
             }
 
             float s = SmootherStep(fadeIn01);
-            currentAttenuation = Mathf.Lerp(_cloudSwapSavedAtten, targetAttenuation, s);
-            currentMie = Mathf.Lerp(_cloudSwapSavedMie, targetMie, s);
-            currentCloudScattering = Mathf.Lerp(_cloudSwapSavedScatter, targetCloudScattering, s);
-            currentCloudColoring = Mathf.Lerp(_cloudSwapSavedColor, targetCloudColoring, s);
-            currentCloudSharpness = Mathf.Lerp(_cloudSwapSavedSharp, targetCloudSharpness, s);
-            currentCloudSize = Mathf.Lerp(_cloudSwapSavedSize, targetCloudSize, s);
-            currentCloudSaturation = Mathf.Lerp(_cloudSwapSavedSat, targetCloudSaturation, s);
-            currentDirectionality = Mathf.Lerp(_cloudSwapSavedDir, targetDirectionality, s);
+            wx.currentAttenuation = Mathf.Lerp(_cloudSwapSavedAtten, wx.targetAttenuation, s);
+            wx.currentMie = Mathf.Lerp(_cloudSwapSavedMie, wx.targetMie, s);
+            wx.currentCloudScattering = Mathf.Lerp(_cloudSwapSavedScatter, wx.targetCloudScattering, s);
+            wx.currentCloudColoring = Mathf.Lerp(_cloudSwapSavedColor, wx.targetCloudColoring, s);
+            wx.currentCloudSharpness = Mathf.Lerp(_cloudSwapSavedSharp, wx.targetCloudSharpness, s);
+            wx.currentCloudSize = Mathf.Lerp(_cloudSwapSavedSize, wx.targetCloudSize, s);
+            wx.currentCloudSaturation = Mathf.Lerp(_cloudSwapSavedSat, wx.targetCloudSaturation, s);
+            wx.currentDirectionality = Mathf.Lerp(_cloudSwapSavedDir, wx.targetDirectionality, s);
             if (!flashLive)
             {
-                currentBrightness = Mathf.Lerp(_cloudSwapSavedBri, targetBrightness, s);
-                currentContrast = Mathf.Lerp(_cloudSwapSavedCon, targetContrast, s);
-                currentCloudBrightness = Mathf.Lerp(_cloudSwapSavedCloudBri, targetCloudBrightness, s);
-                currentRayleigh = Mathf.Lerp(_cloudSwapSavedRay, targetRayleigh, s);
+                wx.currentBrightness = Mathf.Lerp(_cloudSwapSavedBri, wx.targetBrightness, s);
+                wx.currentContrast = Mathf.Lerp(_cloudSwapSavedCon, wx.targetContrast, s);
+                wx.currentCloudBrightness = Mathf.Lerp(_cloudSwapSavedCloudBri, wx.targetCloudBrightness, s);
+                wx.currentRayleigh = Mathf.Lerp(_cloudSwapSavedRay, wx.targetRayleigh, s);
             }
-            currentVCloudSun = LerpOptional(_cloudSwapSavedVSun, targetVCloudSun, s);
-            currentVCloudMoon = LerpOptional(_cloudSwapSavedVMoon, targetVCloudMoon, s);
+            wx.currentVCloudSun = LerpOptional(_cloudSwapSavedVSun, wx.targetVCloudSun, s);
+            wx.currentVCloudMoon = LerpOptional(_cloudSwapSavedVMoon, wx.targetVCloudMoon, s);
         }
 
         /// <summary>
@@ -2508,74 +2591,80 @@ namespace Oxide.Plugins
 
         /// <summary>
         /// Time-based smootherstep opacity/coverage dissolve. Owns cloud opacity/coverage
-        /// while active so the normal WeatherBlendFactor lerp cannot fight the fade.
+        /// while active so the normal wx.WeatherBlendFactor lerp cannot fight the fade.
         /// Mesh swap only fires when both channels are at the floor; a short hold then
         /// eases back to the live weather targets.
         /// </summary>
         private void TickCloudAssetDissolve()
         {
-            if (_cloudSwapPhase == 0) return;
+            if (_cloudSwapPhase == CloudSwapPhase.Idle) return;
             float elapsed = Time.realtimeSinceStartup - _cloudSwapPhaseStart;
 
-            if (_cloudSwapPhase == 1)
+            if (_cloudSwapPhase == CloudSwapPhase.FadeOut)
             {
                 float t = Mathf.Clamp01(elapsed / Mathf.Max(0.4f, _cloudSwapOutDuration));
                 float s = SmootherStep(t);
-                currentCloudOpacity = Mathf.Lerp(_cloudSwapSavedOpacity, CloudSwapFloor, s);
-                currentClouds = Mathf.Lerp(_cloudSwapSavedCoverage, CloudSwapFloorCoverage, s);
+                wx.currentCloudOpacity = Mathf.Lerp(_cloudSwapSavedOpacity, CloudSwapFloor, s);
+                wx.currentClouds = Mathf.Lerp(_cloudSwapSavedCoverage, CloudSwapFloorCoverage, s);
                 ApplyDissolveLighting(0f);
 
                 // Swap mesh at the veil floor (not a punched-out clear sky)
                 if (t >= 0.98f)
                 {
                     ConsoleSystem.Run(ConsoleSystem.Option.Server, $"weather.load_cloud_config {_cloudSwapDesired}");
-                    currentCloudConfig = _cloudSwapDesired;
-                    currentCloudOpacity = CloudSwapFloor;
-                    currentClouds = CloudSwapFloorCoverage;
+                    wx.currentCloudConfig = _cloudSwapDesired;
+                    wx.currentCloudOpacity = CloudSwapFloor;
+                    wx.currentClouds = CloudSwapFloorCoverage;
                     _cloudSwapFadeFromOpacity = CloudSwapFloor;
                     _cloudSwapFadeFromCoverage = CloudSwapFloorCoverage;
                     ApplyDissolveLighting(0f);
                     InvalidateAppliedSkyConvars();
-                    _cloudSwapPhase = 2;
+                    _cloudSwapPhase = CloudSwapPhase.Hold;
                     _cloudSwapPhaseStart = Time.realtimeSinceStartup;
                     ApplyCloudSwapConvars();
                     Puts($"[Weather] Cloud asset loaded -> {_cloudSwapDesired} (holding lighting, then fade in)");
                 }
             }
-            else if (_cloudSwapPhase == 2)
+            else if (_cloudSwapPhase == CloudSwapPhase.Hold)
             {
-                currentCloudOpacity = CloudSwapFloor;
-                currentClouds = CloudSwapFloorCoverage;
+                wx.currentCloudOpacity = CloudSwapFloor;
+                wx.currentClouds = CloudSwapFloorCoverage;
                 ApplyDissolveLighting(0f);
                 if (elapsed >= _cloudSwapHoldDuration)
                 {
-                    _cloudSwapFadeFromOpacity = currentCloudOpacity;
-                    _cloudSwapFadeFromCoverage = currentClouds;
-                    _cloudSwapPhase = 3;
+                    _cloudSwapFadeFromOpacity = wx.currentCloudOpacity;
+                    _cloudSwapFadeFromCoverage = wx.currentClouds;
+                    _cloudSwapPhase = CloudSwapPhase.FadeIn;
                     _cloudSwapPhaseStart = Time.realtimeSinceStartup;
                     Puts($"[Weather] Cloud asset fading in -> {_cloudSwapDesired}");
                 }
             }
-            else if (_cloudSwapPhase == 3)
+            else if (_cloudSwapPhase == CloudSwapPhase.FadeIn)
             {
                 float t = Mathf.Clamp01(elapsed / Mathf.Max(0.5f, _cloudSwapInDuration));
                 float s = SmootherStep(t);
                 // Mid-hops (Clear→RainMild on the way to Overcast) only walk partway
                 // toward the live target so RainMild is actually visible as a step.
                 bool moreHops = _cloudSwapQueue.Count > 0;
-                float liveOp = targetCloudOpacity > 0.05f ? targetCloudOpacity : Mathf.Max(CloudSwapFloor, _cloudSwapSavedOpacity);
-                float liveCov = targetClouds > 0.05f ? targetClouds : Mathf.Max(CloudSwapFloorCoverage, _cloudSwapSavedCoverage);
+                bool emptySky = (_cloudSwapDesired == "Clear_VClouds" || wx.currentCloudConfig == "Clear_VClouds")
+                    && wx.targetCloudOpacity < 0.04f && wx.targetClouds < 0.04f;
+                float liveOp = emptySky
+                    ? wx.targetCloudOpacity
+                    : (wx.targetCloudOpacity > 0.05f ? wx.targetCloudOpacity : Mathf.Max(CloudSwapFloor, _cloudSwapSavedOpacity));
+                float liveCov = emptySky
+                    ? wx.targetClouds
+                    : (wx.targetClouds > 0.05f ? wx.targetClouds : Mathf.Max(CloudSwapFloorCoverage, _cloudSwapSavedCoverage));
                 float mid = moreHops ? 0.55f : 1f;
                 float goalOp = Mathf.Lerp(_cloudSwapSavedOpacity, liveOp, mid);
                 float goalCov = Mathf.Lerp(_cloudSwapSavedCoverage, liveCov, mid);
-                currentCloudOpacity = Mathf.Lerp(_cloudSwapFadeFromOpacity, goalOp, s);
-                currentClouds = Mathf.Lerp(_cloudSwapFadeFromCoverage, goalCov, s);
+                wx.currentCloudOpacity = Mathf.Lerp(_cloudSwapFadeFromOpacity, goalOp, s);
+                wx.currentClouds = Mathf.Lerp(_cloudSwapFadeFromCoverage, goalCov, s);
                 ApplyDissolveLighting(moreHops ? t * mid : t);
 
                 if (t >= 0.98f)
                 {
-                    currentCloudOpacity = goalOp;
-                    currentClouds = goalCov;
+                    wx.currentCloudOpacity = goalOp;
+                    wx.currentClouds = goalCov;
                     ApplyDissolveLighting(moreHops ? mid : 1f);
                     if (moreHops)
                     {
@@ -2585,7 +2674,7 @@ namespace Oxide.Plugins
                         StartCloudSwapHop(next);
                         return;
                     }
-                    _cloudSwapPhase = 0;
+                    _cloudSwapPhase = CloudSwapPhase.Idle;
                     _cloudSwapDesired = null;
                     _cloudSwapHopsTotal = 1;
                     StopCloudSwapTicker();
@@ -2601,114 +2690,114 @@ namespace Oxide.Plugins
 
             UpdateTargetsFromClock(forceLog: false);
 
-            float distance = Mathf.Abs(currentRain - targetRain) + Mathf.Abs(currentClouds - targetClouds) +
-                             Mathf.Abs(currentFog - targetFog) + Mathf.Abs(currentThunder - targetThunder) * 0.5f;
-            float baseT = WeatherBlendFactor;
+            float distance = Mathf.Abs(wx.currentRain - wx.targetRain) + Mathf.Abs(wx.currentClouds - wx.targetClouds) +
+                             Mathf.Abs(wx.currentFog - wx.targetFog) + Mathf.Abs(wx.currentThunder - wx.targetThunder) * 0.5f;
+            float baseT = wx.WeatherBlendFactor;
             float t = Mathf.Clamp(baseT * (0.70f + distance * 1.5f), baseT * 0.55f, baseT * 2.8f);
-            bool clearing = (targetRain < currentRain - 0.02f) || (targetClouds < currentClouds - 0.04f);
+            bool clearing = (wx.targetRain < wx.currentRain - 0.02f) || (wx.targetClouds < wx.currentClouds - 0.04f);
             float clearMul = clearing ? 0.82f : 1.0f;
             float tFast = Mathf.Clamp01(t * 1.45f * clearMul);
             float tMid = Mathf.Clamp01(t * 1.05f * clearMul);
             float tRain = Mathf.Clamp01(t * 0.95f * clearMul);
             float tFog = Mathf.Clamp01(t * 0.85f * clearMul);
             float tWetUp = Mathf.Clamp01(t * 0.70f);
-            float tWetDown = Mathf.Clamp01(t * (0.85f + currentWind * 1.1f));
+            float tWetDown = Mathf.Clamp01(t * (0.85f + wx.currentWind * 1.1f));
 
             // During cloud-asset dissolve, TickCloudAssetDissolve owns opacity + coverage
             // so the normal blend cannot fight the fade (that fight caused visible snaps).
-            if (_cloudSwapPhase == 0)
+            if (_cloudSwapPhase == CloudSwapPhase.Idle)
             {
-                currentCloudOpacity = Mathf.Lerp(currentCloudOpacity, targetCloudOpacity, tFast);
-                currentClouds = Mathf.Lerp(currentClouds, targetClouds, tMid);
-                currentAttenuation = Mathf.Lerp(currentAttenuation, targetAttenuation, tFast);
-                currentMie = Mathf.Lerp(currentMie, targetMie, tFast);
-                bool flashLive = _lightningFlashUntil > Time.realtimeSinceStartup;
+                wx.currentCloudOpacity = Mathf.Lerp(wx.currentCloudOpacity, wx.targetCloudOpacity, tFast);
+                wx.currentClouds = Mathf.Lerp(wx.currentClouds, wx.targetClouds, tMid);
+                wx.currentAttenuation = Mathf.Lerp(wx.currentAttenuation, wx.targetAttenuation, tFast);
+                wx.currentMie = Mathf.Lerp(wx.currentMie, wx.targetMie, tFast);
+                bool flashLive = wx._lightningFlashUntil > Time.realtimeSinceStartup;
                 if (!flashLive)
                 {
-                    currentBrightness = Mathf.Lerp(currentBrightness, targetBrightness, tMid);
-                    currentContrast = Mathf.Lerp(currentContrast, targetContrast, tMid);
-                    currentCloudBrightness = Mathf.Lerp(currentCloudBrightness, targetCloudBrightness, tMid);
-                    currentRayleigh = Mathf.Lerp(currentRayleigh, targetRayleigh, tMid);
+                    wx.currentBrightness = Mathf.Lerp(wx.currentBrightness, wx.targetBrightness, tMid);
+                    wx.currentContrast = Mathf.Lerp(wx.currentContrast, wx.targetContrast, tMid);
+                    wx.currentCloudBrightness = Mathf.Lerp(wx.currentCloudBrightness, wx.targetCloudBrightness, tMid);
+                    wx.currentRayleigh = Mathf.Lerp(wx.currentRayleigh, wx.targetRayleigh, tMid);
                 }
-                currentCloudSharpness = Mathf.Lerp(currentCloudSharpness, targetCloudSharpness, tMid);
-                currentCloudScattering = Mathf.Lerp(currentCloudScattering, targetCloudScattering, tMid);
-                currentCloudColoring = Mathf.Lerp(currentCloudColoring, targetCloudColoring, tMid);
-                currentCloudSize = Mathf.Lerp(currentCloudSize, targetCloudSize, tMid);
-                currentCloudSaturation = Mathf.Lerp(currentCloudSaturation, targetCloudSaturation, tMid);
-                currentDirectionality = Mathf.Lerp(currentDirectionality, targetDirectionality, tMid);
-                currentDirLight = Mathf.Lerp(currentDirLight, targetDirLight, tMid);
-                currentAmbLight = Mathf.Lerp(currentAmbLight, targetAmbLight, tMid);
-                currentVCloudSun = Mathf.Lerp(currentVCloudSun, targetVCloudSun, tMid);
-                currentVCloudMoon = Mathf.Lerp(currentVCloudMoon, targetVCloudMoon, tMid);
-                currentSunMesh = Mathf.Lerp(currentSunMesh, targetSunMesh, tMid);
-                currentMoonMesh = Mathf.Lerp(currentMoonMesh, targetMoonMesh, tMid);
-                currentReflection = Mathf.Lerp(currentReflection, targetReflection, tMid);
+                wx.currentCloudSharpness = Mathf.Lerp(wx.currentCloudSharpness, wx.targetCloudSharpness, tMid);
+                wx.currentCloudScattering = Mathf.Lerp(wx.currentCloudScattering, wx.targetCloudScattering, tMid);
+                wx.currentCloudColoring = Mathf.Lerp(wx.currentCloudColoring, wx.targetCloudColoring, tMid);
+                wx.currentCloudSize = Mathf.Lerp(wx.currentCloudSize, wx.targetCloudSize, tMid);
+                wx.currentCloudSaturation = Mathf.Lerp(wx.currentCloudSaturation, wx.targetCloudSaturation, tMid);
+                wx.currentDirectionality = Mathf.Lerp(wx.currentDirectionality, wx.targetDirectionality, tMid);
+                wx.currentDirLight = Mathf.Lerp(wx.currentDirLight, wx.targetDirLight, tMid);
+                wx.currentAmbLight = Mathf.Lerp(wx.currentAmbLight, wx.targetAmbLight, tMid);
+                wx.currentVCloudSun = Mathf.Lerp(wx.currentVCloudSun, wx.targetVCloudSun, tMid);
+                wx.currentVCloudMoon = Mathf.Lerp(wx.currentVCloudMoon, wx.targetVCloudMoon, tMid);
+                wx.currentSunMesh = Mathf.Lerp(wx.currentSunMesh, wx.targetSunMesh, tMid);
+                wx.currentMoonMesh = Mathf.Lerp(wx.currentMoonMesh, wx.targetMoonMesh, tMid);
+                wx.currentReflection = Mathf.Lerp(wx.currentReflection, wx.targetReflection, tMid);
             }
-            currentWind = Mathf.Lerp(currentWind, targetWind, tMid);
-            currentRain = Mathf.Lerp(currentRain, targetRain, tRain);
-            currentThunder = Mathf.Lerp(currentThunder, targetThunder, tRain);
-            currentRainbow = Mathf.Lerp(currentRainbow, targetRainbow, tRain);
-            currentFog = Mathf.Lerp(currentFog, targetFog, tFog);
-            currentFogMultiplier = Mathf.Lerp(currentFogMultiplier, targetFogMultiplier, tFog);
-            currentFogRampStart = Mathf.Lerp(currentFogRampStart, targetFogRampStart, tFog);
-            currentFogRampEnd = Mathf.Lerp(currentFogRampEnd, targetFogRampEnd, tFog);
-            currentFogHeightFalloff = Mathf.Lerp(currentFogHeightFalloff, targetFogHeightFalloff, tFog);
-            float wetT = targetWetness >= currentWetness ? tWetUp : tWetDown;
-            currentWetness = Mathf.Lerp(currentWetness, targetWetness, wetT);
-            currentWetnessSnow = Mathf.Lerp(currentWetnessSnow, targetWetnessSnow, wetT);
-            currentDust = Mathf.Lerp(currentDust, targetDust, tMid);
+            wx.currentWind = Mathf.Lerp(wx.currentWind, wx.targetWind, tMid);
+            wx.currentRain = Mathf.Lerp(wx.currentRain, wx.targetRain, tRain);
+            wx.currentThunder = Mathf.Lerp(wx.currentThunder, wx.targetThunder, tRain);
+            wx.currentRainbow = Mathf.Lerp(wx.currentRainbow, wx.targetRainbow, tRain);
+            wx.currentFog = Mathf.Lerp(wx.currentFog, wx.targetFog, tFog);
+            wx.currentFogMultiplier = Mathf.Lerp(wx.currentFogMultiplier, wx.targetFogMultiplier, tFog);
+            wx.currentFogRampStart = Mathf.Lerp(wx.currentFogRampStart, wx.targetFogRampStart, tFog);
+            wx.currentFogRampEnd = Mathf.Lerp(wx.currentFogRampEnd, wx.targetFogRampEnd, tFog);
+            wx.currentFogHeightFalloff = Mathf.Lerp(wx.currentFogHeightFalloff, wx.targetFogHeightFalloff, tFog);
+            float wetT = wx.targetWetness >= wx.currentWetness ? tWetUp : tWetDown;
+            wx.currentWetness = Mathf.Lerp(wx.currentWetness, wx.targetWetness, wetT);
+            wx.currentWetnessSnow = Mathf.Lerp(wx.currentWetnessSnow, wx.targetWetnessSnow, wetT);
+            wx.currentDust = Mathf.Lerp(wx.currentDust, wx.targetDust, tMid);
 
             // Snap settled channels so lerp + solar/CCN jitter cannot hunt under F2
             // rounding and re-issue the same printed convar forever.
             // Dissolve ticker owns these two channels; snapping toward the live
             // weather target here is what turned a 1.7s in-ramp into a single jump.
-            if (_cloudSwapPhase == 0)
+            if (_cloudSwapPhase == CloudSwapPhase.Idle)
             {
-                SnapSettled(ref currentCloudOpacity, targetCloudOpacity);
-                SnapSettled(ref currentClouds, targetClouds);
-                SnapSettled(ref currentAttenuation, targetAttenuation);
-                SnapSettled(ref currentMie, targetMie);
-                if (_lightningFlashUntil <= Time.realtimeSinceStartup)
+                SnapSettled(ref wx.currentCloudOpacity, wx.targetCloudOpacity);
+                SnapSettled(ref wx.currentClouds, wx.targetClouds);
+                SnapSettled(ref wx.currentAttenuation, wx.targetAttenuation);
+                SnapSettled(ref wx.currentMie, wx.targetMie);
+                if (wx._lightningFlashUntil <= Time.realtimeSinceStartup)
                 {
-                    SnapSettled(ref currentBrightness, targetBrightness);
-                    SnapSettled(ref currentContrast, targetContrast);
+                    SnapSettled(ref wx.currentBrightness, wx.targetBrightness);
+                    SnapSettled(ref wx.currentContrast, wx.targetContrast);
                 }
-                SnapSettled(ref currentCloudBrightness, targetCloudBrightness);
-                SnapSettled(ref currentCloudSharpness, targetCloudSharpness);
-                SnapSettled(ref currentCloudScattering, targetCloudScattering);
-                SnapSettled(ref currentCloudColoring, targetCloudColoring);
-                SnapSettled(ref currentCloudSize, targetCloudSize);
-                SnapSettled(ref currentCloudSaturation, targetCloudSaturation);
-                SnapSettled(ref currentRayleigh, targetRayleigh);
-                SnapSettled(ref currentDirectionality, targetDirectionality);
+                SnapSettled(ref wx.currentCloudBrightness, wx.targetCloudBrightness);
+                SnapSettled(ref wx.currentCloudSharpness, wx.targetCloudSharpness);
+                SnapSettled(ref wx.currentCloudScattering, wx.targetCloudScattering);
+                SnapSettled(ref wx.currentCloudColoring, wx.targetCloudColoring);
+                SnapSettled(ref wx.currentCloudSize, wx.targetCloudSize);
+                SnapSettled(ref wx.currentCloudSaturation, wx.targetCloudSaturation);
+                SnapSettled(ref wx.currentRayleigh, wx.targetRayleigh);
+                SnapSettled(ref wx.currentDirectionality, wx.targetDirectionality);
             }
-            SnapSettled(ref currentWind, targetWind);
-            SnapSettled(ref currentRain, targetRain);
-            SnapSettled(ref currentThunder, targetThunder);
-            SnapSettled(ref currentRainbow, targetRainbow);
-            SnapSettled(ref currentFog, targetFog);
-            SnapSettled(ref currentFogMultiplier, targetFogMultiplier);
-            SnapSettled(ref currentFogRampStart, targetFogRampStart, 2f);
-            SnapSettled(ref currentFogRampEnd, targetFogRampEnd, 5f);
-            SnapSettled(ref currentFogHeightFalloff, targetFogHeightFalloff);
-            SnapSettled(ref currentWetness, targetWetness);
-            SnapSettled(ref currentWetnessSnow, targetWetnessSnow);
-            SnapSettled(ref currentDust, targetDust);
+            SnapSettled(ref wx.currentWind, wx.targetWind);
+            SnapSettled(ref wx.currentRain, wx.targetRain);
+            SnapSettled(ref wx.currentThunder, wx.targetThunder);
+            SnapSettled(ref wx.currentRainbow, wx.targetRainbow);
+            SnapSettled(ref wx.currentFog, wx.targetFog);
+            SnapSettled(ref wx.currentFogMultiplier, wx.targetFogMultiplier);
+            SnapSettled(ref wx.currentFogRampStart, wx.targetFogRampStart, 2f);
+            SnapSettled(ref wx.currentFogRampEnd, wx.targetFogRampEnd, 5f);
+            SnapSettled(ref wx.currentFogHeightFalloff, wx.targetFogHeightFalloff);
+            SnapSettled(ref wx.currentWetness, wx.targetWetness);
+            SnapSettled(ref wx.currentWetnessSnow, wx.targetWetnessSnow);
+            SnapSettled(ref wx.currentDust, wx.targetDust);
 
             TickCloudAssetDissolve();
             UpdateLightningFlash();
             ApplyWeatherToClimate();
 
             bool lightningOn = config.EnableLightningStrikes || config.EnableRealLightning;
-            if (lightningOn && currentThunder >= config.LightningThunderThreshold && SkyAllowsLightning())
+            if (lightningOn && wx.currentThunder >= config.LightningThunderThreshold && SkyAllowsLightning())
                 TrySpawnLightning();
 
             lastWeather = PublicWeatherLabel();
-            lastWeatherIntensity = Mathf.Max(currentClouds, currentDust, currentRain);
-            lastRainIntensity = currentRain;
-            lastThunderIntensity = currentThunder;
-            lastWindIntensity = currentWind;
-            lastFogIntensity = currentFog;
+            lastWeatherIntensity = Mathf.Max(wx.currentClouds, wx.currentDust, wx.currentRain);
+            lastRainIntensity = wx.currentRain;
+            lastThunderIntensity = wx.currentThunder;
+            lastWindIntensity = wx.currentWind;
+            lastFogIntensity = wx.currentFog;
         }
 
         /// <summary>
@@ -2718,12 +2807,12 @@ namespace Oxide.Plugins
         /// </summary>
         private string PublicWeatherLabel()
         {
-            if (currentDust > 0.35f && currentRain < 0.1f) return "Dust";
+            if (wx.currentDust > 0.35f && wx.currentRain < 0.1f) return "Dust";
 
-            string asset = currentCloudConfig;
+            string asset = wx.currentCloudConfig;
             if (string.IsNullOrEmpty(asset))
             {
-                return pendingWeatherProfile switch
+                return wx.pendingWeatherProfile switch
                 {
                     "storm" => "Storm",
                     "rain" => "Rain",
@@ -2731,6 +2820,7 @@ namespace Oxide.Plugins
                     "fog" => "Fog",
                     "overcast" => "Overcast",
                     "partly_cloudy" => "Partly Cloudy",
+                    "few" => "Few Clouds",
                     _ => "Clear"
                 };
             }
@@ -2740,18 +2830,20 @@ namespace Oxide.Plugins
                 case "Storm_VClouds":
                     return "Storm";
                 case "RainHeavy_VClouds":
-                    return currentRain > 0.12f ? "Rain" : "Storm";
+                    return wx.currentRain > 0.12f ? "Rain" : "Storm";
                 case "RainMild_VClouds":
-                    if (currentRain > 0.12f) return "Rain";
+                    if (wx.currentRain > 0.12f) return "Rain";
                     return "Partly Cloudy";
                 case "Overcast_VClouds":
                     return "Overcast";
                 case "Fog_VClouds":
-                    return currentFog > 0.08f || pendingWeatherProfile == "fog" ? "Fog" : "Overcast";
+                    return wx.currentFog > 0.08f || wx.pendingWeatherProfile == "fog" ? "Fog" : "Overcast";
                 case "Clear_VClouds":
+                    if (wx.pendingWeatherProfile == "few" || wx.currentClouds >= 0.05f || wx.currentCloudOpacity >= 0.08f)
+                        return "Few Clouds";
                     return "Clear";
                 default:
-                    return pendingWeatherProfile == "clear" ? "Clear" : "Partly Cloudy";
+                    return wx.pendingWeatherProfile == "clear" ? "Clear" : "Partly Cloudy";
             }
         }
 
@@ -2805,85 +2897,85 @@ namespace Oxide.Plugins
         /// </summary>
         private void ClampWeatherTargets()
         {
-            targetRain = Mathf.Clamp01(targetRain);
-            targetWind = Mathf.Clamp01(targetWind);
-            targetFog = Mathf.Clamp01(targetFog);
-            targetThunder = Mathf.Clamp01(targetThunder);
-            targetRainbow = Mathf.Clamp01(targetRainbow);
-            targetDust = Mathf.Clamp01(targetDust);
-            targetWetness = Mathf.Clamp01(targetWetness);
-            targetWetnessSnow = Mathf.Clamp01(targetWetnessSnow);
-            targetClouds = Mathf.Clamp01(targetClouds);
-            targetCloudOpacity = Mathf.Clamp01(targetCloudOpacity);
-            targetCloudSharpness = Mathf.Clamp01(targetCloudSharpness);
-            targetCloudColoring = Mathf.Clamp01(targetCloudColoring);
-            targetCloudSaturation = Mathf.Clamp01(targetCloudSaturation);
-            targetFogHeightFalloff = Mathf.Clamp01(targetFogHeightFalloff);
-            targetDirectionality = Mathf.Clamp01(targetDirectionality);
+            wx.targetRain = Mathf.Clamp01(wx.targetRain);
+            wx.targetWind = Mathf.Clamp01(wx.targetWind);
+            wx.targetFog = Mathf.Clamp01(wx.targetFog);
+            wx.targetThunder = Mathf.Clamp01(wx.targetThunder);
+            wx.targetRainbow = Mathf.Clamp01(wx.targetRainbow);
+            wx.targetDust = Mathf.Clamp01(wx.targetDust);
+            wx.targetWetness = Mathf.Clamp01(wx.targetWetness);
+            wx.targetWetnessSnow = Mathf.Clamp01(wx.targetWetnessSnow);
+            wx.targetClouds = Mathf.Clamp01(wx.targetClouds);
+            wx.targetCloudOpacity = Mathf.Clamp01(wx.targetCloudOpacity);
+            wx.targetCloudSharpness = Mathf.Clamp01(wx.targetCloudSharpness);
+            wx.targetCloudColoring = Mathf.Clamp01(wx.targetCloudColoring);
+            wx.targetCloudSaturation = Mathf.Clamp01(wx.targetCloudSaturation);
+            wx.targetFogHeightFalloff = Mathf.Clamp01(wx.targetFogHeightFalloff);
+            wx.targetDirectionality = Mathf.Clamp01(wx.targetDirectionality);
 
-            targetFogMultiplier = Mathf.Clamp(targetFogMultiplier, 0.50f, 2.00f);
-            targetFogRampStart = Mathf.Clamp(targetFogRampStart, 5f, 400f);
-            targetFogRampEnd = Mathf.Clamp(targetFogRampEnd, 80f, 2500f);
-            if (targetFogRampEnd < targetFogRampStart + 40f)
-                targetFogRampEnd = targetFogRampStart + 40f;
+            wx.targetFogMultiplier = Mathf.Clamp(wx.targetFogMultiplier, 0.50f, 2.00f);
+            wx.targetFogRampStart = Mathf.Clamp(wx.targetFogRampStart, 5f, 400f);
+            wx.targetFogRampEnd = Mathf.Clamp(wx.targetFogRampEnd, 80f, 2500f);
+            if (wx.targetFogRampEnd < wx.targetFogRampStart + 40f)
+                wx.targetFogRampEnd = wx.targetFogRampStart + 40f;
 
-            targetBrightness = Mathf.Clamp(targetBrightness, 0.30f, 1.50f);
-            targetContrast = Mathf.Clamp(targetContrast, 0.50f, 1.50f);
-            targetRayleigh = Mathf.Clamp(targetRayleigh, 0.20f, 2.50f);
-            targetMie = Mathf.Clamp(targetMie, 0.00f, 2.00f);
-            targetAttenuation = Mathf.Clamp(targetAttenuation, 0.20f, 2.00f);
-            targetCloudBrightness = Mathf.Clamp(targetCloudBrightness, 0.30f, 1.50f);
-            targetCloudScattering = Mathf.Clamp(targetCloudScattering, 0.30f, 2.50f);
-            targetCloudSize = Mathf.Clamp(targetCloudSize, 0.40f, 2.50f);
-            targetDirLight = Mathf.Clamp01(targetDirLight);
-            targetAmbLight = Mathf.Clamp01(targetAmbLight);
-            targetVCloudSun = Mathf.Clamp01(targetVCloudSun);
-            targetVCloudMoon = Mathf.Clamp01(targetVCloudMoon);
-            targetSunMesh = Mathf.Clamp01(targetSunMesh);
-            targetMoonMesh = Mathf.Clamp01(targetMoonMesh);
-            targetReflection = Mathf.Clamp01(targetReflection);
+            wx.targetBrightness = Mathf.Clamp(wx.targetBrightness, 0.30f, 1.50f);
+            wx.targetContrast = Mathf.Clamp(wx.targetContrast, 0.50f, 1.50f);
+            wx.targetRayleigh = Mathf.Clamp(wx.targetRayleigh, 0.20f, 2.50f);
+            wx.targetMie = Mathf.Clamp(wx.targetMie, 0.00f, 2.00f);
+            wx.targetAttenuation = Mathf.Clamp(wx.targetAttenuation, 0.20f, 2.00f);
+            wx.targetCloudBrightness = Mathf.Clamp(wx.targetCloudBrightness, 0.30f, 1.50f);
+            wx.targetCloudScattering = Mathf.Clamp(wx.targetCloudScattering, 0.30f, 2.50f);
+            wx.targetCloudSize = Mathf.Clamp(wx.targetCloudSize, 0.40f, 2.50f);
+            wx.targetDirLight = Mathf.Clamp01(wx.targetDirLight);
+            wx.targetAmbLight = Mathf.Clamp01(wx.targetAmbLight);
+            wx.targetVCloudSun = Mathf.Clamp01(wx.targetVCloudSun);
+            wx.targetVCloudMoon = Mathf.Clamp01(wx.targetVCloudMoon);
+            wx.targetSunMesh = Mathf.Clamp01(wx.targetSunMesh);
+            wx.targetMoonMesh = Mathf.Clamp01(wx.targetMoonMesh);
+            wx.targetReflection = Mathf.Clamp01(wx.targetReflection);
         }
 
         private void ClampWeatherCurrent()
         {
-            currentRain = Mathf.Clamp01(currentRain);
-            currentWind = Mathf.Clamp01(currentWind);
-            currentFog = Mathf.Clamp01(currentFog);
-            currentThunder = Mathf.Clamp01(currentThunder);
-            currentRainbow = Mathf.Clamp01(currentRainbow);
-            currentDust = Mathf.Clamp01(currentDust);
-            currentWetness = Mathf.Clamp01(currentWetness);
-            currentWetnessSnow = Mathf.Clamp01(currentWetnessSnow);
-            currentClouds = Mathf.Clamp01(currentClouds);
-            currentCloudOpacity = Mathf.Clamp01(currentCloudOpacity);
-            currentCloudSharpness = Mathf.Clamp01(currentCloudSharpness);
-            currentCloudColoring = Mathf.Clamp01(currentCloudColoring);
-            currentCloudSaturation = Mathf.Clamp01(currentCloudSaturation);
-            currentFogHeightFalloff = Mathf.Clamp01(currentFogHeightFalloff);
-            currentDirectionality = Mathf.Clamp01(currentDirectionality);
+            wx.currentRain = Mathf.Clamp01(wx.currentRain);
+            wx.currentWind = Mathf.Clamp01(wx.currentWind);
+            wx.currentFog = Mathf.Clamp01(wx.currentFog);
+            wx.currentThunder = Mathf.Clamp01(wx.currentThunder);
+            wx.currentRainbow = Mathf.Clamp01(wx.currentRainbow);
+            wx.currentDust = Mathf.Clamp01(wx.currentDust);
+            wx.currentWetness = Mathf.Clamp01(wx.currentWetness);
+            wx.currentWetnessSnow = Mathf.Clamp01(wx.currentWetnessSnow);
+            wx.currentClouds = Mathf.Clamp01(wx.currentClouds);
+            wx.currentCloudOpacity = Mathf.Clamp01(wx.currentCloudOpacity);
+            wx.currentCloudSharpness = Mathf.Clamp01(wx.currentCloudSharpness);
+            wx.currentCloudColoring = Mathf.Clamp01(wx.currentCloudColoring);
+            wx.currentCloudSaturation = Mathf.Clamp01(wx.currentCloudSaturation);
+            wx.currentFogHeightFalloff = Mathf.Clamp01(wx.currentFogHeightFalloff);
+            wx.currentDirectionality = Mathf.Clamp01(wx.currentDirectionality);
 
-            currentFogMultiplier = Mathf.Clamp(currentFogMultiplier, 0.50f, 2.00f);
-            currentFogRampStart = Mathf.Clamp(currentFogRampStart, 5f, 400f);
-            currentFogRampEnd = Mathf.Clamp(currentFogRampEnd, 80f, 2500f);
-            if (currentFogRampEnd < currentFogRampStart + 40f)
-                currentFogRampEnd = currentFogRampStart + 40f;
+            wx.currentFogMultiplier = Mathf.Clamp(wx.currentFogMultiplier, 0.50f, 2.00f);
+            wx.currentFogRampStart = Mathf.Clamp(wx.currentFogRampStart, 5f, 400f);
+            wx.currentFogRampEnd = Mathf.Clamp(wx.currentFogRampEnd, 80f, 2500f);
+            if (wx.currentFogRampEnd < wx.currentFogRampStart + 40f)
+                wx.currentFogRampEnd = wx.currentFogRampStart + 40f;
 
-            currentBrightness = Mathf.Clamp(currentBrightness, 0.30f, 1.50f);
-            currentContrast = Mathf.Clamp(currentContrast, 0.50f, 1.50f);
-            currentRayleigh = Mathf.Clamp(currentRayleigh, 0.20f, 2.50f);
-            currentMie = Mathf.Clamp(currentMie, 0.00f, 2.00f);
-            currentAttenuation = Mathf.Clamp(currentAttenuation, 0.20f, 2.00f);
-            currentCloudBrightness = Mathf.Clamp(currentCloudBrightness, 0.30f, 1.50f);
-            currentCloudScattering = Mathf.Clamp(currentCloudScattering, 0.30f, 2.50f);
-            currentCloudSize = Mathf.Clamp(currentCloudSize, 0.40f, 2.50f);
+            wx.currentBrightness = Mathf.Clamp(wx.currentBrightness, 0.30f, 1.50f);
+            wx.currentContrast = Mathf.Clamp(wx.currentContrast, 0.50f, 1.50f);
+            wx.currentRayleigh = Mathf.Clamp(wx.currentRayleigh, 0.20f, 2.50f);
+            wx.currentMie = Mathf.Clamp(wx.currentMie, 0.00f, 2.00f);
+            wx.currentAttenuation = Mathf.Clamp(wx.currentAttenuation, 0.20f, 2.00f);
+            wx.currentCloudBrightness = Mathf.Clamp(wx.currentCloudBrightness, 0.30f, 1.50f);
+            wx.currentCloudScattering = Mathf.Clamp(wx.currentCloudScattering, 0.30f, 2.50f);
+            wx.currentCloudSize = Mathf.Clamp(wx.currentCloudSize, 0.40f, 2.50f);
 
-            currentDirLight = Mathf.Clamp01(currentDirLight);
-            currentAmbLight = Mathf.Clamp01(currentAmbLight);
-            currentVCloudSun = Mathf.Clamp01(currentVCloudSun);
-            currentVCloudMoon = Mathf.Clamp01(currentVCloudMoon);
-            currentSunMesh = Mathf.Clamp01(currentSunMesh);
-            currentMoonMesh = Mathf.Clamp01(currentMoonMesh);
-            currentReflection = Mathf.Clamp01(currentReflection);
+            wx.currentDirLight = Mathf.Clamp01(wx.currentDirLight);
+            wx.currentAmbLight = Mathf.Clamp01(wx.currentAmbLight);
+            wx.currentVCloudSun = Mathf.Clamp01(wx.currentVCloudSun);
+            wx.currentVCloudMoon = Mathf.Clamp01(wx.currentVCloudMoon);
+            wx.currentSunMesh = Mathf.Clamp01(wx.currentSunMesh);
+            wx.currentMoonMesh = Mathf.Clamp01(wx.currentMoonMesh);
+            wx.currentReflection = Mathf.Clamp01(wx.currentReflection);
         }
 
         private void ApplyWeatherToClimate()
@@ -2891,38 +2983,38 @@ namespace Oxide.Plugins
             ClampWeatherCurrent();
             var climate = SingletonComponent<global::Climate>.Instance;
             if (climate == null) return;
-            climate.Overrides.Rain = currentRain;
-            climate.Overrides.Wind = currentWind;
-            climate.Overrides.Fog = currentFog;
-            climate.Overrides.Clouds = currentClouds;
+            climate.Overrides.Rain = wx.currentRain;
+            climate.Overrides.Wind = wx.currentWind;
+            climate.Overrides.Fog = wx.currentFog;
+            climate.Overrides.Clouds = wx.currentClouds;
 
             float eps = WeatherApplyEpsilon;
-            SetWeatherConvar("weather.rain", currentRain, ref appliedRain, eps);
-            SetWeatherConvar("weather.fog", currentFog, ref appliedFog, eps);
-            SetWeatherConvar("weather.wind", currentWind, ref appliedWind, eps);
-            SetWeatherConvar("weather.dust_chance", currentDust, ref appliedDust, eps);
-            SetWeatherConvar("weather.fog_multiplier", currentFogMultiplier, ref appliedFogMultiplier, eps);
-            SetWeatherConvar("weather.atmosphere_fog_ramp_start_distance", currentFogRampStart, ref appliedFogRampStart, 2f, "F0");
-            SetWeatherConvar("weather.atmosphere_fog_ramp_end_distance", currentFogRampEnd, ref appliedFogRampEnd, 5f, "F0");
-            SetWeatherConvar("weather.atmosphere_fog_height_falloff", currentFogHeightFalloff, ref appliedFogHeightFalloff, eps);
-            SetWeatherConvar("weather.cloud_coverage", currentClouds, ref appliedClouds, eps);
-            SetWeatherConvar("weather.cloud_opacity", currentCloudOpacity, ref appliedCloudOpacity, eps);
-            SetWeatherConvar("weather.cloud_attenuation", currentAttenuation, ref appliedAttenuation, eps);
-            SetWeatherConvar("weather.cloud_brightness", currentCloudBrightness, ref appliedCloudBrightness, eps);
-            SetWeatherConvar("weather.cloud_sharpness", currentCloudSharpness, ref appliedCloudSharpness, eps);
-            SetWeatherConvar("weather.cloud_scattering", currentCloudScattering, ref appliedCloudScattering, eps);
-            SetWeatherConvar("weather.cloud_coloring", currentCloudColoring, ref appliedCloudColoring, eps);
-            SetWeatherConvar("weather.cloud_size", currentCloudSize, ref appliedCloudSize, eps);
-            SetWeatherConvar("weather.cloud_saturation", currentCloudSaturation, ref appliedCloudSaturation, eps);
-            SetWeatherConvar("weather.thunder", currentThunder, ref appliedThunder, eps);
-            SetWeatherConvar("weather.rainbow", currentRainbow, ref appliedRainbow, eps);
-            SetWeatherConvar("weather.wetness_rain", currentWetness, ref appliedWetness, eps);
-            SetWeatherConvar("weather.wetness_snow", currentWetnessSnow, ref appliedWetnessSnow, eps);
-            SetWeatherConvar("weather.atmosphere_mie", currentMie, ref appliedMie, eps);
-            SetWeatherConvar("weather.atmosphere_rayleigh", currentRayleigh, ref appliedRayleigh, eps);
-            SetWeatherConvar("weather.atmosphere_brightness", currentBrightness, ref appliedBrightness, eps);
-            SetWeatherConvar("weather.atmosphere_contrast", currentContrast, ref appliedContrast, eps);
-            SetWeatherConvar("weather.atmosphere_directionality", currentDirectionality, ref appliedDirectionality, eps);
+            SetWeatherConvar("weather.rain", wx.currentRain, ref wx.appliedRain, eps);
+            SetWeatherConvar("weather.fog", wx.currentFog, ref wx.appliedFog, eps);
+            SetWeatherConvar("weather.wind", wx.currentWind, ref wx.appliedWind, eps);
+            SetWeatherConvar("weather.dust_chance", wx.currentDust, ref wx.appliedDust, eps);
+            SetWeatherConvar("weather.fog_multiplier", wx.currentFogMultiplier, ref wx.appliedFogMultiplier, eps);
+            SetWeatherConvar("weather.atmosphere_fog_ramp_start_distance", wx.currentFogRampStart, ref wx.appliedFogRampStart, 2f, "F0");
+            SetWeatherConvar("weather.atmosphere_fog_ramp_end_distance", wx.currentFogRampEnd, ref wx.appliedFogRampEnd, 5f, "F0");
+            SetWeatherConvar("weather.atmosphere_fog_height_falloff", wx.currentFogHeightFalloff, ref wx.appliedFogHeightFalloff, eps);
+            SetWeatherConvar("weather.cloud_coverage", wx.currentClouds, ref wx.appliedClouds, eps);
+            SetWeatherConvar("weather.cloud_opacity", wx.currentCloudOpacity, ref wx.appliedCloudOpacity, eps);
+            SetWeatherConvar("weather.cloud_attenuation", wx.currentAttenuation, ref wx.appliedAttenuation, eps);
+            SetWeatherConvar("weather.cloud_brightness", wx.currentCloudBrightness, ref wx.appliedCloudBrightness, eps);
+            SetWeatherConvar("weather.cloud_sharpness", wx.currentCloudSharpness, ref wx.appliedCloudSharpness, eps);
+            SetWeatherConvar("weather.cloud_scattering", wx.currentCloudScattering, ref wx.appliedCloudScattering, eps);
+            SetWeatherConvar("weather.cloud_coloring", wx.currentCloudColoring, ref wx.appliedCloudColoring, eps);
+            SetWeatherConvar("weather.cloud_size", wx.currentCloudSize, ref wx.appliedCloudSize, eps);
+            SetWeatherConvar("weather.cloud_saturation", wx.currentCloudSaturation, ref wx.appliedCloudSaturation, eps);
+            SetWeatherConvar("weather.thunder", wx.currentThunder, ref wx.appliedThunder, eps);
+            SetWeatherConvar("weather.rainbow", wx.currentRainbow, ref wx.appliedRainbow, eps);
+            SetWeatherConvar("weather.wetness_rain", wx.currentWetness, ref wx.appliedWetness, eps);
+            SetWeatherConvar("weather.wetness_snow", wx.currentWetnessSnow, ref wx.appliedWetnessSnow, eps);
+            SetWeatherConvar("weather.atmosphere_mie", wx.currentMie, ref wx.appliedMie, eps);
+            SetWeatherConvar("weather.atmosphere_rayleigh", wx.currentRayleigh, ref wx.appliedRayleigh, eps);
+            SetWeatherConvar("weather.atmosphere_brightness", wx.currentBrightness, ref wx.appliedBrightness, eps);
+            SetWeatherConvar("weather.atmosphere_contrast", wx.currentContrast, ref wx.appliedContrast, eps);
+            SetWeatherConvar("weather.atmosphere_directionality", wx.currentDirectionality, ref wx.appliedDirectionality, eps);
             ApplyOptionalLightingConvars(false);
             ApplyNightlightConvars();
         }
@@ -2964,10 +3056,10 @@ namespace Oxide.Plugins
         private void ComputeOptionalLightingFromMeteo(float rain, float cover, float fog, float thunder,
             float wetness, float cape, float shortwave, float humidity, float visibilityM, bool isDay)
         {
-            targetDirLight = targetAmbLight = 1f;
-            targetVCloudSun = targetVCloudMoon = 1f;
-            targetSunMesh = targetMoonMesh = 1f;
-            targetReflection = 1f;
+            wx.targetDirLight = wx.targetAmbLight = 1f;
+            wx.targetVCloudSun = wx.targetVCloudMoon = 1f;
+            wx.targetSunMesh = wx.targetMoonMesh = 1f;
+            wx.targetReflection = 1f;
             var lit = config?.Lighting;
             if (lit == null || !lit.Enabled) return;
 
@@ -2985,41 +3077,41 @@ namespace Oxide.Plugins
             if (lit.DriveLightMultipliers)
             {
                 // Direct sun follows shortwave, punched down by thick sky.
-                targetDirLight = Mathf.Clamp01(Mathf.Lerp(1.00f, 0.52f, thick) * Mathf.Lerp(0.82f, 1.00f, isDay ? sun01 : 0.15f));
+                wx.targetDirLight = Mathf.Clamp01(Mathf.Lerp(1.00f, 0.52f, thick) * Mathf.Lerp(0.82f, 1.00f, isDay ? sun01 : 0.15f));
                 // Humid / foggy air lifts fill light a little; storm still dims.
-                targetAmbLight = Mathf.Clamp01(Mathf.Lerp(1.00f, 0.72f, thick) * Mathf.Lerp(1.00f, 1.00f, humid01));
+                wx.targetAmbLight = Mathf.Clamp01(Mathf.Lerp(1.00f, 0.72f, thick) * Mathf.Lerp(1.00f, 1.00f, humid01));
             }
 
             if (lit.DriveVCloudColorScale)
             {
-                targetVCloudSun = Mathf.Clamp01(Mathf.Lerp(1.00f, 0.62f, thick) * (isDay ? Mathf.Lerp(0.75f, 1.00f, sun01) : 0.55f));
+                wx.targetVCloudSun = Mathf.Clamp01(Mathf.Lerp(1.00f, 0.62f, thick) * (isDay ? Mathf.Lerp(0.75f, 1.00f, sun01) : 0.55f));
                 float moonCloudClear = Mathf.Clamp01(lit.VCloudMoonNightClear);
                 float moonCloudThick = Mathf.Clamp01(lit.VCloudMoonNightOvercast);
                 if (moonCloudThick > moonCloudClear) moonCloudThick = moonCloudClear;
                 float nightCloud = Mathf.Lerp(moonCloudClear, moonCloudThick, thick) * MoonIlluminationFactor();
-                targetVCloudMoon = Mathf.Clamp01(isDay ? Mathf.Min(0.35f, nightCloud) : nightCloud);
+                wx.targetVCloudMoon = Mathf.Clamp01(isDay ? Mathf.Min(0.35f, nightCloud) : nightCloud);
             }
 
             if (lit.DriveMeshBrightness)
             {
-                targetSunMesh = Mathf.Clamp01(Mathf.Lerp(1.00f, 0.78f, thick) * (isDay ? Mathf.Lerp(0.80f, 1.00f, sun01) : 0.35f));
+                wx.targetSunMesh = Mathf.Clamp01(Mathf.Lerp(1.00f, 0.78f, thick) * (isDay ? Mathf.Lerp(0.80f, 1.00f, sun01) : 0.35f));
                 float moonClear = Mathf.Clamp01(lit.MoonMeshNightClear);
                 float moonThick = Mathf.Clamp01(lit.MoonMeshNightOvercast);
                 if (moonThick > moonClear) moonThick = moonClear;
                 float nightMesh = Mathf.Lerp(moonClear, moonThick, thick) * MoonIlluminationFactor();
                 // Day: keep the disc quiet. Night: cap so moonlight does not bleach vclouds.
-                targetMoonMesh = Mathf.Clamp01(isDay ? Mathf.Min(0.28f, nightMesh) : nightMesh);
+                wx.targetMoonMesh = Mathf.Clamp01(isDay ? Mathf.Min(0.28f, nightMesh) : nightMesh);
             }
 
             if (lit.DriveReflection)
-                targetReflection = Mathf.Clamp01(Mathf.Lerp(0.70f, 1.00f, Mathf.Max(wet01, rain01)));
+                wx.targetReflection = Mathf.Clamp01(Mathf.Lerp(0.70f, 1.00f, Mathf.Max(wet01, rain01)));
 
             // CAPE only tightens vcloud/sun a hair when a cell is primed — no mesh swap.
             if (cape01 > 0.35f && rain01 < 0.12f)
             {
                 float dryCell = (cape01 - 0.35f) * 0.15f;
-                targetVCloudSun = Mathf.Clamp01(targetVCloudSun - dryCell);
-                targetDirLight = Mathf.Clamp01(targetDirLight - dryCell * 0.5f);
+                wx.targetVCloudSun = Mathf.Clamp01(wx.targetVCloudSun - dryCell);
+                wx.targetDirLight = Mathf.Clamp01(wx.targetDirLight - dryCell * 0.5f);
             }
         }
 
@@ -3030,21 +3122,21 @@ namespace Oxide.Plugins
             float eps = WeatherApplyEpsilon;
             if (lit.DriveLightMultipliers)
             {
-                SetWeatherConvar("weather.directional_light_multiplier", currentDirLight, ref appliedDirLight, eps, "F2", quiet);
-                SetWeatherConvar("weather.ambient_light_multiplier", currentAmbLight, ref appliedAmbLight, eps, "F2", quiet);
+                SetWeatherConvar("weather.directional_light_multiplier", wx.currentDirLight, ref wx.appliedDirLight, eps, "F2", quiet);
+                SetWeatherConvar("weather.ambient_light_multiplier", wx.currentAmbLight, ref wx.appliedAmbLight, eps, "F2", quiet);
             }
             if (lit.DriveVCloudColorScale)
             {
-                SetWeatherConvar("weather.vclouds_sun_color_scale", currentVCloudSun, ref appliedVCloudSun, eps, "F2", quiet);
-                SetWeatherConvar("weather.vclouds_moon_color_scale", currentVCloudMoon, ref appliedVCloudMoon, eps, "F2", quiet);
+                SetWeatherConvar("weather.vclouds_sun_color_scale", wx.currentVCloudSun, ref wx.appliedVCloudSun, eps, "F2", quiet);
+                SetWeatherConvar("weather.vclouds_moon_color_scale", wx.currentVCloudMoon, ref wx.appliedVCloudMoon, eps, "F2", quiet);
             }
             if (lit.DriveMeshBrightness)
             {
-                SetWeatherConvar("weather.sun_mesh_brightness_multiplier", currentSunMesh, ref appliedSunMesh, eps, "F2", quiet);
-                SetWeatherConvar("weather.moon_mesh_brightness_multiplier", currentMoonMesh, ref appliedMoonMesh, eps, "F2", quiet);
+                SetWeatherConvar("weather.sun_mesh_brightness_multiplier", wx.currentSunMesh, ref wx.appliedSunMesh, eps, "F2", quiet);
+                SetWeatherConvar("weather.moon_mesh_brightness_multiplier", wx.currentMoonMesh, ref wx.appliedMoonMesh, eps, "F2", quiet);
             }
             if (lit.DriveReflection)
-                SetWeatherConvar("weather.reflection_multiplier", currentReflection, ref appliedReflection, eps, "F2", quiet);
+                SetWeatherConvar("weather.reflection_multiplier", wx.currentReflection, ref wx.appliedReflection, eps, "F2", quiet);
         }
 
         private void ApplyNightlightConvars()
@@ -3052,14 +3144,39 @@ namespace Oxide.Plugins
             var lit = config?.Lighting;
             if (lit == null || !lit.NightlightEnabled) return;
             float bri = Mathf.Clamp(lit.NightlightBrightness, 0f, 0.05f);
-            bool night = !lastOmIsDay || IsGameNightHour();
-            if (night && currentClouds > 0.45f)
+            bool night = !wx.lastOmIsDay || IsGameNightHour();
+            if (night && wx.currentClouds > 0.45f)
                 bri = Mathf.Clamp(bri + Mathf.Max(0f, lit.NightlightOvercastBoost), 0f, 0.05f);
             float dist = Mathf.Clamp(lit.NightlightDistance, 1f, 20f);
             float fade = Mathf.Clamp01(lit.NightlightFadeFraction);
-            SetWeatherConvar("env.nightlight_brightness", bri, ref appliedNightlightBri, 0.0005f, "F3");
-            SetWeatherConvar("env.nightlight_distance", dist, ref appliedNightlightDist, 0.05f, "F2");
-            SetWeatherConvar("env.nightlight_fadefraction", fade, ref appliedNightlightFade, 0.01f, "F2");
+            SetWeatherConvar("env.nightlight_brightness", bri, ref wx.appliedNightlightBri, 0.0005f, "F3");
+            SetWeatherConvar("env.nightlight_distance", dist, ref wx.appliedNightlightDist, 0.05f, "F2");
+            SetWeatherConvar("env.nightlight_fadefraction", fade, ref wx.appliedNightlightFade, 0.01f, "F2");
+        }
+
+        /// <summary>
+        /// Split fair weather into three looks that stock assets can actually show:
+        /// clear = empty dome on Clear_VClouds, few = wisps on Clear_VClouds,
+        /// partly_cloudy = RainMild_VClouds.
+        /// </summary>
+        private static string RefineFairSkyProfile(string profile, int weatherCode, float stack, float cloudPercent, float rainValue)
+        {
+            if (profile == "storm" || profile == "rain" || profile == "snow"
+                || profile == "fog" || profile == "dust" || profile == "overcast")
+                return profile;
+
+            if (rainValue >= 0.05f)
+                return "partly_cloudy";
+
+            float cover = Mathf.Max(stack, cloudPercent);
+            // Layer mix wins over WMO. Code 2 with 5% cover is still an empty dome.
+            if (cover <= 0.10f)
+                return "clear";
+            if (cover <= 0.28f && weatherCode <= 1)
+                return "few";
+            if (weatherCode <= 2 || profile == "clear" || profile == "few" || profile == "partly_cloudy")
+                return "partly_cloudy";
+            return profile;
         }
 
         private string GetWeatherProfile(int weatherCode)
@@ -3073,7 +3190,8 @@ namespace Oxide.Plugins
             if (weatherCode == 45 || weatherCode == 48) return "fog";
             if (config.EnableDust && weatherCode >= 7 && weatherCode <= 9) return "dust";
             if (weatherCode >= 3) return "overcast";
-            if (weatherCode == 2 || weatherCode == 1) return "partly_cloudy";
+            if (weatherCode == 2) return "partly_cloudy";
+            if (weatherCode == 1) return "few";
             return "clear";
         }
 
@@ -3085,22 +3203,22 @@ namespace Oxide.Plugins
             ConsoleSystem.Run(ConsoleSystem.Option.Server, "weather.overcast_chance 0");
             ConsoleSystem.Run(ConsoleSystem.Option.Server, "weather.rain_chance 0");
             ConsoleSystem.Run(ConsoleSystem.Option.Server, "weather.storm_chance 0");
-            currentWeatherProfile = profile ?? "clear";
+            wx.currentWeatherProfile = profile ?? "clear";
             if (config.AllowCloudConfigSwap)
             {
-                string cloudConfig = DesiredCloudConfig(currentWeatherProfile, rainIntensity);
-                if (!string.IsNullOrEmpty(cloudConfig) && cloudConfig != currentCloudConfig)
+                string cloudConfig = DesiredCloudConfig(wx.currentWeatherProfile, rainIntensity);
+                if (!string.IsNullOrEmpty(cloudConfig) && cloudConfig != wx.currentCloudConfig)
                 {
                     ConsoleSystem.Run(ConsoleSystem.Option.Server, $"weather.load_cloud_config {cloudConfig}");
-                    currentCloudConfig = cloudConfig;
+                    wx.currentCloudConfig = cloudConfig;
                 }
             }
-            Puts($"[Weather] Continuous mode -- profile '{currentWeatherProfile}', cloud '{currentCloudConfig}'");
+            Puts($"[Weather] Continuous mode -- profile '{wx.currentWeatherProfile}', cloud '{wx.currentCloudConfig}'");
         }
 
         private void ApplyMultiDayLookAhead(bool forceLog)
         {
-            _lookAheadRain = 0f; _lookAheadHours = 0f; _lookAheadLabel = "none";
+            wx._lookAheadRain = 0f; wx._lookAheadHours = 0f; wx._lookAheadLabel = "none";
             if (!config.EnableLookAhead || _weatherAnchors.Count < 2) return;
             DateTime now = DateTime.UtcNow;
             float bestScore = 0f; float bestHours = 0f; float bestRain = 0f; int bestCode = 0; float bestCloud = 0f; float bestCape = 0f;
@@ -3118,23 +3236,23 @@ namespace Oxide.Plugins
                 if (score > bestScore) { bestScore = score; bestHours = (float)hours; bestRain = rainI; bestCode = s.WeatherCode; bestCloud = cloudI; bestCape = s.Cape; }
             }
             if (bestScore < 0.08f) return;
-            _lookAheadRain = bestRain; _lookAheadHours = bestHours;
-            _lookAheadLabel = bestCode >= 95 ? "storm" : bestRain > 0.35f ? "rain" : bestCloud > 0.6f ? "cloud" : "mild";
+            wx._lookAheadRain = bestRain; wx._lookAheadHours = bestHours;
+            wx._lookAheadLabel = bestCode >= 95 ? "storm" : bestRain > 0.35f ? "rain" : bestCloud > 0.6f ? "cloud" : "mild";
             float maxBias = Mathf.Clamp(config.LookAheadMaxBias, 0f, 0.35f);
             float proximity = Mathf.Clamp01(1f - (bestHours - 1f) / 36f);
             float bias = maxBias * bestScore * Mathf.Lerp(0.35f, 1f, proximity);
-            if (bias > 0.02f && _cloudSwapPhase == 0)
+            if (bias > 0.02f && _cloudSwapPhase == CloudSwapPhase.Idle && wx.pendingWeatherProfile != "clear")
             {
-                targetCloudOpacity = Mathf.Clamp01(targetCloudOpacity + bias * 0.55f);
-                targetClouds = Mathf.Clamp01(targetClouds + bias * 0.40f);
-                targetAttenuation = Mathf.Min(1.9f, targetAttenuation + bias * 0.25f);
+                wx.targetCloudOpacity = Mathf.Clamp01(wx.targetCloudOpacity + bias * 0.55f);
+                wx.targetClouds = Mathf.Clamp01(wx.targetClouds + bias * 0.40f);
+                wx.targetAttenuation = Mathf.Min(1.9f, wx.targetAttenuation + bias * 0.25f);
             }
-            if (forceLog) Puts($"[Weather] Look-ahead: {_lookAheadLabel} in ~{_lookAheadHours:F0}h");
+            if (forceLog) Puts($"[Weather] Look-ahead: {wx._lookAheadLabel} in ~{wx._lookAheadHours:F0}h");
         }
 
         private void UpdateCcnAndInstability(float humidity, float temperature, float dewPoint, float pressure, float rainValue, float windKmh, float windValue, float cape = 0f)
         {
-            if (_seedBias > 0f && Time.realtimeSinceStartup >= _seedBiasEnd) _seedBias = 0f;
+            if (wx._seedBias > 0f && Time.realtimeSinceStartup >= wx._seedBiasEnd) wx._seedBias = 0f;
             if (config.EnableCcnPhysics)
             {
                 float baseCcn = Mathf.Clamp01(config.CcnBaseLevel);
@@ -3146,12 +3264,12 @@ namespace Oxide.Plugins
                 }
                 float humidBoost = Mathf.InverseLerp(40f, 90f, humidity) * 0.08f;
                 float washout = rainValue * Mathf.Clamp01(config.CcnWashoutRate);
-                targetCcn = Mathf.Clamp01(baseCcn + dust + humidBoost + _seedBias - washout);
-                float dt = Mathf.Clamp(Time.realtimeSinceStartup - _lastCcnUpdate, 0.5f, 10f);
-                _lastCcnUpdate = Time.realtimeSinceStartup;
-                currentCcn = Mathf.Lerp(currentCcn, targetCcn, Mathf.Clamp01(dt / 25f));
+                wx.targetCcn = Mathf.Clamp01(baseCcn + dust + humidBoost + wx._seedBias - washout);
+                float dt = Mathf.Clamp(Time.realtimeSinceStartup - wx._lastCcnUpdate, 0.5f, 10f);
+                wx._lastCcnUpdate = Time.realtimeSinceStartup;
+                wx.currentCcn = Mathf.Lerp(wx.currentCcn, wx.targetCcn, Mathf.Clamp01(dt / 25f));
             }
-            else currentCcn = targetCcn = Mathf.Clamp01(config.CcnBaseLevel);
+            else wx.currentCcn = wx.targetCcn = Mathf.Clamp01(config.CcnBaseLevel);
 
             if (config.EnableInstability)
             {
@@ -3161,10 +3279,10 @@ namespace Oxide.Plugins
                 float pressureInst = pressure > 0 ? Mathf.Clamp01(Mathf.InverseLerp(1018f, 995f, pressure)) : 0f;
                 float shear = windValue * 0.20f;
                 float capeInst = Mathf.Clamp01(Mathf.InverseLerp(100f, 2500f, cape));
-                targetInstability = Mathf.Clamp01(moistureInst * 0.30f + warmBoost * 0.15f + pressureInst * 0.20f + shear + capeInst * 0.45f + _seedBias * 0.3f);
-                currentInstability = Mathf.Lerp(currentInstability, targetInstability, 0.12f);
+                wx.targetInstability = Mathf.Clamp01(moistureInst * 0.30f + warmBoost * 0.15f + pressureInst * 0.20f + shear + capeInst * 0.45f + wx._seedBias * 0.3f);
+                wx.currentInstability = Mathf.Lerp(wx.currentInstability, wx.targetInstability, 0.12f);
             }
-            else currentInstability = targetInstability = 0f;
+            else wx.currentInstability = wx.targetInstability = 0f;
         }
 
         private static float RainEfficiencyFromCcn(float ccn)
@@ -3180,7 +3298,7 @@ namespace Oxide.Plugins
         /// </summary>
         private bool SkyAllowsLightning()
         {
-            string asset = currentCloudConfig ?? "";
+            string asset = wx.currentCloudConfig ?? "";
             if (string.IsNullOrEmpty(asset) || asset == "Clear_VClouds")
                 return false;
             return true;
@@ -3189,8 +3307,8 @@ namespace Oxide.Plugins
         private void TrySpawnLightning()
         {
             float now = Time.realtimeSinceStartup;
-            if (now < _nextLightningEarliest) return;
-            float t = Mathf.Clamp01(currentThunder);
+            if (now < wx._nextLightningEarliest) return;
+            float t = Mathf.Clamp01(wx.currentThunder);
             float minI = Mathf.Max(2f, config.LightningMinInterval);
             float maxI = Mathf.Max(minI + 1f, config.LightningMaxInterval);
             float interval = Mathf.Lerp(maxI, minI, t * t);
@@ -3201,12 +3319,12 @@ namespace Oxide.Plugins
             else if (UnityEngine.Random.value < 0.12f)
                 interval *= UnityEngine.Random.Range(1.6f, 2.4f);
             float chance = t < 0.6f ? Mathf.Lerp(0.08f, 0.28f, Mathf.InverseLerp(0.45f, 0.6f, t)) : Mathf.Lerp(0.28f, 0.75f, Mathf.InverseLerp(0.6f, 1f, t));
-            if (!config.AllowDryLightning && currentRain < 0.12f && t < 0.7f)
+            if (!config.AllowDryLightning && wx.currentRain < 0.12f && t < 0.7f)
                 chance *= 0.45f;
-            _nextLightningEarliest = now + interval * UnityEngine.Random.Range(0.22f, 0.55f);
+            wx._nextLightningEarliest = now + interval * UnityEngine.Random.Range(0.22f, 0.55f);
             if (UnityEngine.Random.value > chance) return;
-            _nextLightningEarliest = now + interval;
-            _lastLightningTime = now;
+            wx._nextLightningEarliest = now + interval;
+            wx._lastLightningTime = now;
             Vector3 pos = PickLightningPosition();
             if (pos == Vector3.zero) return;
             string prefab = config.LightningEffectPrefab != null ? config.LightningEffectPrefab.Trim() : "";
@@ -3238,12 +3356,12 @@ namespace Oxide.Plugins
         private void BeginLightningFlash(float thunder)
         {
             float now = Time.realtimeSinceStartup;
-            if (_lightningFlashUntil <= now)
+            if (wx._lightningFlashUntil <= now)
             {
-                _lightningFlashBri = currentBrightness;
-                _lightningFlashCon = currentContrast;
-                _lightningFlashCloudBri = currentCloudBrightness;
-                _lightningFlashRayleigh = currentRayleigh;
+                wx._lightningFlashBri = wx.currentBrightness;
+                wx._lightningFlashCon = wx.currentContrast;
+                wx._lightningFlashCloudBri = wx.currentCloudBrightness;
+                wx._lightningFlashRayleigh = wx.currentRayleigh;
             }
 
             // Real CG flash: 1–5 return strokes, first usually brightest, gaps 30–180ms,
@@ -3301,17 +3419,17 @@ namespace Oxide.Plugins
                 cursor += glow;
             }
 
-            _lightningWobbleSeed = UnityEngine.Random.Range(0f, 64f);
-            _lightningFlashUntil = cursor + 0.02f;
-            _lightningFlashTimer?.Destroy();
+            wx._lightningWobbleSeed = UnityEngine.Random.Range(0f, 64f);
+            wx._lightningFlashUntil = cursor + 0.02f;
+            StopTimer(ref _lightningFlashTimer);
             TickLightningFlash();
-            _lightningFlashTimer = timer.Every(0.05f, TickLightningFlash);
+            RestartEvery(ref _lightningFlashTimer, 0.05f, TickLightningFlash);
         }
 
         private void TickLightningFlash()
         {
             float now = Time.realtimeSinceStartup;
-            if (_lightningFlashUntil <= 0f || now >= _lightningFlashUntil || _lightningStrokes.Count == 0)
+            if (wx._lightningFlashUntil <= 0f || now >= wx._lightningFlashUntil || _lightningStrokes.Count == 0)
             {
                 RestoreLightningFlash();
                 return;
@@ -3337,16 +3455,16 @@ namespace Oxide.Plugins
                 // Irregular flicker inside the envelope (ionization + camera persistence)
                 float wobble =
                     0.72f
-                    + 0.18f * Mathf.Sin((now + _lightningWobbleSeed) * 37.1f)
-                    + 0.10f * Mathf.Sin((now + _lightningWobbleSeed) * 71.6f)
+                    + 0.18f * Mathf.Sin((now + wx._lightningWobbleSeed) * 37.1f)
+                    + 0.10f * Mathf.Sin((now + wx._lightningWobbleSeed) * 71.6f)
                     + UnityEngine.Random.Range(-0.08f, 0.08f);
                 overlay *= Mathf.Clamp(wobble, 0.55f, 1.25f);
             }
 
-            float baseBri = float.IsNaN(_lightningFlashBri) ? currentBrightness : _lightningFlashBri;
-            float baseCon = float.IsNaN(_lightningFlashCon) ? currentContrast : _lightningFlashCon;
-            float baseCloud = float.IsNaN(_lightningFlashCloudBri) ? currentCloudBrightness : _lightningFlashCloudBri;
-            float baseRay = float.IsNaN(_lightningFlashRayleigh) ? currentRayleigh : _lightningFlashRayleigh;
+            float baseBri = float.IsNaN(wx._lightningFlashBri) ? wx.currentBrightness : wx._lightningFlashBri;
+            float baseCon = float.IsNaN(wx._lightningFlashCon) ? wx.currentContrast : wx._lightningFlashCon;
+            float baseCloud = float.IsNaN(wx._lightningFlashCloudBri) ? wx.currentCloudBrightness : wx._lightningFlashCloudBri;
+            float baseRay = float.IsNaN(wx._lightningFlashRayleigh) ? wx.currentRayleigh : wx._lightningFlashRayleigh;
 
             // Hard stroke: more brightness, less contrast crush. Soft: milkier, lifts clouds.
             float briBoost = Mathf.Lerp(overlay, overlay * 0.62f, softness);
@@ -3354,41 +3472,40 @@ namespace Oxide.Plugins
             float cloudBoost = Mathf.Lerp(overlay * 0.15f, overlay * 0.45f, softness);
             float rayDip = Mathf.Lerp(0f, overlay * 0.18f, softness);
 
-            currentBrightness = Mathf.Min(1.85f, baseBri + briBoost);
-            currentContrast = Mathf.Min(1.55f, baseCon + conBoost);
-            currentCloudBrightness = Mathf.Min(1.6f, baseCloud + cloudBoost);
-            currentRayleigh = Mathf.Max(0.45f, baseRay - rayDip);
+            wx.currentBrightness = Mathf.Min(1.85f, baseBri + briBoost);
+            wx.currentContrast = Mathf.Min(1.55f, baseCon + conBoost);
+            wx.currentCloudBrightness = Mathf.Min(1.6f, baseCloud + cloudBoost);
+            wx.currentRayleigh = Mathf.Max(0.45f, baseRay - rayDip);
 
-            SetWeatherConvar("weather.atmosphere_brightness", currentBrightness, ref appliedBrightness, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.atmosphere_contrast", currentContrast, ref appliedContrast, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.cloud_brightness", currentCloudBrightness, ref appliedCloudBrightness, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.atmosphere_rayleigh", currentRayleigh, ref appliedRayleigh, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.atmosphere_brightness", wx.currentBrightness, ref wx.appliedBrightness, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.atmosphere_contrast", wx.currentContrast, ref wx.appliedContrast, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.cloud_brightness", wx.currentCloudBrightness, ref wx.appliedCloudBrightness, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.atmosphere_rayleigh", wx.currentRayleigh, ref wx.appliedRayleigh, WeatherApplyEpsilon, "F2", true);
         }
 
         private void RestoreLightningFlash()
         {
-            _lightningFlashTimer?.Destroy();
-            _lightningFlashTimer = null;
+            StopTimer(ref _lightningFlashTimer);
             _lightningStrokes.Clear();
-            _lightningFlashUntil = 0f;
-            if (!float.IsNaN(_lightningFlashBri)) currentBrightness = _lightningFlashBri;
-            if (!float.IsNaN(_lightningFlashCon)) currentContrast = _lightningFlashCon;
-            if (!float.IsNaN(_lightningFlashCloudBri)) currentCloudBrightness = _lightningFlashCloudBri;
-            if (!float.IsNaN(_lightningFlashRayleigh)) currentRayleigh = _lightningFlashRayleigh;
-            _lightningFlashBri = float.NaN;
-            _lightningFlashCon = float.NaN;
-            _lightningFlashCloudBri = float.NaN;
-            _lightningFlashRayleigh = float.NaN;
-            SetWeatherConvar("weather.atmosphere_brightness", currentBrightness, ref appliedBrightness, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.atmosphere_contrast", currentContrast, ref appliedContrast, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.cloud_brightness", currentCloudBrightness, ref appliedCloudBrightness, WeatherApplyEpsilon, "F2", true);
-            SetWeatherConvar("weather.atmosphere_rayleigh", currentRayleigh, ref appliedRayleigh, WeatherApplyEpsilon, "F2", true);
+            wx._lightningFlashUntil = 0f;
+            if (!float.IsNaN(wx._lightningFlashBri)) wx.currentBrightness = wx._lightningFlashBri;
+            if (!float.IsNaN(wx._lightningFlashCon)) wx.currentContrast = wx._lightningFlashCon;
+            if (!float.IsNaN(wx._lightningFlashCloudBri)) wx.currentCloudBrightness = wx._lightningFlashCloudBri;
+            if (!float.IsNaN(wx._lightningFlashRayleigh)) wx.currentRayleigh = wx._lightningFlashRayleigh;
+            wx._lightningFlashBri = float.NaN;
+            wx._lightningFlashCon = float.NaN;
+            wx._lightningFlashCloudBri = float.NaN;
+            wx._lightningFlashRayleigh = float.NaN;
+            SetWeatherConvar("weather.atmosphere_brightness", wx.currentBrightness, ref wx.appliedBrightness, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.atmosphere_contrast", wx.currentContrast, ref wx.appliedContrast, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.cloud_brightness", wx.currentCloudBrightness, ref wx.appliedCloudBrightness, WeatherApplyEpsilon, "F2", true);
+            SetWeatherConvar("weather.atmosphere_rayleigh", wx.currentRayleigh, ref wx.appliedRayleigh, WeatherApplyEpsilon, "F2", true);
         }
 
         private void UpdateLightningFlash()
         {
-            if (_lightningFlashUntil <= 0f) return;
-            if (Time.realtimeSinceStartup >= _lightningFlashUntil)
+            if (wx._lightningFlashUntil <= 0f) return;
+            if (Time.realtimeSinceStartup >= wx._lightningFlashUntil)
                 RestoreLightningFlash();
         }
 
@@ -3412,17 +3529,17 @@ namespace Oxide.Plugins
             {
                 var data = new WeatherStateData
                 {
-                    Profile = currentWeatherProfile ?? "clear",
-                    CloudConfig = currentCloudConfig ?? "",
-                    WeatherCode = lastWeatherCode,
-                    Rain = currentRain, Wind = currentWind, Fog = currentFog,
-                    FogMultiplier = currentFogMultiplier, FogRampStart = currentFogRampStart, FogRampEnd = currentFogRampEnd,
-                    FogHeightFalloff = currentFogHeightFalloff, Thunder = currentThunder, Rainbow = currentRainbow,
-                    Wetness = currentWetness, WetnessSnow = currentWetnessSnow,
-                    Clouds = currentClouds, CloudOpacity = currentCloudOpacity, Mie = currentMie, Brightness = currentBrightness,
-                    Rayleigh = currentRayleigh, Contrast = currentContrast, Directionality = currentDirectionality, Attenuation = currentAttenuation,
-                    CloudBrightness = currentCloudBrightness, CloudSharpness = currentCloudSharpness, CloudScattering = currentCloudScattering,
-                    CloudColoring = currentCloudColoring, CloudSize = currentCloudSize, CloudSaturation = currentCloudSaturation,
+                    Profile = wx.currentWeatherProfile ?? "clear",
+                    CloudConfig = wx.currentCloudConfig ?? "",
+                    WeatherCode = wx.lastWeatherCode,
+                    Rain = wx.currentRain, Wind = wx.currentWind, Fog = wx.currentFog,
+                    FogMultiplier = wx.currentFogMultiplier, FogRampStart = wx.currentFogRampStart, FogRampEnd = wx.currentFogRampEnd,
+                    FogHeightFalloff = wx.currentFogHeightFalloff, Thunder = wx.currentThunder, Rainbow = wx.currentRainbow,
+                    Wetness = wx.currentWetness, WetnessSnow = wx.currentWetnessSnow,
+                    Clouds = wx.currentClouds, CloudOpacity = wx.currentCloudOpacity, Mie = wx.currentMie, Brightness = wx.currentBrightness,
+                    Rayleigh = wx.currentRayleigh, Contrast = wx.currentContrast, Directionality = wx.currentDirectionality, Attenuation = wx.currentAttenuation,
+                    CloudBrightness = wx.currentCloudBrightness, CloudSharpness = wx.currentCloudSharpness, CloudScattering = wx.currentCloudScattering,
+                    CloudColoring = wx.currentCloudColoring, CloudSize = wx.currentCloudSize, CloudSaturation = wx.currentCloudSaturation,
                     SavedAt = DateTime.UtcNow.ToString("o"),
                     UtcOffsetSeconds = _cachedUtcOffsetSeconds,
                     Timezone = _cachedTimezone ?? ""
@@ -3439,26 +3556,26 @@ namespace Oxide.Plugins
                 var data = Interface.Oxide.DataFileSystem.ReadObject<WeatherStateData>("livestats_weather_state");
                 if (data == null || string.IsNullOrEmpty(data.Profile)) return;
                 if (!string.IsNullOrEmpty(data.SavedAt) && DateTime.TryParse(data.SavedAt, null, System.Globalization.DateTimeStyles.RoundtripKind, out DateTime saved) && (DateTime.UtcNow - saved).TotalHours > 2.0) return;
-                currentWeatherProfile = data.Profile;
-                currentCloudConfig = data.CloudConfig ?? "";
-                lastWeatherCode = data.WeatherCode;
-                currentRain = data.Rain; currentWind = data.Wind; currentFog = data.Fog;
-                currentFogMultiplier = data.FogMultiplier; currentFogRampStart = data.FogRampStart; currentFogRampEnd = data.FogRampEnd;
-                currentFogHeightFalloff = data.FogHeightFalloff; currentThunder = data.Thunder; currentRainbow = data.Rainbow;
-                currentWetness = data.Wetness; currentWetnessSnow = data.WetnessSnow;
-                currentClouds = data.Clouds; currentCloudOpacity = data.CloudOpacity; currentMie = data.Mie; currentBrightness = data.Brightness;
-                currentRayleigh = data.Rayleigh; currentContrast = data.Contrast; currentDirectionality = data.Directionality; currentAttenuation = data.Attenuation;
-                currentCloudBrightness = data.CloudBrightness; currentCloudSharpness = data.CloudSharpness; currentCloudScattering = data.CloudScattering;
-                currentCloudColoring = data.CloudColoring; currentCloudSize = data.CloudSize; currentCloudSaturation = data.CloudSaturation;
-                targetRain = currentRain; targetWind = currentWind; targetFog = currentFog; targetFogMultiplier = currentFogMultiplier;
-                targetFogRampStart = currentFogRampStart; targetFogRampEnd = currentFogRampEnd; targetFogHeightFalloff = currentFogHeightFalloff;
-                targetThunder = currentThunder; targetRainbow = currentRainbow; targetWetness = currentWetness; targetWetnessSnow = currentWetnessSnow;
-                targetClouds = currentClouds; targetCloudOpacity = currentCloudOpacity; targetMie = currentMie; targetBrightness = currentBrightness;
-                targetRayleigh = currentRayleigh; targetContrast = currentContrast; targetDirectionality = currentDirectionality; targetAttenuation = currentAttenuation;
-                targetCloudBrightness = currentCloudBrightness; targetCloudSharpness = currentCloudSharpness; targetCloudScattering = currentCloudScattering;
-                targetCloudColoring = currentCloudColoring; targetCloudSize = currentCloudSize; targetCloudSaturation = currentCloudSaturation;
+                wx.currentWeatherProfile = data.Profile;
+                wx.currentCloudConfig = data.CloudConfig ?? "";
+                wx.lastWeatherCode = data.WeatherCode;
+                wx.currentRain = data.Rain; wx.currentWind = data.Wind; wx.currentFog = data.Fog;
+                wx.currentFogMultiplier = data.FogMultiplier; wx.currentFogRampStart = data.FogRampStart; wx.currentFogRampEnd = data.FogRampEnd;
+                wx.currentFogHeightFalloff = data.FogHeightFalloff; wx.currentThunder = data.Thunder; wx.currentRainbow = data.Rainbow;
+                wx.currentWetness = data.Wetness; wx.currentWetnessSnow = data.WetnessSnow;
+                wx.currentClouds = data.Clouds; wx.currentCloudOpacity = data.CloudOpacity; wx.currentMie = data.Mie; wx.currentBrightness = data.Brightness;
+                wx.currentRayleigh = data.Rayleigh; wx.currentContrast = data.Contrast; wx.currentDirectionality = data.Directionality; wx.currentAttenuation = data.Attenuation;
+                wx.currentCloudBrightness = data.CloudBrightness; wx.currentCloudSharpness = data.CloudSharpness; wx.currentCloudScattering = data.CloudScattering;
+                wx.currentCloudColoring = data.CloudColoring; wx.currentCloudSize = data.CloudSize; wx.currentCloudSaturation = data.CloudSaturation;
+                wx.targetRain = wx.currentRain; wx.targetWind = wx.currentWind; wx.targetFog = wx.currentFog; wx.targetFogMultiplier = wx.currentFogMultiplier;
+                wx.targetFogRampStart = wx.currentFogRampStart; wx.targetFogRampEnd = wx.currentFogRampEnd; wx.targetFogHeightFalloff = wx.currentFogHeightFalloff;
+                wx.targetThunder = wx.currentThunder; wx.targetRainbow = wx.currentRainbow; wx.targetWetness = wx.currentWetness; wx.targetWetnessSnow = wx.currentWetnessSnow;
+                wx.targetClouds = wx.currentClouds; wx.targetCloudOpacity = wx.currentCloudOpacity; wx.targetMie = wx.currentMie; wx.targetBrightness = wx.currentBrightness;
+                wx.targetRayleigh = wx.currentRayleigh; wx.targetContrast = wx.currentContrast; wx.targetDirectionality = wx.currentDirectionality; wx.targetAttenuation = wx.currentAttenuation;
+                wx.targetCloudBrightness = wx.currentCloudBrightness; wx.targetCloudSharpness = wx.currentCloudSharpness; wx.targetCloudScattering = wx.currentCloudScattering;
+                wx.targetCloudColoring = wx.currentCloudColoring; wx.targetCloudSize = wx.currentCloudSize; wx.targetCloudSaturation = wx.currentCloudSaturation;
 
-                pendingWeatherProfile = currentWeatherProfile ?? "clear";
+                wx.pendingWeatherProfile = wx.currentWeatherProfile ?? "clear";
                 if (Mathf.Abs(data.UtcOffsetSeconds) > 1f)
                     _cachedUtcOffsetSeconds = data.UtcOffsetSeconds;
                 if (!string.IsNullOrEmpty(data.Timezone))
@@ -3469,39 +3586,32 @@ namespace Oxide.Plugins
                 // Re-apply the volumetric asset and force convars so the sky matches.
                 if (config.AllowCloudConfigSwap)
                 {
-                    string asset = currentCloudConfig;
-                    bool dryClear = currentRain < 0.12f
-                        && lastWeatherCode < 80
-                        && currentWeatherProfile != "storm"
-                        && currentWeatherProfile != "rain";
+                    string asset = wx.currentCloudConfig;
+                    bool dryClear = wx.currentRain < 0.12f
+                        && wx.lastWeatherCode < 80
+                        && wx.currentWeatherProfile != "storm"
+                        && wx.currentWeatherProfile != "rain";
                     if (string.IsNullOrEmpty(asset)
                         || (dryClear && (asset == "Storm_VClouds" || asset == "RainHeavy_VClouds")))
                     {
-                        string reconciled = DesiredCloudConfig(currentWeatherProfile, currentRain);
+                        string reconciled = DesiredCloudConfig(wx.currentWeatherProfile, wx.currentRain);
                         if (!string.IsNullOrEmpty(reconciled) && reconciled != asset)
-                            Puts($"[Weather] Persist asset {asset} ignored for {currentWeatherProfile} — using {reconciled}");
+                            Puts($"[Weather] Persist asset {asset} ignored for {wx.currentWeatherProfile} — using {reconciled}");
                         asset = reconciled;
                     }
                     if (!string.IsNullOrEmpty(asset))
                     {
                         ConsoleSystem.Run(ConsoleSystem.Option.Server, $"weather.load_cloud_config {asset}");
-                        currentCloudConfig = asset;
+                        wx.currentCloudConfig = asset;
                         Puts($"[Weather] Restored cloud asset -> {asset}");
                     }
                 }
 
                 // Force next ApplyWeatherToClimate pass to push every convar
-                appliedClouds = appliedRain = appliedWind = appliedFog = float.NaN;
-                appliedFogMultiplier = appliedFogRampStart = appliedFogRampEnd = float.NaN;
-                appliedFogHeightFalloff = appliedThunder = appliedRainbow = float.NaN;
-                appliedWetness = appliedWetnessSnow = appliedDust = float.NaN;
-                appliedMie = appliedRayleigh = appliedBrightness = appliedContrast = float.NaN;
-                appliedDirectionality = appliedAttenuation = float.NaN;
-                appliedCloudBrightness = appliedCloudSharpness = appliedCloudScattering = float.NaN;
-                appliedCloudColoring = appliedCloudSize = appliedCloudSaturation = appliedCloudOpacity = float.NaN;
+                wx.InvalidateAppliedAll();
 
-                _weatherInitialized = true;
-                Puts($"[Weather] Restored previous state -> {data.Profile} asset={currentCloudConfig}");
+                wx._weatherInitialized = true;
+                Puts($"[Weather] Restored previous state -> {data.Profile} asset={wx.currentCloudConfig}");
             }
             catch { }
         }
@@ -3908,8 +4018,8 @@ namespace Oxide.Plugins
         {
             if (player != null && !HasAdmin(player)) { SendMessage(player, lang.GetMessage("WeatherNeedAdmin", this, player.UserIDString)); return; }
             string report = string.Format(lang.GetMessage("WeatherStatusLine", this, player?.UserIDString),
-                pendingWeatherProfile, currentCloudConfig, currentRain.ToString("F2"), currentClouds.ToString("F2"),
-                currentCcn.ToString("F2"), _dynamicBlendSeconds.ToString("F0"), _weatherAnchors.Count);
+                wx.pendingWeatherProfile, wx.currentCloudConfig, wx.currentRain.ToString("F2"), wx.currentClouds.ToString("F2"),
+                wx.currentCcn.ToString("F2"), wx._dynamicBlendSeconds.ToString("F0"), _weatherAnchors.Count);
             Puts(report);
             if (player != null) SendMessage(player, report);
         }
@@ -3923,7 +4033,7 @@ namespace Oxide.Plugins
             if (args != null && args.Length >= 1) float.TryParse(args[0], out intensity);
             if (args != null && args.Length >= 2) float.TryParse(args[1], out duration);
             intensity = Mathf.Clamp01(intensity); duration = Mathf.Clamp(duration, 30f, 3600f);
-            _seedBias = intensity; _seedBiasEnd = Time.realtimeSinceStartup + duration;
+            wx._seedBias = intensity; wx._seedBiasEnd = Time.realtimeSinceStartup + duration;
             string msg = string.Format(lang.GetMessage("WeatherSeedLine", this, player?.UserIDString), intensity.ToString("F2"), duration.ToString("F0"));
             Puts(msg); if (player != null) SendMessage(player, msg);
         }
@@ -3931,7 +4041,7 @@ namespace Oxide.Plugins
         [ConsoleCommand("livestats.weatherstatus")]
         private void ConWeatherStatus(ConsoleSystem.Arg arg)
         {
-            arg.ReplyWith($"label={pendingWeatherProfile} asset={currentCloudConfig} rain={currentRain:F2} clouds={currentClouds:F2} opacity={currentCloudOpacity:F2} atten={currentAttenuation:F2} CCN={currentCcn:F2} anchors={_weatherAnchors.Count}");
+            arg.ReplyWith($"label={wx.pendingWeatherProfile} asset={wx.currentCloudConfig} rain={wx.currentRain:F2} clouds={wx.currentClouds:F2} opacity={wx.currentCloudOpacity:F2} atten={wx.currentAttenuation:F2} CCN={wx.currentCcn:F2} anchors={_weatherAnchors.Count}");
         }
 
         [ConsoleCommand("livestats.weatherseed")]
@@ -3941,7 +4051,7 @@ namespace Oxide.Plugins
             float intensity = arg.Args != null && arg.Args.Length >= 1 && float.TryParse(arg.Args[0], out float i) ? i : 0.45f;
             float duration = arg.Args != null && arg.Args.Length >= 2 && float.TryParse(arg.Args[1], out float d) ? d : 600f;
             intensity = Mathf.Clamp01(intensity); duration = Mathf.Clamp(duration, 30f, 3600f);
-            _seedBias = intensity; _seedBiasEnd = Time.realtimeSinceStartup + duration;
+            wx._seedBias = intensity; wx._seedBiasEnd = Time.realtimeSinceStartup + duration;
             string uid = arg.Player() != null ? arg.Player().UserIDString : null;
             arg.ReplyWith(string.Format(lang.GetMessage("WeatherSeedConsole", this, uid), intensity.ToString("F2"), duration.ToString("F0")));
         }
@@ -4317,11 +4427,85 @@ namespace Oxide.Plugins
                 changed = true;
             }
 
+            NormalizeConfig();
+
             if (changed)
             {
                 Puts("Config was missing some sections – filled missing parts with defaults (user values preserved).");
                 SaveConfig();
             }
+        }
+
+        private void NormalizeConfig()
+        {
+            if (config == null) return;
+
+            config.WorldStatsUpdateInterval = Mathf.Clamp(config.WorldStatsUpdateInterval, 5f, 300f);
+            config.LocalWeatherUpdateIntervalMinutes = Mathf.Clamp(config.LocalWeatherUpdateIntervalMinutes, 5, 180);
+            config.WeatherBlendSeconds = Mathf.Clamp(config.WeatherBlendSeconds, 25f, 180f);
+            config.WeatherBlendInterval = Mathf.Clamp(config.WeatherBlendInterval, 0.5f, 5f);
+            config.HysteresisRequiredVotes = Mathf.Max(1, config.HysteresisRequiredVotes);
+            config.ForecastHorizonDays = Mathf.Clamp(config.ForecastHorizonDays, 1, 5);
+            config.ForecastMinutely15Count = Mathf.Clamp(config.ForecastMinutely15Count, 24, 96);
+            config.MaxMinutelyAnchors = Mathf.Clamp(config.MaxMinutelyAnchors, 24, 192);
+            config.LookAheadMaxBias = Mathf.Clamp(config.LookAheadMaxBias, 0f, 0.35f);
+            config.AnticipatoryBias = Mathf.Clamp(config.AnticipatoryBias, 0f, 0.4f);
+            config.CloudSwapDissolveSeconds = Mathf.Clamp(config.CloudSwapDissolveSeconds, 2f, 20f);
+            config.LowDeckCloudMin = Mathf.Clamp01(config.LowDeckCloudMin);
+            config.LightningMinInterval = Mathf.Max(1f, config.LightningMinInterval);
+            config.LightningMaxInterval = Mathf.Max(config.LightningMinInterval + 1f, config.LightningMaxInterval);
+            config.LightningThunderThreshold = Mathf.Clamp01(config.LightningThunderThreshold);
+            config.LightningFlashDuration = Mathf.Clamp(config.LightningFlashDuration, 0.04f, 0.22f);
+            config.CcnBaseLevel = Mathf.Clamp01(config.CcnBaseLevel);
+            config.StormCapeThreshold = Mathf.Max(100f, config.StormCapeThreshold);
+            config.StormVeryHighCape = Mathf.Max(config.StormCapeThreshold, config.StormVeryHighCape);
+
+            if (double.IsNaN(config.LocalWeatherLatitude) || config.LocalWeatherLatitude < -90 || config.LocalWeatherLatitude > 90)
+                config.LocalWeatherLatitude = 39.95;
+            if (double.IsNaN(config.LocalWeatherLongitude) || config.LocalWeatherLongitude < -180 || config.LocalWeatherLongitude > 180)
+                config.LocalWeatherLongitude = -75.16;
+
+            if (config.TimeSystem == null)
+                config.TimeSystem = new TimeSystemConfig();
+            config.TimeSystem.UpdateIntervalSeconds = Mathf.Max(10f, config.TimeSystem.UpdateIntervalSeconds);
+            config.TimeSystem.DawnDuskMinutes = Mathf.Clamp(config.TimeSystem.DawnDuskMinutes, 10f, 90f);
+            config.TimeSystem.NightBrightnessScale = Mathf.Clamp(config.TimeSystem.NightBrightnessScale, 0.55f, 0.95f);
+            config.TimeSystem.SuppressCatchUpSeconds = Mathf.Clamp(config.TimeSystem.SuppressCatchUpSeconds, 1f, 60f);
+            config.TimeSystem.CustomMoonPhase = Mathf.Clamp01(config.TimeSystem.CustomMoonPhase);
+            string moon = config.TimeSystem.MoonMode ?? "Real";
+            if (moon != "Real" && moon != "ForceFull" && moon != "ForceNew" && moon != "Custom")
+                config.TimeSystem.MoonMode = "Real";
+
+            if (config.TimeSystem.SplitDay == null)
+                config.TimeSystem.SplitDay = new SplitDayConfig();
+            var sd = config.TimeSystem.SplitDay;
+            sd.InGameDaysPerRealDay = Mathf.Clamp(sd.InGameDaysPerRealDay, 1, 24);
+            sd.DaytimePercent = Mathf.Clamp(sd.DaytimePercent, 1f, 99f);
+            sd.NighttimePercent = Mathf.Clamp(sd.NighttimePercent, 1f, 99f);
+            sd.DayStartHour = Mathf.Clamp(sd.DayStartHour, 0f, 23.9f);
+            sd.DayEndHour = Mathf.Clamp(sd.DayEndHour, sd.DayStartHour + 0.1f, 24f);
+            sd.AlignRealHour = Mathf.Repeat(sd.AlignRealHour, 24f);
+            sd.UpdateIntervalSeconds = Mathf.Clamp(sd.UpdateIntervalSeconds, 1f, 10f);
+            sd.RateBlendHours = Mathf.Max(0f, sd.RateBlendHours);
+            sd.HourDriftCorrection = Mathf.Max(0.01f, sd.HourDriftCorrection);
+
+            if (config.TimeSystem.Polar == null)
+                config.TimeSystem.Polar = new PolarConfig();
+            config.TimeSystem.Polar.MinimumNightBrightness = Mathf.Clamp01(config.TimeSystem.Polar.MinimumNightBrightness);
+
+            if (config.Lighting == null)
+                config.Lighting = new WeatherLightingConfig();
+            var lit = config.Lighting;
+            lit.NightlightBrightness = Mathf.Clamp(lit.NightlightBrightness, 0f, 0.05f);
+            lit.NightlightDistance = Mathf.Clamp(lit.NightlightDistance, 1f, 20f);
+            lit.NightlightFadeFraction = Mathf.Clamp01(lit.NightlightFadeFraction);
+            lit.MoonMeshNightClear = Mathf.Clamp01(lit.MoonMeshNightClear);
+            lit.MoonMeshNightOvercast = Mathf.Clamp01(lit.MoonMeshNightOvercast);
+            lit.VCloudMoonNightClear = Mathf.Clamp01(lit.VCloudMoonNightClear);
+            lit.VCloudMoonNightOvercast = Mathf.Clamp01(lit.VCloudMoonNightOvercast);
+
+            if (config.Tournament == null)
+                config.Tournament = new TournamentConfig();
         }
 
         protected override void SaveConfig() => Config.WriteObject(config, true);
