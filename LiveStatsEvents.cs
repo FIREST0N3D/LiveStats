@@ -11,7 +11,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.88")]
+    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.161")]
     [Description("Core event scheduler + classic world events (Cargo, Airdrop, Heli, Chinook, Bradley, F-15, Hackable). Requires LiveStatsWorld. NPC events require LiveStatsEventsNPC. Vehicle events+despawn require LiveStatsEventsVehicles. Configs: core owns schedule + classic events; LiveStatsEventsNPC owns NPC behavior; LiveStatsEventsVehicles owns vehicle limits/despawn.")]
     class LiveStatsEvents : RustPlugin
     {
@@ -102,6 +102,7 @@ namespace Oxide.Plugins
             public List<Vector3> Points = new List<Vector3>();
             public float Width;
             public float Length; // sum of segment lengths
+            public bool IsMain;
         }
         private readonly List<CachedRoad> _roadCache = new List<CachedRoad>();
         private readonly List<Vector3> _roadXings = new List<Vector3>();
@@ -139,6 +140,67 @@ namespace Oxide.Plugins
         private string _lastHackableGrid = "";
         private float _suppressHackableAnnounceUntil = -1f;
         private readonly HashSet<ulong> _announcedCrateIds = new HashSet<ulong>();
+        private readonly HashSet<int> _throughMonRoads = new HashSet<int>();
+        private readonly Dictionary<string, float[]> _razorLocalXZ = new Dictionary<string, float[]>(StringComparer.OrdinalIgnoreCase);
+        private bool _razorSeeded;
+        private const string MonumentScanFile = "LiveStatsMonuments";
+        private const string MonumentScanVersion = "monuments-v3.3";
+        private const string BradleyPathFile = "LiveStatsBradleyPaths";
+        private const string BradleyPathVersion = "paths-v3";
+        private readonly List<MonumentScanEntry> _monumentScan = new List<MonumentScanEntry>();
+        private bool _monumentScanReady;
+
+        private class MonumentScanEntry
+        {
+            public int Id;
+            public string Name = "";
+            public string Prefab = "";
+            public string Grid = "";
+            public float X;
+            public float Z;
+            public float Yaw;
+            public float Radius;
+            public string Kind = "roadside";
+            public string Family = "";
+            public bool BradleySkip;
+            public List<int> ThroughRoads = new List<int>();
+            public List<int> SpurRoads = new List<int>();
+            public int Blocks;
+            public List<float> GateX = new List<float>();
+            public List<float> GateZ = new List<float>();
+            public List<float> LaneX = new List<float>();
+            public List<float> LaneZ = new List<float>();
+        }
+
+        private class MonumentScanFileData
+        {
+            public string Map = "";
+            public string Version = "";
+            public List<MonumentScanEntry> Monuments = new List<MonumentScanEntry>();
+        }
+
+        private class BradleyPathPrefab
+        {
+            public string Prefab = "";
+            public string Family = "";
+            public string Kind = "";
+            public bool Tour;
+            public float Spacing = 14f;
+            public List<float> LocalX = new List<float>();
+            public List<float> LocalZ = new List<float>();
+            public int Cells;
+            public float Length;
+            public string Via = "";
+        }
+
+        private class BradleyPathFileData
+        {
+            public string Map = "";
+            public string Version = "";
+            public Dictionary<string, BradleyPathPrefab> Prefabs = new Dictionary<string, BradleyPathPrefab>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        private BradleyPathFileData _bradleyPaths;
 
         // Weather snapshot cache (avoids disk + Climate reads on every event roll)
         private int _cachedWipeDay;
@@ -244,7 +306,7 @@ namespace Oxide.Plugins
             permission.RegisterPermission(AdminPermission, this);
             // Do NOT register livestats.admin / livestatsworld.admin – those belong to other plugins.
             LoadDefaultMessages();
-            Puts("LiveStatsEvents v1.13.88 — 3-way takes the long unused arm, not a U-turn");
+            Puts("LiveStatsEvents v1.13.161 — skip-pin must leave the lot; no junkyard splice");
             // Earliest possible vanilla gate — EventSchedule may queue before OnServerInitialized
             EarlyVanillaSuppress();
         }
@@ -5587,6 +5649,7 @@ namespace Oxide.Plugins
                 _roadCache.Clear();
                 _roadCache.AddRange(_staticRoadCache);
                 Puts($"[Events] Road cache restored from previous load ({_roadCache.Count} roads, map={identity})");
+                ScanBradleyMonumentCorridors();
                 return;
             }
             BuildRoadCache();
@@ -5597,6 +5660,43 @@ namespace Oxide.Plugins
         /// Drops water nodes, near-duplicates, and steep/cliff segments.
         /// Result is also stored in static fields so soft reloads skip the rebuild.
         /// </summary>
+        private void MarkMainRoads()
+        {
+            try
+            {
+                var mains = TerrainMeta.Path?.MainRoads;
+                if (mains == null || mains.Count == 0) return;
+                var anchors = new List<Vector3>(mains.Count * 2);
+                foreach (var road in mains)
+                {
+                    if (road?.Path?.Points == null || road.Path.Points.Length < 2) continue;
+                    anchors.Add(road.Path.Points[0]);
+                    anchors.Add(road.Path.Points[road.Path.Points.Length - 1]);
+                    int mid = road.Path.Points.Length / 2;
+                    anchors.Add(road.Path.Points[mid]);
+                }
+                for (int i = 0; i < _roadCache.Count; i++)
+                {
+                    var r = _roadCache[i];
+                    if (r.Points == null || r.Points.Count < 4) continue;
+                    Vector3 a = r.Points[0], b = r.Points[r.Points.Count / 2], c = r.Points[r.Points.Count - 1];
+                    for (int k = 0; k < anchors.Count; k++)
+                    {
+                        Vector3 p = anchors[k];
+                        float d0 = (a.x - p.x) * (a.x - p.x) + (a.z - p.z) * (a.z - p.z);
+                        float d1 = (b.x - p.x) * (b.x - p.x) + (b.z - p.z) * (b.z - p.z);
+                        float d2 = (c.x - p.x) * (c.x - p.x) + (c.z - p.z) * (c.z - p.z);
+                        if (d0 < 40f * 40f || d1 < 40f * 40f || d2 < 40f * 40f)
+                        {
+                            r.IsMain = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
         private void BuildRoadCache()
         {
             _roadCache.Clear();
@@ -5718,8 +5818,10 @@ namespace Oxide.Plugins
                     _roadCache.Add(cached);
                 }
 
+                MarkMainRoads();
                 _roadCache.Sort((a, b) =>
                 {
+                    if (a.IsMain != b.IsMain) return a.IsMain ? -1 : 1;
                     int c = b.Width.CompareTo(a.Width);
                     return c != 0 ? c : b.Length.CompareTo(a.Length);
                 });
@@ -5733,6 +5835,7 @@ namespace Oxide.Plugins
                 // Persist for soft reloads (oxide.reload) on the same map
                 _staticRoadCache = new List<CachedRoad>(_roadCache);
                 _staticRoadMapIdentity = GetMapIdentity();
+                ScanBradleyMonumentCorridors();
             }
             catch (Exception ex)
             {
@@ -5857,17 +5960,149 @@ namespace Oxide.Plugins
                 || n.IndexOf("oilrig", StringComparison.Ordinal) >= 0;
         }
 
+        /// <summary>
+        /// Facepunch autospawn prefab family (Monument Finder list + 2025/26 adds).
+        /// skip = not a road tour. roadside = drive past. coastal = harbor/ferry/fishing/lighthouse
+        /// (through only if a named road ENTERS AND LEAVES). yard = inner lot no-go.
+        /// </summary>
+        private static string MonumentPrefabFamily(string n)
+        {
+            if (string.IsNullOrEmpty(n)) return "skip";
+            n = n.ToLowerInvariant();
+            if (n.IndexOf("power_sub", StringComparison.Ordinal) >= 0 || n.IndexOf("powersub", StringComparison.Ordinal) >= 0)
+                return "skip";
+            if (n.IndexOf("cave_", StringComparison.Ordinal) >= 0 || n.IndexOf("/cave", StringComparison.Ordinal) >= 0)
+                return "skip";
+            if (n.IndexOf("ice_lake", StringComparison.Ordinal) >= 0) return "skip";
+            if (n.IndexOf("swamp_", StringComparison.Ordinal) >= 0) return "skip";
+            if (n.IndexOf("underwater_lab", StringComparison.Ordinal) >= 0) return "skip";
+            if (n.IndexOf("oilrig", StringComparison.Ordinal) >= 0) return "skip";
+            if (n.IndexOf("mining_quarry", StringComparison.Ordinal) >= 0) return "skip";
+            if (n.IndexOf("water_well", StringComparison.Ordinal) >= 0 || n.IndexOf("waterwell", StringComparison.Ordinal) >= 0) return "skip";
+            if (n.IndexOf("jungle", StringComparison.Ordinal) >= 0) return "skip";
+            if (n.IndexOf("deepsea", StringComparison.Ordinal) >= 0) return "skip";
+            if (n.IndexOf("island", StringComparison.Ordinal) >= 0) return "skip";
+
+            if (n.IndexOf("gas_station", StringComparison.Ordinal) >= 0) return "roadside";
+            if (n.IndexOf("supermarket", StringComparison.Ordinal) >= 0) return "roadside";
+            if (n.IndexOf("bus_stop", StringComparison.Ordinal) >= 0) return "roadside";
+            if (n.IndexOf("busstop", StringComparison.Ordinal) >= 0) return "roadside";
+            if (n.IndexOf("stables", StringComparison.Ordinal) >= 0) return "roadside";
+            if (n.IndexOf("warehouse", StringComparison.Ordinal) >= 0) return "roadside";
+            if (n.IndexOf("radtown_small", StringComparison.Ordinal) >= 0) return "roadside";
+            if (n.IndexOf("entrance_bunker", StringComparison.Ordinal) >= 0) return "roadside";
+            if (n.IndexOf("apartment", StringComparison.Ordinal) >= 0) return "roadside";
+            if (n.IndexOf("outpost", StringComparison.Ordinal) >= 0) return "roadside";
+            if (n.IndexOf("compound", StringComparison.Ordinal) >= 0) return "roadside";
+            if (n.IndexOf("junkyard", StringComparison.Ordinal) >= 0) return "yard";
+
+            if (n.IndexOf("harbor_", StringComparison.Ordinal) >= 0 || n.IndexOf("harbour", StringComparison.Ordinal) >= 0)
+                return "coastal";
+            if (n.IndexOf("ferry_terminal", StringComparison.Ordinal) >= 0) return "coastal";
+            if (n.IndexOf("fishing_village", StringComparison.Ordinal) >= 0) return "coastal";
+            if (n.IndexOf("lighthouse", StringComparison.Ordinal) >= 0) return "coastal";
+
+            if (n.IndexOf("airfield", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("launch_site", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("powerplant", StringComparison.Ordinal) >= 0 || n.IndexOf("power_plant", StringComparison.Ordinal) >= 0)
+                return "yard";
+            if (n.IndexOf("trainyard", StringComparison.Ordinal) >= 0 || n.IndexOf("train_yard", StringComparison.Ordinal) >= 0)
+                return "yard";
+            if (n.IndexOf("water_treatment", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("excavator", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("satellite", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("sphere_tank", StringComparison.Ordinal) >= 0 || n.IndexOf("dome", StringComparison.Ordinal) >= 0)
+                return "yard";
+            if (n.IndexOf("sewer", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("junkyard", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("military_tunnel", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("arctic_research", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("desert_military", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("missile_silo", StringComparison.Ordinal) >= 0 || n.IndexOf("nuclear_missile", StringComparison.Ordinal) >= 0)
+                return "yard";
+            if (n.IndexOf("compound", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("bandit", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("outpost", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("apartment", StringComparison.Ordinal) >= 0) return "yard";
+            if (n.IndexOf("radtown", StringComparison.Ordinal) >= 0) return "yard";
+            return "";
+        }
+
+        private static bool HarborLotName(string n)
+        {
+            if (string.IsNullOrEmpty(n)) return false;
+            return n.IndexOf("harbor", StringComparison.Ordinal) >= 0
+                || n.IndexOf("harbour", StringComparison.Ordinal) >= 0
+                || n.IndexOf("ferry_terminal", StringComparison.Ordinal) >= 0
+                || n.IndexOf("fishing_village", StringComparison.Ordinal) >= 0;
+        }
+
+        /// <summary>Dock-only coastal lots — never a Bradley through-tour.</summary>
+        private static bool HarborPierOnlyName(string n)
+        {
+            if (string.IsNullOrEmpty(n)) return false;
+            return n.IndexOf("ferry_terminal", StringComparison.Ordinal) >= 0
+                || n.IndexOf("fishing_village", StringComparison.Ordinal) >= 0;
+        }
+
+        private bool IsHarborLot(Vector3 p)
+        {
+            if (_monumentScanReady)
+            {
+                for (int i = 0; i < _monumentScan.Count; i++)
+                {
+                    var m = _monumentScan[i];
+                    if (m == null || !HarborLotName(m.Name)) continue;
+                    if (BradleyCanTourMonument(m)) continue;
+                    if (string.Equals(m.Kind, "through", StringComparison.Ordinal)) continue;
+                    float dx = p.x - m.X, dz = p.z - m.Z;
+                    float rad = Mathf.Max(m.Radius, 140f);
+                    if (dx * dx + dz * dz <= rad * rad) return true;
+                }
+            }
+            try
+            {
+                var mons = TerrainMeta.Path?.Monuments;
+                if (mons == null) return false;
+                for (int i = 0; i < mons.Count; i++)
+                {
+                    var mon = mons[i];
+                    if (mon == null) continue;
+                    if (!HarborLotName((mon.name ?? "").ToLowerInvariant())) continue;
+                    Vector3 mp = mon.transform.position;
+                    float dx = mp.x - p.x, dz = mp.z - p.z;
+                    if (dx * dx + dz * dz <= 140f * 140f) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
         private static bool BradleySkipLotName(string n)
         {
             if (string.IsNullOrEmpty(n)) return true;
             return n.IndexOf("gas_station", StringComparison.Ordinal) >= 0
                 || n.IndexOf("supermarket", StringComparison.Ordinal) >= 0
+                || n.IndexOf("bus_stop", StringComparison.Ordinal) >= 0
+                || n.IndexOf("busstop", StringComparison.Ordinal) >= 0
                 || n.IndexOf("lighthouse", StringComparison.Ordinal) >= 0
-                || n.IndexOf("warehouse_small", StringComparison.Ordinal) >= 0
+                || n.IndexOf("warehouse", StringComparison.Ordinal) >= 0
+                || n.IndexOf("water_well", StringComparison.Ordinal) >= 0
+                || n.IndexOf("waterwell", StringComparison.Ordinal) >= 0
+                || n.IndexOf("entrance_bunker", StringComparison.Ordinal) >= 0
+                || n.IndexOf("power_sub", StringComparison.Ordinal) >= 0
+                || n.IndexOf("powersub", StringComparison.Ordinal) >= 0
+                || n.IndexOf("transformer", StringComparison.Ordinal) >= 0
+                || n.IndexOf("swimming_pool", StringComparison.Ordinal) >= 0
                 || n.IndexOf("swamp", StringComparison.Ordinal) >= 0
+                || n.IndexOf("jungle", StringComparison.Ordinal) >= 0
+                || n.IndexOf("stables", StringComparison.Ordinal) >= 0
                 || n.IndexOf("cave", StringComparison.Ordinal) >= 0
                 || n.IndexOf("underwater", StringComparison.Ordinal) >= 0
-                || n.IndexOf("island", StringComparison.Ordinal) >= 0;
+                || n.IndexOf("island", StringComparison.Ordinal) >= 0
+                || n.IndexOf("apartment", StringComparison.Ordinal) >= 0
+                || n.IndexOf("outpost", StringComparison.Ordinal) >= 0
+                || n.IndexOf("compound", StringComparison.Ordinal) >= 0;
         }
 
         private string ClosestMonumentLabel(Vector3 p, out float dist)
@@ -5903,6 +6138,23 @@ namespace Oxide.Plugins
         /// </summary>
         private bool IsBradleyNoGoLot(Vector3 p)
         {
+            // Harbor / fishing pier is always a lot — never a through-tour.
+            if (IsHarborLot(p)) return true;
+            // Painted through-road across a monument is a tour, not a trap.
+            if (OnMonumentThroughRoad(p)) return false;
+            if (_monumentScanReady)
+            {
+                var hit = FindMonumentScanAt(p);
+                if (hit == null) return false;
+                if (hit.Kind == "skip" || hit.Kind == "roadside") return false;
+                if (hit.Kind == "through")
+                {
+                    float dx = p.x - hit.X, dz = p.z - hit.Z;
+                    float inner = hit.Radius * 0.55f;
+                    return dx * dx + dz * dz <= inner * inner;
+                }
+                return true; // courtyard interior
+            }
             try
             {
                 var mons = TerrainMeta.Path?.Monuments;
@@ -5918,7 +6170,6 @@ namespace Oxide.Plugins
                     {
                         var b = mon.Bounds;
                         float ext = Mathf.Max(b.extents.x, b.extents.z);
-                        // Named courtyard OR any large monument (I12 was an unnamed lot).
                         if (!BradleyLotName(n) && ext < 40f) continue;
                         rad = Mathf.Clamp(ext + 16f, 55f, 160f);
                     }
@@ -5934,6 +6185,1650 @@ namespace Oxide.Plugins
             }
             catch { }
             return false;
+        }
+
+        /// <summary>
+        /// monuments-v1: one boot pass. Persist oxide/data/LiveStatsMonuments.json
+        /// keyed by map identity. Through-road = enter AND leave bounds.
+        /// Courtyard = large lot with no through-road (or only a spur).
+        /// Bradley/NPC drive through-roads; inner lot / barricades stay no-go.
+        /// </summary>
+        private void ScanBradleyMonumentCorridors()
+        {
+            BuildMonumentScan();
+        }
+
+        private bool TryLoadMonumentScan()
+        {
+            _monumentScan.Clear();
+            _monumentScanReady = false;
+            _throughMonRoads.Clear();
+            try
+            {
+                var data = Interface.Oxide.DataFileSystem.ReadObject<MonumentScanFileData>(MonumentScanFile);
+                if (data == null || data.Monuments == null || data.Monuments.Count == 0) return false;
+                if (!string.Equals(data.Version, MonumentScanVersion, StringComparison.Ordinal)) return false;
+                if (!string.Equals(data.Map, GetMapIdentity(), StringComparison.Ordinal)) return false;
+                _monumentScan.AddRange(data.Monuments);
+                for (int i = 0; i < _monumentScan.Count; i++)
+                {
+                    var m = _monumentScan[i];
+                    if (m?.ThroughRoads == null) continue;
+                    for (int r = 0; r < m.ThroughRoads.Count; r++)
+                        _throughMonRoads.Add(m.ThroughRoads[r]);
+                }
+                int withLane = 0;
+                for (int i = 0; i < _monumentScan.Count; i++)
+                {
+                    var m = _monumentScan[i];
+                    if (m?.LaneX != null && m.LaneX.Count >= 4) withLane++;
+                }
+                if (withLane == 0)
+                {
+                    Puts($"[Events] {MonumentScanVersion} restored but lanes empty — rebuilding");
+                    return false;
+                }
+                _monumentScanReady = true;
+                Puts($"[Events] {data.Version} restored ({_monumentScan.Count} sites, lanes={withLane}, through-roads={_throughMonRoads.Count}, map={data.Map})");
+                EnsureBradleyPathCatalog();
+                ApplyPrefabTemplatesToScan();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Puts("[Events] monuments-v1 load: " + ex.Message);
+                return false;
+            }
+        }
+
+        private void SaveMonumentScan()
+        {
+            try
+            {
+                var data = new MonumentScanFileData
+                {
+                    Map = GetMapIdentity(),
+                    Version = MonumentScanVersion,
+                    Monuments = _monumentScan
+                };
+                Interface.Oxide.DataFileSystem.WriteObject(MonumentScanFile, data);
+            }
+            catch (Exception ex)
+            {
+                Puts("[Events] monuments-v1 save: " + ex.Message);
+            }
+        }
+
+        private static string ShortMonumentName(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            string n = raw;
+            int slash = n.LastIndexOf('/');
+            if (slash >= 0 && slash + 1 < n.Length) n = n.Substring(slash + 1);
+            return n.Replace(".prefab", "");
+        }
+
+        private void BuildMonumentScan()
+        {
+            if (TryLoadMonumentScan()) return;
+            _monumentScan.Clear();
+            _throughMonRoads.Clear();
+            _monumentScanReady = false;
+            try
+            {
+                var mons = TerrainMeta.Path?.Monuments;
+                if (mons == null || mons.Count == 0)
+                {
+                    Puts("[Events] monuments-v1: no TerrainMeta.Path.Monuments");
+                    return;
+                }
+
+                var blockHits = new List<Vector3>();
+                try
+                {
+                    foreach (var bn in BaseNetworkable.serverEntities)
+                    {
+                        var ent = bn as BaseEntity;
+                        if (ent == null || ent.IsDestroyed) continue;
+                        string sn = (ent.ShortPrefabName ?? "").ToLowerInvariant();
+                        if (sn.IndexOf("barricade", StringComparison.Ordinal) < 0
+                            && sn.IndexOf("barrier", StringComparison.Ordinal) < 0
+                            && sn.IndexOf("icewall", StringComparison.Ordinal) < 0
+                            && sn.IndexOf("road_barrier", StringComparison.Ordinal) < 0
+                            && sn.IndexOf("gates.external", StringComparison.Ordinal) < 0)
+                            continue;
+                        blockHits.Add(ent.transform.position);
+                        if (blockHits.Count >= 400) break;
+                    }
+                }
+                catch { }
+
+                int id = 0;
+                for (int i = 0; i < mons.Count; i++)
+                {
+                    var mon = mons[i];
+                    if (mon == null || mon.transform == null) continue;
+                    string raw = mon.name ?? "";
+                    string n = raw.ToLowerInvariant();
+                    Vector3 mp = mon.transform.position;
+                    float rad = 70f;
+                    try
+                    {
+                        var b = mon.Bounds;
+                        rad = Mathf.Clamp(Mathf.Max(b.extents.x, b.extents.z) + 16f, 40f, 220f);
+                    }
+                    catch { }
+                    if (MonumentPrefabFamily(n) == "yard")
+                        rad = Mathf.Max(rad, 130f);
+
+                    float yaw = 0f;
+                    try { yaw = mon.transform.eulerAngles.y; } catch { }
+                    var entry = new MonumentScanEntry
+                    {
+                        Id = id++,
+                        Name = ShortMonumentName(raw),
+                        Prefab = ShortMonumentName(raw),
+                        Grid = PositionToGrid(mp),
+                        X = mp.x,
+                        Z = mp.z,
+                        Yaw = yaw,
+                        Radius = rad
+                    };
+
+                    string family = MonumentPrefabFamily(n);
+                    entry.Family = family;
+                    // harbor_1 / harbor_2 can tour the LAND-SIDE road. Ferry + fishing stay skip.
+                    entry.BradleySkip = BradleySkipLotName(n)
+                        || family == "skip"
+                        || HarborPierOnlyName(n)
+                        || n.IndexOf("radtown_small", StringComparison.Ordinal) >= 0
+                        || n.IndexOf("oilrig", StringComparison.Ordinal) >= 0
+                        || n.IndexOf("deepsea", StringComparison.Ordinal) >= 0
+                        || n.IndexOf("underwater", StringComparison.Ordinal) >= 0;
+                    bool coastal = family == "coastal" || HarborLotName(n);
+
+                    float radSq = rad * rad;
+                    float clip = rad + 36f;
+                    float clipSq = clip * clip;
+                    for (int r = 0; r < _roadCache.Count; r++)
+                    {
+                        var pts = _roadCache[r].Points;
+                        if (pts == null || pts.Count < 6) continue;
+                        if (_roadCache[r].Width < 4.4f) continue;
+                        int firstHit = -1, lastHit = -1;
+                        bool coreHit = false;
+                        for (int p = 0; p < pts.Count; p++)
+                        {
+                            float dx = pts[p].x - mp.x, dz = pts[p].z - mp.z;
+                            float d2 = dx * dx + dz * dz;
+                            if (d2 <= radSq) coreHit = true;
+                            if (d2 <= clipSq)
+                            {
+                                if (firstHit < 0) firstHit = p;
+                                lastHit = p;
+                            }
+                        }
+                        if (firstHit < 0) continue;
+                        bool enter = firstHit > 1;
+                        bool leave = lastHit >= 0 && lastHit < pts.Count - 2;
+                        if (enter && leave)
+                        {
+                            if (!entry.ThroughRoads.Contains(r)) entry.ThroughRoads.Add(r);
+                            _throughMonRoads.Add(r);
+                            entry.GateX.Add(pts[firstHit].x);
+                            entry.GateZ.Add(pts[firstHit].z);
+                            entry.GateX.Add(pts[lastHit].x);
+                            entry.GateZ.Add(pts[lastHit].z);
+                        }
+                        else if (coreHit || enter || leave)
+                        {
+                            if (!entry.SpurRoads.Contains(r)) entry.SpurRoads.Add(r);
+                            if (firstHit >= 0)
+                            {
+                                entry.GateX.Add(pts[firstHit].x);
+                                entry.GateZ.Add(pts[firstHit].z);
+                            }
+                            if (leave && lastHit >= 0 && lastHit != firstHit)
+                            {
+                                entry.GateX.Add(pts[lastHit].x);
+                                entry.GateZ.Add(pts[lastHit].z);
+                            }
+                        }
+                    }
+                    int blocks = 0;
+                    for (int b = 0; b < blockHits.Count; b++)
+                    {
+                        float dx = blockHits[b].x - mp.x, dz = blockHits[b].z - mp.z;
+                        if (dx * dx + dz * dz <= radSq) blocks++;
+                    }
+                    entry.Blocks = blocks;
+
+                    bool twoGate = entry.GateX != null && entry.GateX.Count >= 2 && entry.GateZ != null && entry.GateZ.Count >= 2;
+                    float gateSpan = 0f;
+                    if (twoGate)
+                    {
+                        float gx = entry.GateX[0] - entry.GateX[entry.GateX.Count - 1];
+                        float gz = entry.GateZ[0] - entry.GateZ[entry.GateZ.Count - 1];
+                        gateSpan = Mathf.Sqrt(gx * gx + gz * gz);
+                    }
+
+                    if (family == "roadside" || (entry.BradleySkip && family != "yard" && family != "coastal"))
+                        entry.Kind = family == "skip" ? "skip" : "roadside";
+                    else if (entry.ThroughRoads.Count > 0)
+                        entry.Kind = "through";
+                    else if (coastal || family == "yard" || BradleyLotName(n) || rad >= 70f)
+                        entry.Kind = "courtyard";
+                    else
+                        entry.Kind = "roadside";
+                    if (entry.BradleySkip && entry.Kind == "courtyard")
+                        entry.Kind = "roadside";
+
+                    BuildMonumentLane(entry);
+                    BakeMonumentSkeleton(entry);
+
+                    _monumentScan.Add(entry);
+                }
+
+                _monumentScanReady = true;
+                int thru = 0, yard = 0, skip = 0, road = 0, bskip = 0;
+                for (int i = 0; i < _monumentScan.Count; i++)
+                {
+                    var e = _monumentScan[i];
+                    if (e == null) continue;
+                    if (e.BradleySkip) bskip++;
+                    if (e.Kind == "through") thru++;
+                    else if (e.Kind == "courtyard") yard++;
+                    else if (e.Kind == "skip") skip++;
+                    else if (e.Kind == "roadside") road++;
+                }
+                Puts($"[Events] {MonumentScanVersion} built sites={_monumentScan.Count} through={thru} courtyard={yard} roadside={road} skip={skip} bradleySkip={bskip} through-roads={_throughMonRoads.Count} map={GetMapIdentity()}");
+                for (int i = 0; i < _monumentScan.Count; i++)
+                {
+                    var e = _monumentScan[i];
+                    if (e == null) continue;
+                    int tc = e.ThroughRoads != null ? e.ThroughRoads.Count : 0;
+                    int sc = e.SpurRoads != null ? e.SpurRoads.Count : 0;
+                    int lc = e.LaneX != null ? e.LaneX.Count : 0;
+                    int gc = e.GateX != null ? e.GateX.Count : 0;
+                    string flag = e.BradleySkip ? "bradley=skip" : "bradley=tour";
+                    Puts($"[Events] {MonumentScanVersion} {e.Grid} {e.Name} kind={e.Kind} family={e.Family} {flag} thru={tc} spur={sc} gates={gc} lane={lc} r={e.Radius:F0} blocks={e.Blocks}");
+                }
+                SaveMonumentScan();
+                EnsureBradleyPathCatalog();
+                ApplyPrefabTemplatesToScan();
+                SaveBradleyPaths();
+            }
+            catch (Exception ex)
+            {
+                Puts("[Events] monuments-v1 build: " + ex.Message);
+                _monumentScanReady = false;
+            }
+        }
+
+        private void BuildMonumentLane(MonumentScanEntry entry)
+        {
+            if (entry == null) return;
+            entry.LaneX = entry.LaneX ?? new List<float>();
+            entry.LaneZ = entry.LaneZ ?? new List<float>();
+            entry.LaneX.Clear();
+            entry.LaneZ.Clear();
+            if (entry.Kind == "skip") return;
+
+            Vector3 origin = new Vector3(entry.X, 0f, entry.Z);
+            float rad = entry.Radius;
+            float radSq = rad * rad;
+
+            List<Vector3> best = null;
+            float bestScore = -1f;
+            var roadIds = new List<int>();
+            if (entry.ThroughRoads != null)
+            {
+                for (int t = 0; t < entry.ThroughRoads.Count; t++)
+                    if (!roadIds.Contains(entry.ThroughRoads[t])) roadIds.Add(entry.ThroughRoads[t]);
+            }
+            if (entry.SpurRoads != null)
+            {
+                for (int t = 0; t < entry.SpurRoads.Count; t++)
+                    if (!roadIds.Contains(entry.SpurRoads[t])) roadIds.Add(entry.SpurRoads[t]);
+            }
+            // Any Path.Road that actually crosses the ring — not just "through".
+            for (int r = 0; r < _roadCache.Count; r++)
+            {
+                if (roadIds.Contains(r)) continue;
+                var pts = _roadCache[r].Points;
+                if (pts == null || pts.Count < 4 || _roadCache[r].Width < 4.4f) continue;
+                for (int p = 0; p < pts.Count; p++)
+                {
+                    float dx = pts[p].x - origin.x, dz = pts[p].z - origin.z;
+                    if (dx * dx + dz * dz <= radSq)
+                    {
+                        roadIds.Add(r);
+                        break;
+                    }
+                }
+            }
+            for (int t = 0; t < roadIds.Count; t++)
+            {
+                int rid = roadIds[t];
+                if (rid < 0 || rid >= _roadCache.Count) continue;
+                var pts = _roadCache[rid].Points;
+                if (pts == null) continue;
+                var clip = new List<Vector3>();
+                float keepSq = (rad * 2.1f) * (rad * 2.1f);
+                for (int p = 0; p < pts.Count; p++)
+                {
+                    float dx = pts[p].x - origin.x, dz = pts[p].z - origin.z;
+                    if (dx * dx + dz * dz <= keepSq)
+                        clip.Add(pts[p]);
+                }
+                if (clip.Count < 3 && pts.Count >= 3)
+                {
+                    int nearest = 0;
+                    float bestD = float.MaxValue;
+                    for (int p = 0; p < pts.Count; p++)
+                    {
+                        float dx = pts[p].x - origin.x, dz = pts[p].z - origin.z;
+                        float d2 = dx * dx + dz * dz;
+                        if (d2 < bestD) { bestD = d2; nearest = p; }
+                    }
+                    int lo = Math.Max(0, nearest - 8);
+                    int hi = Math.Min(pts.Count - 1, nearest + 8);
+                    clip.Clear();
+                    for (int p = lo; p <= hi; p++) clip.Add(pts[p]);
+                }
+                if (clip.Count < 3) continue;
+                float span = Vector3.Distance(clip[0], clip[clip.Count - 1]);
+                float score = span + clip.Count * 4f;
+                if (entry.GateX != null && entry.GateX.Count >= 2 && entry.GateZ != null && entry.GateZ.Count >= 2)
+                {
+                    var g0 = new Vector3(entry.GateX[0], 0f, entry.GateZ[0]);
+                    var g1 = new Vector3(entry.GateX[entry.GateX.Count - 1], 0f, entry.GateZ[entry.GateZ.Count - 1]);
+                    float a0 = Vector3.Distance(clip[0], g0) + Vector3.Distance(clip[clip.Count - 1], g1);
+                    float a1 = Vector3.Distance(clip[0], g1) + Vector3.Distance(clip[clip.Count - 1], g0);
+                    float gateFit = Math.Min(a0, a1);
+                    score += Math.Max(0f, 220f - gateFit);
+                    if (span >= 90f) score += 80f;
+                }
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = clip;
+                }
+            }
+
+            if (best == null && entry.GateX != null && entry.GateX.Count >= 2 && entry.GateZ != null && entry.GateZ.Count >= 2)
+            {
+                var a = new Vector3(entry.GateX[0], 0f, entry.GateZ[0]);
+                var b = new Vector3(entry.GateX[entry.GateX.Count - 1], 0f, entry.GateZ[entry.GateZ.Count - 1]);
+                float span = Vector3.Distance(a, b);
+                if (span >= 40f)
+                {
+                    best = new List<Vector3>();
+                    int steps = Mathf.Clamp(Mathf.RoundToInt(span / 22f), 3, 16);
+                    for (int s = 0; s <= steps; s++)
+                    {
+                        var p = Vector3.Lerp(a, b, s / (float)steps);
+                        p.y = TerrainMeta.HeightMap != null ? TerrainMeta.HeightMap.GetHeight(p) : 0f;
+                        best.Add(p);
+                    }
+                }
+            }
+
+            if (best == null) return;
+            for (int i = 0; i < best.Count; i++)
+            {
+                entry.LaneX.Add(best[i].x);
+                entry.LaneZ.Add(best[i].z);
+            }
+        }
+
+        private List<Vector3> ClipThroughRoadLane(MonumentScanEntry e)
+        {
+            var lane = new List<Vector3>();
+            if (e == null || e.ThroughRoads == null || e.ThroughRoads.Count == 0) return lane;
+            if (_roadCache == null || _roadCache.Count == 0) return lane;
+            float keep = (e.Radius + 36f) * (e.Radius + 36f);
+            List<Vector3> best = null;
+            float bestSpan = 0f;
+            for (int r = 0; r < e.ThroughRoads.Count; r++)
+            {
+                int rid = e.ThroughRoads[r];
+                if (rid < 0 || rid >= _roadCache.Count) continue;
+                var pts = _roadCache[rid].Points;
+                if (pts == null || pts.Count < 8) continue;
+                var clip = new List<Vector3>();
+                for (int i = 0; i < pts.Count; i++)
+                {
+                    float dx = pts[i].x - e.X, dz = pts[i].z - e.Z;
+                    if (dx * dx + dz * dz <= keep)
+                        clip.Add(pts[i]);
+                    else if (clip.Count >= 8)
+                        break;
+                    else if (clip.Count > 0)
+                        clip.Clear();
+                }
+                if (clip.Count < 8) continue;
+                float sx = clip[clip.Count - 1].x - clip[0].x;
+                float sz = clip[clip.Count - 1].z - clip[0].z;
+                float span = Mathf.Sqrt(sx * sx + sz * sz);
+                if (span > bestSpan)
+                {
+                    bestSpan = span;
+                    best = clip;
+                }
+            }
+            if (best != null && bestSpan >= 80f)
+                lane.AddRange(best);
+            return lane;
+        }
+
+
+        private void SeedRazorMonumentLoops()
+        {
+            if (_razorSeeded) return;
+            _razorSeeded = true;
+            _razorLocalXZ.Clear();
+            _razorLocalXZ["sphere_tank"] = new float[] { -44.6739f, -12.5042f, -39.9974f, 11.9221f, -36.5013f, 25.6112f, -24.593f, 34.7088f, -8.0997f, 45.7054f, 27.2346f, 55.8961f, 35.8948f, 54.4029f, 47.99f, 46.9288f, 50.9379f, 27.8135f, 41.9841f, 0.4928f, 30.0028f, -24.8955f, 13.5103f, -37.4542f, -29.664f, -40.0153f, -38.8212f, -34.256f, -43.9296f, -16.2887f };
+            _razorLocalXZ["airfield_1"] = new float[] { -134.809f, -96.6487f, -132.645f, -85.7724f, -79.2341f, -84.0717f, -69.1614f, -72.1806f, -56.2533f, -62.3448f, -55.5956f, -44.6467f, -136.157f, -43.6402f, -112.031f, -43.6269f, -79.5491f, -43.806f, -80.4429f, -25.9524f, -111.916f, 0.6875f, -112.414f, 16.7153f, -91.7073f, 49.4918f, -113.054f, 16.1625f, -111.895f, -6.3126f, -134.455f, -11.3642f, -105.024f, -9.0365f, -45.8041f, -9.4762f, -28.4471f, -0.9524f, -29.7935f, 13.9385f, -6.8983f, 13.8315f, 1.8461f, 5.9658f, 7.5173f, 6.0202f, 37.9468f, 15.395f, 46.6009f, 16.0801f, 70.7774f, -10.0084f, 109.315f, -10.1113f, 137.109f, -12.1277f, 144.241f, -32.8632f, 112.457f, -43.9773f, 105.445f, -74.4724f, 86.5849f, -81.8528f, 66.8394f, -97.8916f, 34.037f, -99.5851f, 29.9134f, -72.9995f, 17.278f, -69.9363f, -0.6341f, -56.7683f, -33.2386f, -55.4344f, -57.7682f, -56.2654f, -76.6747f, -15.8266f, -33.9512f, -14.8613f, -24.2061f, -51.7436f, 7.4062f, -51.3809f, 61.8753f, -43.8552f, 88.2946f, -42.7828f, 90.6615f, 8.793f, 92.7296f, 21.5847f, 92.3238f, -9.2029f, 13.2239f, -10.1776f, -25.279f, -10.4813f, -69.5417f, -10.7361f, -82.8822f, -48.3826f, -84.4519f, -82.8863f, -132.377f, -85.8742f };
+            _razorLocalXZ["harbor_1"] = new float[] { 100.546f, -21.7406f, 57.4827f, -21.7406f, 57.3444f, -55.9303f, 57.5958f, -21.7406f, 30.8955f, -21.7406f, 25.9937f, -24.617f, 24.4832f, -31.0493f, 18.7431f, -36.6939f, -12.9141f, -36.6408f, -45.3514f, -36.7605f, -54.7292f, -26.2215f, -51.8347f, -25.4547f, -51.8051f, 8.3647f, -51.3946f, -25.6509f, -63.313f, -36.6249f, -98.159f, -36.7487f, -103.263f, -40.4077f, -104.392f, -43.8071f, -105.683f, -52.1713f, -104.888f, -59.1651f, -99.5379f, -66.0376f, -60.4455f, -66.0376f, -38.6742f, -66.0376f, -33.3896f, -69.9757f, -29.3028f, -71.2384f, -16.8634f, -75.5062f, -11.872f, -76.1217f, 0.8109f, -75.1856f, 11.2345f, -71.6347f, 22.0154f, -64.141f, 29.3522f, -54.9685f, 34.424f, -44.3777f, 36.4792f, -33.4201f, 36.7437f, -21.7406f, 45.6758f, -21.7406f, 45.6758f, 11.5046f, 45.8461f, -21.7406f, 91.7711f, -21.7406f };
+            _razorLocalXZ["harbor_2"] = new float[] { 22.6917f, -84.9832f, -34.1382f, -85.5831f, -82.8178f, -85.2745f, -83.2573f, -53.538f, -81.728f, -28.7895f, -15.8536f, -25.4362f, 6.6483f, -23.3717f, 41.0658f, -22.7482f, 40.1911f, 14.5554f, -30.9287f, 16.4043f, -67.093f, 16.7506f, -64.9412f, 35.4569f, -64.2664f, 91.8329f, -26.8558f, 99.9408f, -24.6042f, 71.5147f, 45.1959f, 69.4271f, -24.4145f, 71.3003f, -27.0754f, 95.9049f, -65.0782f, 93.4022f, -64.135f, 50.4864f, -64.4117f, 19.0653f, -66.65f, -24.1463f, -80.1478f, -27.1263f, -83.3122f, -51.1976f, -82.7666f, -84.801f, -1.8208f, -85.7778f };
+            _razorLocalXZ["junkyard_1"] = new float[] { 31.6427f, 55.5016f, 30.1172f, 43.2185f, 25.5816f, 28.5134f, 35.2907f, 13.1193f, 31.2733f, 3.8099f, 5.1713f, -8.9497f, -12.4945f, -8.7882f, -21.686f, 1.293f, -35.5006f, 5.0632f, -48.9927f, 8.2906f, -70.8534f, 7.6986f, -74.0362f, -8.443f, -68.3481f, 9.7762f, -66.9337f, 27.5104f, -69.5865f, 38.8019f, -67.1333f, 27.3404f, -68.1916f, 11.5916f, -48.5619f, 8.6025f, -35.6937f, 5.3056f, -21.6746f, 2.9377f, 11.812f, 17.1711f, 24.8064f, 22.3881f, 37.5806f, 14.2117f, 43.4317f, 16.004f, 49.62f, 19.5105f, 58.417f, 9.5516f, 65.7243f, -2.8875f, 70.6566f, -26.5739f, 60.3374f, -39.1839f, 49.285f, -53.4582f, 34.6746f, -61.5134f, 50.0529f, -52.8052f, 65.3894f, -34.0593f, 72.406f, -26.2476f, 65.2051f, -3.0028f, 57.4449f, 9.4185f, 51.2203f, 17.7417f, 37.176f, 15.0586f, 26.8684f, 25.442f, 30.4267f, 43.9321f };
+            _razorLocalXZ["trainyard_1"] = new float[] { 63.5246f, -2.3617f, 56.4243f, -2.6101f, 49.0622f, -2.7309f, 36.0476f, -14.614f, 22.716f, -14.6589f, 12.716f, -14.6589f, 12.716f, -22.75f, 12.716f, 18.6589f, 12.716f, -14.6589f, 22.1708f, -18.2999f, 22.071f, -74.7744f, -6.6125f, -74.2602f, -26.755f, -80.7569f, -38.5178f, -70.4946f, -38.7187f, -50.2889f, -22.0289f, -44.6155f, -37.1253f, -59.1627f, -41.5046f, -77.9461f, -90.5709f, -82.469f, -92.1006f, -78.9673f, -95.5848f, -61.5951f, -95.7291f, 25.4842f, -80.5431f, 30.8824f, -70.3922f, 30.9128f, -67.6463f, 23.0383f, -42.1062f, 22.7769f, -44.3335f, -12.3053f, -44.875f, -12.7851f, -38.44f, -14.6032f, -26.3947f, -14.4189f, -22.0062f, -13.2894f, -7.9719f, -13.1325f, -7.8039f, -11.7887f, -7.6659f, 18.289f, -7.6399f, 19.7966f, -7.5714f, -11.4036f, -10.8643f, -12.5277f, -11.1973f, -21.7159f, -13.1763f, -24.5886f, -11.753f, -40.0844f, -7.9497f, -45.0342f, -8.406f, -74.5499f, 22.071f, -74.7744f, 76.471f, -74.7744f, 80.3421f, -62.4771f, 80.3421f, -32.4771f, 75.4822f, -30.4771f, 75.4822f, -16.5914f, 75.4822f, -10.5914f, 70.4822f, -6.5914f, 65.5246f, -2.3617f };
+            _razorLocalXZ["powerplant_1"] = new float[] { 18.3474f, 67.7239f, 18.3474f, 40.8174f, 67.4247f, 40.7106f, 4.392f, 40.7106f, 1.0467f, 0.0888f, 1.0467f, -40.6115f, -3.4869f, -46.2247f, 1.4433f, -58.2209f, 4.8886f, -61.3712f, 4.8186f, -66.1768f, 3.2686f, -69.4104f, 3.1889f, -93.8335f, 3.2686f, -69.4104f, 4.8186f, -66.1768f, 4.8886f, -61.3712f, 2.3069f, -58.0664f, 0.1142f, -51.9898f, -5.9127f, -44.5731f, -63.4544f, -44.5731f, -67.6941f, -48.2145f, -96.1015f, -48.3726f, -101.497f, -55.3947f, -101.909f, -87.3858f, -93.1647f, -91.7413f, -86.168f, -96.1535f, -70.8447f, -95.9745f, -67.8832f, -91.992f, -63.5f, -75.577f, -62.5f, -71.0111f, -62.5f, -32.4117f, -69.4082f, -24.5123f, -70.3849f, -21.5473f, -67.9369f, -16f, -65f, -13.4733f, -65f, -12.639f, -65f, 12.2136f, -65f, 63.877f, -61.6533f, 79.358f, -56.8955f, 86.6915f, -44.5865f, 92.6369f, -32.7438f, 99.9867f, -17.3018f, 105f, -13.5f, 105.5f, 30.5f, 105.5f, 50.9375f, 97.9088f, 66.1421f, 80.7127f, 70.75f, 63.8761f, 70.75f, 39.545f, 70.75f, -23.256f, 70.75f, 41.5318f, 18.3474f, 40.8174f };
+            _razorLocalXZ["water_treatment_plant_1"] = new float[] { 94.2949f, 31.3285f, 59.6445f, 30.3015f, 56.2498f, -10.1183f, 48.0216f, -5.36f, 29.8862f, -5.4011f, 16.17f, -14.5343f, 15.5126f, -98.5449f, 14.1354f, -103.693f, 14.2544f, -125.046f, 17.4894f, -127.687f, 17.5812f, -135.969f, 16.0782f, -139.031f, 16.1378f, -149.436f, 15.8953f, -140.267f, 16.9246f, -138.745f, 17.262f, -125.614f, 12.8036f, -124.452f, -15.1641f, -124.753f, -23.3595f, -133.724f, -23.7182f, -137.287f, -24.1202f, -148.115f, -27.1412f, -153.928f, -28.7329f, -155.973f, -28.645f, -150.316f, -50.8209f, -150.588f, -28.7848f, -151.173f, -24.818f, -148.788f, -24.1909f, -130.521f, -28.5883f, -126.455f, -29.1837f, -124.908f, -28.955f, -112.06f, -23.6384f, -108.233f, -21.1923f, -106.922f, -21.426f, -99.8725f, -28.3303f, -91.6504f, -27.0522f, -51.7102f, -30.7065f, -44.5484f, -27.3839f, -12.3673f, -28.0514f, -31.8467f, -28.7509f, -38.1953f, -23.9973f, -40.6225f, -13.9552f, -40.1601f, -8.6511f, -42.8547f, -5.0758f, -42.557f, 2.9489f, -52.3519f, 14.8706f, -52.5641f, 15.8345f, -80.82f, -15.9486f, -80.82f, -22.0366f, -84.7204f, -23.7125f, -85.6363f, -23.9451f, -99.0342f, -19.6812f, -105.516f, -16.0274f, -109.726f, -8.1952f, -111.424f, -7.1045f, -113.89f, -6.8422f, -124.787f, 15.8345f, -124.787f, 15.8345f, -51.2806f, 18.238f, -11.4787f, 28.9972f, -5.8038f, 36.8947f, -5.3177f, 45.9107f, -5.4784f, 55.6798f, -9.3465f, 60.1711f, 31.095f };
+            DebugLog($"Bradley Razor loops seeded={_razorLocalXZ.Count}");
+        }
+
+        private List<Vector3> GetRazorLaneWorld(MonumentScanEntry e)
+        {
+            var lane = new List<Vector3>();
+            if (e == null) return lane;
+            SeedRazorMonumentLoops();
+            string key = ((e.Prefab ?? "") + " " + (e.Name ?? "")).ToLowerInvariant();
+            float[] xz = null;
+            foreach (var kv in _razorLocalXZ)
+            {
+                if (key.IndexOf(kv.Key, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    xz = kv.Value;
+                    break;
+                }
+            }
+            if (xz == null || xz.Length < 16) return lane;
+            for (int i = 0; i + 1 < xz.Length; i += 2)
+            {
+                float wx, wz;
+                LocalToWorld(e, xz[i], xz[i + 1], out wx, out wz);
+                var p = new Vector3(wx, 0f, wz);
+                try { p.y = TerrainMeta.HeightMap != null ? TerrainMeta.HeightMap.GetHeight(p) : e.X * 0f; }
+                catch { }
+                lane.Add(p);
+            }
+            return lane;
+        }
+
+        private List<Vector3> GetMonumentDriveLane(MonumentScanEntry e)
+        {
+            var razor = GetRazorLaneWorld(e);
+            if (razor.Count >= 8) return razor;
+            var tpl = GetPrefabTemplateLane(e);
+            if (tpl.Count >= 8) return tpl;
+            return GetMonumentLane(e);
+        }
+
+        private static int ClosestLaneIndex(List<Vector3> lane, Vector3 p)
+        {
+            int best = 0;
+            float bestD = float.MaxValue;
+            for (int i = 0; i < lane.Count; i++)
+            {
+                float dx = lane[i].x - p.x, dz = lane[i].z - p.z;
+                float d = dx * dx + dz * dz;
+                if (d < bestD) { bestD = d; best = i; }
+            }
+            return best;
+        }
+
+        private static List<Vector3> WalkLaneArc(List<Vector3> lane, int a, int b)
+        {
+            var arc = new List<Vector3>();
+            if (lane == null || lane.Count == 0) return arc;
+            a = Mathf.Clamp(a, 0, lane.Count - 1);
+            b = Mathf.Clamp(b, 0, lane.Count - 1);
+            if (a == b)
+            {
+                arc.Add(lane[a]);
+                return arc;
+            }
+            float close = Vector3.Distance(
+                new Vector3(lane[0].x, 0f, lane[0].z),
+                new Vector3(lane[lane.Count - 1].x, 0f, lane[lane.Count - 1].z));
+            bool loop = close < 45f;
+            if (!loop)
+            {
+                if (a <= b)
+                {
+                    for (int i = a; i <= b; i++) arc.Add(lane[i]);
+                }
+                else
+                {
+                    for (int i = a; i >= b; i--) arc.Add(lane[i]);
+                }
+                return arc;
+            }
+            var fwd = new List<Vector3>();
+            int n = lane.Count;
+            int i2 = a;
+            for (int k = 0; k <= n; k++)
+            {
+                fwd.Add(lane[i2]);
+                if (i2 == b) break;
+                i2 = (i2 + 1) % n;
+            }
+            var rev = new List<Vector3>();
+            i2 = a;
+            for (int k = 0; k <= n; k++)
+            {
+                rev.Add(lane[i2]);
+                if (i2 == b) break;
+                i2 = (i2 - 1 + n) % n;
+            }
+            return fwd.Count <= rev.Count ? fwd : rev;
+        }
+
+        /// <summary>
+        /// Replace highway nodes inside a yard with the Razor/template loop
+        /// clipped from the inbound gate to the outbound gate.
+        /// </summary>
+        private static bool BradleyHazardLotName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string n = name.ToLowerInvariant();
+            return n.IndexOf("power_sub", StringComparison.Ordinal) >= 0
+                || n.IndexOf("powersub", StringComparison.Ordinal) >= 0
+                || n.IndexOf("water_well", StringComparison.Ordinal) >= 0
+                || n.IndexOf("waterwell", StringComparison.Ordinal) >= 0;
+        }
+
+        /// <summary>
+        /// Path.Road often pins a node on the substation pad (N14 power_sub_big_1).
+        /// Drop those pads; keep a jump to the next dry highway node.
+        /// </summary>
+        private int StripBradleyHazardPads(List<Vector3> route)
+        {
+            if (route == null || route.Count < 10 || !_monumentScanReady) return 0;
+            var pads = new List<MonumentScanEntry>();
+            for (int i = 0; i < _monumentScan.Count; i++)
+            {
+                var e = _monumentScan[i];
+                if (e != null && BradleyHazardLotName(e.Prefab + " " + e.Name))
+                    pads.Add(e);
+            }
+            if (pads.Count == 0) return 0;
+            int removed = 0;
+            for (int i = route.Count - 2; i >= 1; i--)
+            {
+                bool hit = false;
+                for (int p = 0; p < pads.Count; p++)
+                {
+                    float dx = route[i].x - pads[p].X, dz = route[i].z - pads[p].Z;
+                    float r = Mathf.Max(pads[p].Radius, 38f) + 8f;
+                    if (dx * dx + dz * dz <= r * r) { hit = true; break; }
+                }
+                if (!hit) continue;
+                route.RemoveAt(i);
+                removed++;
+            }
+            if (removed > 0)
+                DebugLog($"Bradley strip-pads removed={removed} pts={route.Count}");
+            return removed;
+        }
+
+        private void AdoptBradleyRoute(ref List<Vector3> route)
+        {
+            if (route == null || route.Count < 8) return;
+            StripBradleyHazardPads(route);
+            SpliceBradleyMonumentCorridors(route);
+        }
+
+        private static List<Vector3> WalkLaneThrough(List<Vector3> lane, int a, int b, float cx, float cz)
+        {
+            var fwd = new List<Vector3>();
+            var rev = new List<Vector3>();
+            if (lane == null || lane.Count == 0) return fwd;
+            a = Mathf.Clamp(a, 0, lane.Count - 1);
+            b = Mathf.Clamp(b, 0, lane.Count - 1);
+            float close = Vector3.Distance(
+                new Vector3(lane[0].x, 0f, lane[0].z),
+                new Vector3(lane[lane.Count - 1].x, 0f, lane[lane.Count - 1].z));
+            bool loop = close < 45f;
+            if (!loop)
+                return WalkLaneArc(lane, a, b);
+            int n = lane.Count;
+            int i2 = a;
+            for (int k = 0; k <= n; k++)
+            {
+                fwd.Add(lane[i2]);
+                if (i2 == b) break;
+                i2 = (i2 + 1) % n;
+            }
+            i2 = a;
+            for (int k = 0; k <= n; k++)
+            {
+                rev.Add(lane[i2]);
+                if (i2 == b) break;
+                i2 = (i2 - 1 + n) % n;
+            }
+            float Mean(List<Vector3> arc)
+            {
+                if (arc == null || arc.Count == 0) return 99999f;
+                float sum = 0f;
+                for (int i = 0; i < arc.Count; i++)
+                {
+                    float dx = arc[i].x - cx, dz = arc[i].z - cz;
+                    sum += Mathf.Sqrt(dx * dx + dz * dz);
+                }
+                return sum / arc.Count;
+            }
+            if (fwd.Count < 8 && rev.Count >= 8) return rev;
+            if (rev.Count < 8 && fwd.Count >= 8) return fwd;
+            return Mean(fwd) <= Mean(rev) ? fwd : rev;
+        }
+
+        private int SpliceBradleyMonumentCorridors(List<Vector3> chain)
+        {
+            if (chain == null || chain.Count < 10) return 0;
+            if (!_monumentScanReady || _monumentScan == null || _monumentScan.Count == 0) return 0;
+            SeedRazorMonumentLoops();
+            int spliced = 0;
+            for (int m = 0; m < _monumentScan.Count; m++)
+            {
+                var mon = _monumentScan[m];
+                if (mon == null || mon.BradleySkip) continue;
+                bool yard = mon.Kind == "through" || mon.Kind == "courtyard"
+                            || string.Equals(mon.Family, "yard", StringComparison.OrdinalIgnoreCase);
+                if (!yard) continue;
+                var lane = GetMonumentDriveLane(mon);
+                if (lane == null || lane.Count < 6) continue;
+                float r = Mathf.Max(mon.Radius + 28f, 90f);
+                float r2 = r * r;
+                int first = -1, last = -1;
+                for (int i = 0; i < chain.Count; i++)
+                {
+                    float dx = chain[i].x - mon.X, dz = chain[i].z - mon.Z;
+                    if (dx * dx + dz * dz > r2) continue;
+                    if (first < 0) first = i;
+                    last = i;
+                }
+                if (first < 0 || last <= first) continue;
+                int inIdx = Mathf.Max(0, first - 1);
+                int outIdx = Mathf.Min(chain.Count - 1, last + 1);
+                int e0 = ClosestLaneIndex(lane, chain[inIdx]);
+                int e1 = ClosestLaneIndex(lane, chain[outIdx]);
+                if (e0 == e1)
+                    e1 = (e0 + lane.Count / 2) % lane.Count;
+                var arc = WalkLaneThrough(lane, e0, e1, mon.X, mon.Z);
+                float span = 0f;
+                if (arc.Count >= 2)
+                {
+                    float dx = arc[arc.Count - 1].x - arc[0].x;
+                    float dz = arc[arc.Count - 1].z - arc[0].z;
+                    span = Mathf.Sqrt(dx * dx + dz * dz);
+                }
+                // 156 trainyard I8→H8 lane=9 was the rim, not the inner road.
+                string pref = (mon.Prefab ?? "") + " " + (mon.Name ?? "");
+                bool noTankLot = pref.IndexOf("junkyard", StringComparison.OrdinalIgnoreCase) >= 0
+                                 || pref.IndexOf("excavator", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (noTankLot || arc.Count < 12 || span < 70f)
+                {
+                    DebugLog($"Bradley splice-skip {mon.Prefab} lane={arc.Count} span={span:F0}m (keep highway)");
+                    continue;
+                }
+                // Drop first/last arc points that duplicate the highway stubs.
+                chain.RemoveRange(first, last - first + 1);
+                chain.InsertRange(first, arc);
+                spliced++;
+                DebugLog($"Bradley splice {mon.Prefab} {PositionToGrid(chain[inIdx])} -> {PositionToGrid(arc[arc.Count - 1])} lane={arc.Count} via={(GetRazorLaneWorld(mon).Count >= 8 ? "razor" : "tpl")}");
+            }
+            return spliced;
+        }
+
+        private List<Vector3> GetMonumentLane(MonumentScanEntry e)
+        {
+            var lane = new List<Vector3>();
+            if (e == null) return lane;
+            var tpl = GetPrefabTemplateLane(e);
+            var thru = ClipThroughRoadLane(e);
+            if (e.LaneX == null || e.LaneZ == null || e.LaneX.Count < 4)
+                BuildMonumentLane(e);
+            if (e.LaneX != null && e.LaneZ != null)
+            {
+                int n = Math.Min(e.LaneX.Count, e.LaneZ.Count);
+                for (int i = 0; i < n; i++)
+                {
+                    var p = new Vector3(e.LaneX[i], 0f, e.LaneZ[i]);
+                    p.y = TerrainMeta.HeightMap != null ? TerrainMeta.HeightMap.GetHeight(p) : 0f;
+                    lane.Add(p);
+                }
+            }
+            var best = lane;
+            float bestSpan = LaneSpanSq(lane);
+            float thruSpan = LaneSpanSq(thru);
+            float tplSpan = LaneSpanSq(tpl);
+            // Named Path.Road through the lot still wins when it is clearly longer.
+            if (thru.Count >= 8 && (thruSpan >= bestSpan + 20f * 20f || thru.Count > best.Count + 4))
+            {
+                best = thru;
+                bestSpan = thruSpan;
+            }
+            // Prefab-local through-corridor beats a short baker stub.
+            // Refuse near-closed rings (tiny first-last span) so a mid-chain
+            // highway is never swapped for a yard loop.
+            if (tpl.Count >= 8 && tplSpan >= 80f * 80f
+                && (tplSpan >= bestSpan + 15f * 15f || (tplSpan >= bestSpan && tpl.Count >= best.Count)))
+                return tpl;
+            return best;
+        }
+
+        private static float LaneSpanSq(List<Vector3> lane)
+        {
+            if (lane == null || lane.Count < 2) return 0f;
+            float dx = lane[lane.Count - 1].x - lane[0].x;
+            float dz = lane[lane.Count - 1].z - lane[0].z;
+            return dx * dx + dz * dz;
+        }
+
+        private List<Vector3> GetPrefabTemplateLane(MonumentScanEntry e)
+        {
+            var lane = new List<Vector3>();
+            if (e == null || _bradleyPaths?.Prefabs == null) return lane;
+            string key = string.IsNullOrEmpty(e.Prefab) ? e.Name : e.Prefab;
+            BradleyPathPrefab rec;
+            if (string.IsNullOrEmpty(key) || !_bradleyPaths.Prefabs.TryGetValue(key, out rec))
+                return lane;
+            if (rec == null || rec.LocalX == null || rec.LocalZ == null) return lane;
+            int n = Math.Min(rec.LocalX.Count, rec.LocalZ.Count);
+            if (n < 8 || !rec.Tour) return lane;
+            for (int i = 0; i < n; i++)
+            {
+                float wx, wz;
+                LocalToWorld(e, rec.LocalX[i], rec.LocalZ[i], out wx, out wz);
+                var p = new Vector3(wx, 0f, wz);
+                p.y = TerrainMeta.HeightMap != null ? TerrainMeta.HeightMap.GetHeight(p) : 0f;
+                lane.Add(p);
+            }
+            return lane;
+        }
+
+        private static bool NearMonumentLane(List<Vector3> lane, Vector3 pos, float maxDist)
+        {
+            if (lane == null || lane.Count == 0) return false;
+            float maxSq = maxDist * maxDist;
+            float d0x = lane[0].x - pos.x, d0z = lane[0].z - pos.z;
+            if (d0x * d0x + d0z * d0z <= maxSq) return true;
+            float dex = lane[lane.Count - 1].x - pos.x, dez = lane[lane.Count - 1].z - pos.z;
+            if (dex * dex + dez * dez <= maxSq) return true;
+            float best = float.MaxValue;
+            for (int i = 0; i < lane.Count; i++)
+            {
+                float dx = lane[i].x - pos.x, dz = lane[i].z - pos.z;
+                float sq = dx * dx + dz * dz;
+                if (sq < best) best = sq;
+            }
+            return best <= (22f * 22f);
+        }
+
+        private static bool LaneHasTwoGates(List<Vector3> lane)
+        {
+            if (lane == null || lane.Count < 8) return false;
+            float dx = lane[lane.Count - 1].x - lane[0].x;
+            float dz = lane[lane.Count - 1].z - lane[0].z;
+            return dx * dx + dz * dz >= 90f * 90f;
+        }
+
+        private static bool LaneHasTwoGatesWorld(MonumentScanEntry m)
+        {
+            if (m == null || m.LaneX == null || m.LaneZ == null) return false;
+            int n = Math.Min(m.LaneX.Count, m.LaneZ.Count);
+            if (n < 8) return false;
+            float dx = m.LaneX[n - 1] - m.LaneX[0];
+            float dz = m.LaneZ[n - 1] - m.LaneZ[0];
+            return dx * dx + dz * dz >= 80f * 80f;
+        }
+
+        private static void WorldToLocal(MonumentScanEntry e, float wx, float wz, out float lx, out float lz)
+        {
+            float dx = wx - e.X, dz = wz - e.Z;
+            float yaw = e.Yaw * Mathf.Deg2Rad;
+            float c = Mathf.Cos(yaw), s = Mathf.Sin(yaw);
+            lx = dx * c + dz * s;
+            lz = -dx * s + dz * c;
+        }
+
+        private static void LocalToWorld(MonumentScanEntry e, float lx, float lz, out float wx, out float wz)
+        {
+            float yaw = e.Yaw * Mathf.Deg2Rad;
+            float c = Mathf.Cos(yaw), s = Mathf.Sin(yaw);
+            wx = e.X + lx * c - lz * s;
+            wz = e.Z + lx * s + lz * c;
+        }
+
+        /// <summary>
+        /// Current TerrainSplat.Enum is Dirt/Snow/Sand/Rock/Grass/Forest/Stones/Gravel.
+        /// There is no Asphalt channel — painted roads are topology Road + gravel/stone splat.
+        /// </summary>
+        private bool CellPaved(Vector3 p)
+        {
+            try
+            {
+                if (TerrainMeta.SplatMap == null) return false;
+                float gravel = TerrainMeta.SplatMap.GetSplat(p, (int)TerrainSplat.Enum.Gravel);
+                float stones = TerrainMeta.SplatMap.GetSplat(p, (int)TerrainSplat.Enum.Stones);
+                return gravel >= 0.32f || stones >= 0.45f;
+            }
+            catch { return false; }
+        }
+
+        private int CellTopology(Vector3 p)
+        {
+            try
+            {
+                if (TerrainMeta.TopologyMap == null) return 0;
+                return TerrainMeta.TopologyMap.GetTopology(p);
+            }
+            catch { return 0; }
+        }
+
+        private bool CellWet(Vector3 p)
+        {
+            try
+            {
+                float ground = TerrainMeta.HeightMap != null ? TerrainMeta.HeightMap.GetHeight(p) : p.y;
+                float water = ground;
+                if (TerrainMeta.WaterMap != null) water = TerrainMeta.WaterMap.GetHeight(p);
+                if (water - ground > 0.35f) return true;
+                float depth = WaterLevel.GetOverallWaterDepth(p, true, true, null);
+                return depth > 0.35f;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Boot-time skeleton baker. Samples asphalt + Road topology on a 3-4m grid,
+        /// thins pads, scores two-gate corridors, writes world LaneX/Z and local
+        /// oxide/data/LiveStatsBradleyPaths.json. Path.Road clip remains the fallback.
+        /// </summary>
+        private bool BakeMonumentSkeleton(MonumentScanEntry entry)
+        {
+            if (entry == null) return false;
+            if (entry.Kind == "skip" || entry.Family == "skip") return false;
+            if (entry.BradleySkip && entry.Family != "coastal") return false;
+            if (HarborPierOnlyName(entry.Name) || HarborPierOnlyName(entry.Prefab)) return false;
+
+            string key = string.IsNullOrEmpty(entry.Prefab) ? entry.Name : entry.Prefab;
+            if (string.IsNullOrEmpty(key)) return false;
+
+            try
+            {
+                float rad = Mathf.Clamp(entry.Radius, 40f, 230f);
+                float step = rad >= 150f ? 4f : 3f;
+                int half = Mathf.CeilToInt(rad / step);
+                int dim = half * 2 + 1;
+                int maxCells = dim * dim;
+                if (maxCells > 16000)
+                {
+                    step = 5f;
+                    half = Mathf.CeilToInt(rad / step);
+                    dim = half * 2 + 1;
+                    maxCells = dim * dim;
+                }
+
+                var walk = new bool[maxCells];
+                var pad = new bool[maxCells];
+                var wx = new float[maxCells];
+                var wz = new float[maxCells];
+                Vector3 origin = new Vector3(entry.X, 0f, entry.Z);
+                float radSq = rad * rad;
+                int roadMask = (int)TerrainTopology.Enum.Road | (int)TerrainTopology.Enum.Roadside;
+                int railMask = (int)TerrainTopology.Enum.Rail;
+                int oceanMask = (int)TerrainTopology.Enum.Ocean | (int)TerrainTopology.Enum.Offshore;
+                bool coastal = entry.Family == "coastal" || HarborLotName(entry.Name);
+                bool airfield = (entry.Name ?? "").IndexOf("airfield", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool plant = (entry.Name ?? "").IndexOf("powerplant", StringComparison.OrdinalIgnoreCase) >= 0
+                    || (entry.Name ?? "").IndexOf("power_plant", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool junk = (entry.Name ?? "").IndexOf("junkyard", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool train = (entry.Name ?? "").IndexOf("trainyard", StringComparison.OrdinalIgnoreCase) >= 0
+                    || (entry.Name ?? "").IndexOf("train_yard", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool launch = (entry.Name ?? "").IndexOf("launch", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                int accepted = 0;
+                for (int iz = 0; iz < dim; iz++)
+                {
+                    for (int ix = 0; ix < dim; ix++)
+                    {
+                        int id = ix + iz * dim;
+                        float x = entry.X + (ix - half) * step;
+                        float z = entry.Z + (iz - half) * step;
+                        wx[id] = x;
+                        wz[id] = z;
+                        float dx = x - origin.x, dz = z - origin.z;
+                        if (dx * dx + dz * dz > radSq) continue;
+                        var p = new Vector3(x, 0f, z);
+                        try { if (TerrainMeta.HeightMap != null) p.y = TerrainMeta.HeightMap.GetHeight(p); } catch { }
+
+                        int topo = CellTopology(p);
+                        bool rail = (topo & railMask) != 0;
+                        bool roadTopo = (topo & roadMask) != 0;
+                        bool asphalt = CellPaved(p);
+                        bool nearPath = false;
+                        for (int r = 0; r < _roadCache.Count && !nearPath; r++)
+                        {
+                            var pts = _roadCache[r].Points;
+                            if (pts == null || _roadCache[r].Width < 4.0f) continue;
+                            for (int pi = 0; pi < pts.Count; pi += 2)
+                            {
+                                float rx = pts[pi].x - x, rz = pts[pi].z - z;
+                                if (rx * rx + rz * rz <= 100f) { nearPath = true; break; }
+                            }
+                        }
+                        bool shoreRoad = coastal && (roadTopo || nearPath);
+                        if ((topo & oceanMask) != 0 && !shoreRoad) continue;
+                        if (CellWet(p) && !shoreRoad) continue;
+                        if (rail && !roadTopo && !asphalt && !nearPath) continue;
+                        if (!asphalt && !roadTopo && !nearPath) continue;
+                        if (coastal && !nearPath && !roadTopo && asphalt)
+                        {
+                            // Harbor pads / crane lots are gravel but not the land-side highway.
+                            continue;
+                        }
+                        walk[id] = true;
+                        accepted++;
+                    }
+                }
+                if (accepted < 12)
+                {
+                    Puts($"[Events] baker skip {entry.Grid} {key} cells={accepted} reason=thin-mask");
+                    return false;
+                }
+
+                // Thickness: 5x5 accepted count. Pads (runway / lot) score worse than 8-16m corridors.
+                for (int iz = 1; iz < dim - 1; iz++)
+                {
+                    for (int ix = 1; ix < dim - 1; ix++)
+                    {
+                        int id = ix + iz * dim;
+                        if (!walk[id]) continue;
+                        int n = 0;
+                        for (int oz = -2; oz <= 2; oz++)
+                        {
+                            int zz = iz + oz;
+                            if (zz < 0 || zz >= dim) continue;
+                            for (int ox = -2; ox <= 2; ox++)
+                            {
+                                int xx = ix + ox;
+                                if (xx < 0 || xx >= dim) continue;
+                                if (walk[xx + zz * dim]) n++;
+                            }
+                        }
+                        pad[id] = n >= 16;
+                    }
+                }
+
+                var gates = new List<int>();
+                if (entry.GateX != null && entry.GateZ != null)
+                {
+                    int gn = Math.Min(entry.GateX.Count, entry.GateZ.Count);
+                    for (int g = 0; g < gn; g++)
+                    {
+                        int best = -1;
+                        float bestD = 32f * 32f;
+                        for (int i = 0; i < maxCells; i++)
+                        {
+                            if (!walk[i]) continue;
+                            float dx = wx[i] - entry.GateX[g], dz = wz[i] - entry.GateZ[g];
+                            float d2 = dx * dx + dz * dz;
+                            if (d2 < bestD) { bestD = d2; best = i; }
+                        }
+                        if (best >= 0 && !gates.Contains(best)) gates.Add(best);
+                    }
+                }
+                // Ring anchors: walkable cells near the radius that sit on Path.Road.
+                float ringInner = rad * 0.72f;
+                float ringInnerSq = ringInner * ringInner;
+                for (int i = 0; i < maxCells && gates.Count < 8; i++)
+                {
+                    if (!walk[i] || pad[i]) continue;
+                    float dx = wx[i] - origin.x, dz = wz[i] - origin.z;
+                    float d2 = dx * dx + dz * dz;
+                    if (d2 < ringInnerSq) continue;
+                    bool nearPath = false;
+                    for (int r = 0; r < _roadCache.Count && !nearPath; r++)
+                    {
+                        var pts = _roadCache[r].Points;
+                        if (pts == null) continue;
+                        for (int pi = 0; pi < pts.Count; pi += 3)
+                        {
+                            float rx = pts[pi].x - wx[i], rz = pts[pi].z - wz[i];
+                            if (rx * rx + rz * rz <= 100f) { nearPath = true; break; }
+                        }
+                    }
+                    if (!nearPath) continue;
+                    bool far = true;
+                    for (int g = 0; g < gates.Count; g++)
+                    {
+                        float gx = wx[i] - wx[gates[g]], gz = wz[i] - wz[gates[g]];
+                        if (gx * gx + gz * gz < 40f * 40f) { far = false; break; }
+                    }
+                    if (far) gates.Add(i);
+                }
+                if (gates.Count < 2) return false;
+
+                int[] prev = new int[maxCells];
+                float[] dist = new float[maxCells];
+                int[] open = new int[maxCells];
+                int[] neigh = { 1, -1, dim, -dim, dim + 1, dim - 1, -dim + 1, -dim - 1 };
+
+                List<int> bestPath = null;
+                float bestScore = -1f;
+                string via = "skeleton";
+
+                for (int ga = 0; ga < gates.Count; ga++)
+                {
+                    for (int gb = ga + 1; gb < gates.Count; gb++)
+                    {
+                        int start = gates[ga], goal = gates[gb];
+                        for (int i = 0; i < maxCells; i++) { dist[i] = 1e9f; prev[i] = -1; }
+                        dist[start] = 0f;
+                        int on = 0;
+                        open[on++] = start;
+                        while (on > 0)
+                        {
+                            int pick = 0;
+                            float pickD = dist[open[0]];
+                            for (int k = 1; k < on; k++)
+                            {
+                                if (dist[open[k]] < pickD) { pickD = dist[open[k]]; pick = k; }
+                            }
+                            int u = open[pick];
+                            open[pick] = open[--on];
+                            if (u == goal) break;
+                            int ux = u % dim, uz = u / dim;
+                            for (int k = 0; k < neigh.Length; k++)
+                            {
+                                int v = u + neigh[k];
+                                if (v < 0 || v >= maxCells || !walk[v]) continue;
+                                int vx = v % dim, vz = v / dim;
+                                if (Math.Abs(vx - ux) > 1 || Math.Abs(vz - uz) > 1) continue;
+                                float stepCost = (vx != ux && vz != uz) ? 1.41f : 1f;
+                                if (pad[v]) stepCost += airfield ? 6f : 2.4f;
+                                if (coastal && pad[v]) stepCost += 4f;
+                                float odx = wx[v] - origin.x, odz = wz[v] - origin.z;
+                                float od = Mathf.Sqrt(odx * odx + odz * odz);
+                                if (plant && od < rad * 0.42f) stepCost += 1.6f;
+                                if (junk && od < rad * 0.35f) stepCost += 1.4f;
+                                if (launch && od < rad * 0.30f) stepCost += 1.2f;
+                                if (train && pad[v]) stepCost += 2f;
+                                float nd = dist[u] + stepCost;
+                                if (nd + 0.01f >= dist[v]) continue;
+                                dist[v] = nd;
+                                prev[v] = u;
+                                bool listed = false;
+                                for (int t = 0; t < on; t++) if (open[t] == v) { listed = true; break; }
+                                if (!listed && on < open.Length) open[on++] = v;
+                            }
+                        }
+                        if (prev[goal] < 0 && start != goal) continue;
+                        var chain = new List<int>();
+                        for (int c = goal; c >= 0; c = prev[c])
+                        {
+                            chain.Add(c);
+                            if (c == start) break;
+                            if (chain.Count > 800) { chain.Clear(); break; }
+                        }
+                        if (chain.Count < 6) continue;
+                        chain.Reverse();
+                        float len = 0f;
+                        for (int i = 1; i < chain.Count; i++)
+                            len += Vector2.Distance(new Vector2(wx[chain[i]], wz[chain[i]]), new Vector2(wx[chain[i - 1]], wz[chain[i - 1]]));
+                        float need = coastal ? 60f : 80f;
+                        if (len < need) continue;
+                        float score = len;
+                        if (!pad[start] && !pad[goal]) score += 40f;
+                        if (plant || junk || launch) score += 20f;
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            bestPath = chain;
+                            via = "skeleton+" + entry.Family;
+                        }
+                    }
+                }
+
+                if (bestPath == null || bestPath.Count < 6)
+                {
+                    Puts($"[Events] baker skip {entry.Grid} {key} cells={accepted} gates={gates.Count} reason=no-two-gate");
+                    return false;
+                }
+
+                var world = new List<Vector3>();
+                float acc = 0f;
+                world.Add(new Vector3(wx[bestPath[0]], 0f, wz[bestPath[0]]));
+                for (int i = 1; i < bestPath.Count; i++)
+                {
+                    var a = new Vector3(wx[bestPath[i - 1]], 0f, wz[bestPath[i - 1]]);
+                    var b = new Vector3(wx[bestPath[i]], 0f, wz[bestPath[i]]);
+                    acc += Vector3.Distance(a, b);
+                    if (acc >= 14f || i == bestPath.Count - 1)
+                    {
+                        world.Add(b);
+                        acc = 0f;
+                    }
+                }
+                if (world.Count < 4) return false;
+                for (int i = 0; i < world.Count; i++)
+                {
+                    var p = world[i];
+                    p.y = TerrainMeta.HeightMap != null ? TerrainMeta.HeightMap.GetHeight(p) : 0f;
+                    world[i] = p;
+                }
+
+                entry.LaneX = entry.LaneX ?? new List<float>();
+                entry.LaneZ = entry.LaneZ ?? new List<float>();
+                entry.LaneX.Clear();
+                entry.LaneZ.Clear();
+                float pathLen = 0f;
+                for (int i = 0; i < world.Count; i++)
+                {
+                    entry.LaneX.Add(world[i].x);
+                    entry.LaneZ.Add(world[i].z);
+                    if (i > 0) pathLen += Vector3.Distance(world[i], world[i - 1]);
+                }
+
+                if (!entry.BradleySkip && (pathLen >= 80f || LaneHasTwoGatesWorld(entry)))
+                {
+                    if (entry.Kind == "courtyard" || entry.Kind == "roadside" || string.IsNullOrEmpty(entry.Kind))
+                        entry.Kind = "through";
+                }
+
+                RememberBradleyPath(entry, key, world, bestPath.Count, pathLen, via);
+                Puts($"[Events] baker {entry.Grid} {key} cells={accepted} path={world.Count} len={pathLen:F0}m via={via} kind={entry.Kind}");
+                return true;
+            }
+            catch (Exception bakeEx)
+            {
+                Puts("[Events] baker " + key + ": " + bakeEx.Message);
+                return false;
+            }
+        }
+
+        private void RememberBradleyPath(MonumentScanEntry entry, string key, List<Vector3> world, int cells, float len, string via)
+        {
+            if (entry == null || world == null || world.Count < 2) return;
+            if (_bradleyPaths == null)
+            {
+                _bradleyPaths = new BradleyPathFileData
+                {
+                    Map = GetMapIdentity(),
+                    Version = BradleyPathVersion,
+                    Prefabs = new Dictionary<string, BradleyPathPrefab>(StringComparer.OrdinalIgnoreCase)
+                };
+            }
+            var rec = new BradleyPathPrefab
+            {
+                Prefab = key,
+                Family = entry.Family,
+                Kind = entry.Kind,
+                Tour = BradleyCanTourMonument(entry),
+                Spacing = 14f,
+                Cells = cells,
+                Length = len,
+                Via = via
+            };
+            for (int i = 0; i < world.Count; i++)
+            {
+                float lx, lz;
+                WorldToLocal(entry, world[i].x, world[i].z, out lx, out lz);
+                rec.LocalX.Add(lx);
+                rec.LocalZ.Add(lz);
+            }
+            _bradleyPaths.Prefabs[key] = rec;
+        }
+
+        private void SaveBradleyPaths()
+        {
+            try
+            {
+                if (_bradleyPaths == null) _bradleyPaths = new BradleyPathFileData();
+                _bradleyPaths.Map = GetMapIdentity();
+                _bradleyPaths.Version = BradleyPathVersion;
+                Interface.Oxide.DataFileSystem.WriteObject(BradleyPathFile, _bradleyPaths);
+            }
+            catch (Exception saveEx)
+            {
+                Puts("[Events] bradley-paths save: " + saveEx.Message);
+            }
+        }
+
+        private void EnsureBradleyPathCatalog()
+        {
+            if (_bradleyPaths == null)
+            {
+                try
+                {
+                    _bradleyPaths = Interface.Oxide.DataFileSystem.ReadObject<BradleyPathFileData>(BradleyPathFile);
+                }
+                catch { _bradleyPaths = null; }
+            }
+            if (_bradleyPaths == null)
+                _bradleyPaths = new BradleyPathFileData();
+            if (_bradleyPaths.Prefabs == null)
+                _bradleyPaths.Prefabs = new Dictionary<string, BradleyPathPrefab>(StringComparer.OrdinalIgnoreCase);
+            _bradleyPaths.Map = GetMapIdentity();
+            _bradleyPaths.Version = BradleyPathVersion;
+            SeedBuiltInBradleyTemplates();
+            SaveBradleyPaths();
+        }
+
+        private void SeedTpl(string prefab, string family, string kind, bool tour, float[] xz)
+        {
+            if (string.IsNullOrEmpty(prefab) || xz == null || xz.Length < 16) return;
+            float newLen = 0f;
+            for (int i = 2; i + 1 < xz.Length; i += 2)
+            {
+                float dx = xz[i] - xz[i - 2], dz = xz[i + 1] - xz[i - 1];
+                newLen += Mathf.Sqrt(dx * dx + dz * dz);
+            }
+            BradleyPathPrefab existing;
+            if (_bradleyPaths.Prefabs.TryGetValue(prefab, out existing)
+                && existing != null && existing.LocalX != null && existing.LocalX.Count >= 8
+                && existing.Length + 15f >= newLen
+                && existing.LocalX.Count >= xz.Length / 2
+                && existing.Via != null && existing.Via.IndexOf("template-v2", StringComparison.OrdinalIgnoreCase) < 0
+                && existing.Via.IndexOf("skeleton", StringComparison.OrdinalIgnoreCase) < 0)
+                return;
+            var rec = new BradleyPathPrefab
+            {
+                Prefab = prefab,
+                Family = family,
+                Kind = kind,
+                Tour = tour,
+                Spacing = 14f,
+                Via = "template-v3",
+                Cells = xz.Length / 2
+            };
+            float len = 0f;
+            float px = 0f, pz = 0f;
+            for (int i = 0; i + 1 < xz.Length; i += 2)
+            {
+                rec.LocalX.Add(xz[i]);
+                rec.LocalZ.Add(xz[i + 1]);
+                if (i >= 2)
+                {
+                    float dx = xz[i] - px, dz = xz[i + 1] - pz;
+                    len += Mathf.Sqrt(dx * dx + dz * dz);
+                }
+                px = xz[i];
+                pz = xz[i + 1];
+            }
+            rec.Length = len;
+            _bradleyPaths.Prefabs[prefab] = rec;
+        }
+
+        /// <summary>
+        /// Prefab-local OPEN through-corridors (gate → opposite gate).
+        /// Built from baker interior asphalt where it stays inside the prefab
+        /// footprint, otherwise from overhead layout (C-perimeter / taxi / land-side
+        /// / rim). Rotated by instance Yaw at runtime. Not closed rings, pads,
+        /// docks, or runways. Procedural highway clips stay on ClipThroughRoadLane.
+        /// </summary>
+        private void SeedBuiltInBradleyTemplates()
+        {
+            // Power Plant — baker C-perimeter (south/west service road).
+            SeedTpl("powerplant_1", "yard", "through", true, new float[] {
+                114f,-61f, 98f,-56f, 82f,-52f, 66f,-47f, 52f,-47f, 36f,-42f, 26f,-54f, 18f,-65f,
+                5f,-72f, -4f,-70f, -13f,-58f, -24f,-50f, -35f,-43f, -46f,-35f, -57f,-27f, -71f,-21f,
+                -79f,-11f, -90f,-4f, -97f,10f, -97f,23f, -104f,36f, -115f,44f, -116f,57f, -114f,61f
+            });
+            // Dome / sphere — baker north rim (does not climb the sphere).
+            SeedTpl("sphere_tank", "yard", "through", true, new float[] {
+                129f,9f, 125f,24f, 121f,39f, 115f,53f, 105f,62f, 105f,74f, 95f,86f, 85f,97f,
+                73f,103f, 58f,105f, 43f,107f, 28f,106f, 13f,106f, 1f,111f, -15f,116f, -30f,119f,
+                -45f,118f, -59f,114f, -71f,105f, -83f,95f, -91f,86f, -100f,73f, -108f,61f, -119f,48f,
+                -125f,36f, -125f,33f
+            });
+            // Radtown — baker east-west service road along the south of the buildings.
+            SeedTpl("radtown_1", "yard", "through", true, new float[] {
+                45f,122f, 45f,107f, 53f,95f, 62f,82f, 74f,70f, 86f,58f, 94f,46f, 91f,34f,
+                82f,22f, 69f,13f, 60f,4f, 48f,2f, 33f,5f, 18f,3f, 6f,9f, -6f,3f,
+                -21f,10f, -33f,4f, -48f,10f, -63f,5f, -69f,17f, -84f,14f, -96f,8f, -108f,3f,
+                -120f,9f, -129f,15f
+            });
+            // Arctic research — baker south fence approach, SW gate to NE gate.
+            SeedTpl("arctic_research_base_a", "yard", "through", true, new float[] {
+                -22f,-128f, -5f,-129f, 10f,-129f, 23f,-126f, 36f,-122f, 49f,-119f, 63f,-112f, 76f,-105f,
+                87f,-95f, 97f,-83f, 107f,-71f, 114f,-57f, 120f,-45f, 125f,-32f
+            });
+            // Launch Site — OUTER south/west service C. Not the inner Bradley ring.
+            SeedTpl("launch_site_1", "yard", "through", true, new float[] {
+                -175f,45f, -180f,5f, -175f,-40f, -160f,-90f, -130f,-130f, -85f,-155f, -30f,-170f,
+                25f,-172f, 80f,-160f, 125f,-135f, 155f,-95f, 175f,-50f, 180f,-5f, 165f,40f, 140f,75f
+            });
+            // Airfield — south taxiway only (hangar row). Not the runway, not a closed apron.
+            SeedTpl("airfield_1", "yard", "through", true, new float[] {
+                -220f,-38f, -180f,-44f, -140f,-48f, -100f,-51f, -60f,-53f, -20f,-54f, 20f,-54f,
+                60f,-52f, 100f,-49f, 140f,-44f, 180f,-36f, 215f,-24f
+            });
+            // Water Treatment — west spine + north cross (open C around the tanks).
+            SeedTpl("water_treatment_plant_1", "yard", "through", true, new float[] {
+                -72f,-118f, -78f,-85f, -82f,-50f, -80f,-15f, -74f,20f, -62f,55f, -42f,85f,
+                -12f,105f, 22f,112f, 55f,100f, 78f,72f, 88f,38f
+            });
+            // Trainyard — inner south/west rim of the yard (prefab roads, not the procedural rail).
+            SeedTpl("trainyard_1", "yard", "through", true, new float[] {
+                -110f,-20f, -95f,-55f, -70f,-82f, -35f,-95f, 5f,-98f, 45f,-88f, 75f,-60f,
+                92f,-25f, 88f,15f, 62f,50f, 25f,72f
+            });
+            // Junkyard — inner dirt rim around the pit (not the outside highway).
+            SeedTpl("junkyard_1", "yard", "through", true, new float[] {
+                -85f,-15f, -78f,-50f, -50f,-82f, -10f,-95f, 35f,-88f, 70f,-55f, 85f,-15f,
+                78f,25f, 48f,58f, 10f,72f
+            });
+            // Giant Excavator — pit-rim service road, open C, stays off the bucket.
+            SeedTpl("excavator_1", "yard", "through", true, new float[] {
+                -130f,-10f, -120f,-55f, -90f,-100f, -40f,-125f, 20f,-130f, 75f,-110f, 115f,-70f,
+                130f,-20f, 120f,30f, 85f,75f, 30f,105f
+            });
+            // Large harbor — LAND-SIDE warehouse road only. No docks, no bridge.
+            SeedTpl("harbor_1", "coastal", "through", true, new float[] {
+                95f,70f, 90f,35f, 78f,5f, 55f,-22f, 22f,-42f, -15f,-50f, -50f,-42f,
+                -80f,-20f, -98f,10f, -100f,45f, -85f,75f
+            });
+            // Small harbor — land-side C.
+            SeedTpl("harbor_2", "coastal", "through", true, new float[] {
+                75f,40f, 70f,10f, 50f,-22f, 20f,-45f, -15f,-52f, -50f,-40f, -78f,-12f,
+                -92f,20f, -85f,50f
+            });
+            // Abandoned military base — south gate through the compound to the north cut.
+            SeedTpl("desert_military_base_a", "yard", "through", true, new float[] {
+                -48f,-95f, -30f,-88f, -12f,-60f, 0f,-28f, 10f,5f, 22f,38f, 38f,70f, 50f,98f
+            });
+            SeedTpl("desert_military_base_b", "yard", "through", true, new float[] {
+                -48f,-95f, -30f,-88f, -12f,-60f, 0f,-28f, 10f,5f, 22f,38f, 38f,70f, 50f,98f
+            });
+            SeedTpl("desert_military_base_c", "yard", "through", true, new float[] {
+                -48f,-95f, -30f,-88f, -12f,-60f, 0f,-28f, 10f,5f, 22f,38f, 38f,70f, 50f,98f
+            });
+            SeedTpl("desert_military_base_d", "yard", "through", true, new float[] {
+                -48f,-95f, -30f,-88f, -12f,-60f, 0f,-28f, 10f,5f, 22f,38f, 38f,70f, 50f,98f
+            });
+            // Satellite dish — driveway that nicks the south edge of the dishes.
+            SeedTpl("satellite_dish", "yard", "through", true, new float[] {
+                -70f,-25f, -50f,-38f, -25f,-42f, 0f,-38f, 25f,-28f, 48f,-10f, 62f,15f, 68f,42f
+            });
+            // Nuclear missile silo — fenced compound through-road (not the silo pit).
+            SeedTpl("nuclear_missile_silo", "yard", "through", true, new float[] {
+                -95f,-35f, -80f,-75f, -40f,-100f, 10f,-105f, 55f,-85f, 85f,-45f, 95f,0f,
+                80f,45f, 40f,80f
+            });
+            // Military tunnels — SURFACE compound only (entrance road). No underground.
+            SeedTpl("military_tunnel_1", "yard", "through", true, new float[] {
+                -85f,-15f, -70f,-48f, -35f,-68f, 5f,-72f, 40f,-55f, 62f,-20f, 65f,20f, 45f,52f
+            });
+            SeedTpl("military_tunnels_1", "yard", "through", true, new float[] {
+                -85f,-15f, -70f,-48f, -35f,-68f, 5f,-72f, 40f,-55f, 62f,-20f, 65f,20f, 45f,52f
+            });
+            // Sewer branch — surface road past the pipe buildings.
+            SeedTpl("sewer_branch", "yard", "through", true, new float[] {
+                -70f,-40f, -50f,-65f, -15f,-78f, 20f,-70f, 50f,-45f, 62f,-10f, 55f,25f, 25f,50f
+            });
+            Puts("[Events] bradley templates seeded prefabs=" + _bradleyPaths.Prefabs.Count);
+        }
+
+        private void ApplyPrefabTemplatesToScan()
+        {
+            if (!_monumentScanReady || _bradleyPaths?.Prefabs == null) return;
+            int applied = 0;
+            const float minTplSpan = 80f * 80f;
+            const float keepBakerSpan = 120f * 120f;
+            for (int i = 0; i < _monumentScan.Count; i++)
+            {
+                var e = _monumentScan[i];
+                if (e == null || e.BradleySkip) continue;
+                var tpl = GetPrefabTemplateLane(e);
+                if (tpl.Count < 8) continue;
+                float tplSpan = LaneSpanSq(tpl);
+                // Closed rings have a tiny first-last span — never stamp those over a highway.
+                if (tplSpan < minTplSpan) continue;
+                float have = 0f;
+                if (e.LaneX != null && e.LaneX.Count >= 2)
+                {
+                    float dx = e.LaneX[e.LaneX.Count - 1] - e.LaneX[0];
+                    float dz = e.LaneZ[e.LaneZ.Count - 1] - e.LaneZ[0];
+                    have = dx * dx + dz * dz;
+                }
+                // Baker already found a two-gate interior/through road — keep it.
+                if (e.LaneX != null && e.LaneX.Count >= 8 && have >= keepBakerSpan)
+                    continue;
+                if (e.LaneX != null && e.LaneX.Count >= tpl.Count && have >= tplSpan)
+                    continue;
+                e.LaneX = new List<float>();
+                e.LaneZ = new List<float>();
+                for (int p = 0; p < tpl.Count; p++)
+                {
+                    e.LaneX.Add(tpl[p].x);
+                    e.LaneZ.Add(tpl[p].z);
+                }
+                if (e.Kind != "through") e.Kind = "through";
+                applied++;
+            }
+            if (applied > 0)
+            {
+                Puts("[Events] applied " + applied + " prefab path templates onto monument lanes");
+                SaveMonumentScan();
+            }
+        }
+
+        private void ForceRebuildMonumentBaker()
+        {
+            _monumentScanReady = false;
+            _monumentScan.Clear();
+            _throughMonRoads.Clear();
+            _bradleyPaths = new BradleyPathFileData
+            {
+                Map = GetMapIdentity(),
+                Version = BradleyPathVersion,
+                Prefabs = new Dictionary<string, BradleyPathPrefab>(StringComparer.OrdinalIgnoreCase)
+            };
+            try
+            {
+                Interface.Oxide.DataFileSystem.WriteObject(MonumentScanFile, new MonumentScanFileData { Map = "force", Version = "force" });
+            }
+            catch { }
+            EnsureRoadCache();
+            if (!_monumentScanReady)
+                BuildMonumentScan();
+            SaveBradleyPaths();
+        }
+
+
+        private MonumentScanEntry FindMonumentScanAt(Vector3 p)
+        {
+            MonumentScanEntry best = null;
+            float bestD = float.MaxValue;
+            for (int i = 0; i < _monumentScan.Count; i++)
+            {
+                var m = _monumentScan[i];
+                if (m == null) continue;
+                float dx = p.x - m.X, dz = p.z - m.Z;
+                float d2 = dx * dx + dz * dz;
+                if (d2 > m.Radius * m.Radius) continue;
+                bool mRoad = string.Equals(m.Kind, "roadside", StringComparison.OrdinalIgnoreCase);
+                bool bRoad = best != null && string.Equals(best.Kind, "roadside", StringComparison.OrdinalIgnoreCase);
+                // Gas / supermarket on a ferry or plant approach must win over
+                // the larger courtyard circle that overlaps the same asphalt.
+                if (best == null
+                    || (mRoad && !bRoad)
+                    || (mRoad == bRoad && m.Radius < best.Radius)
+                    || (mRoad == bRoad && Mathf.Abs(m.Radius - best.Radius) < 1f && d2 < bestD))
+                {
+                    bestD = d2;
+                    best = m;
+                }
+            }
+            return best;
+        }
+
+        /// <summary>
+        /// Through-yards, baker two-gate lanes, land-side harbor corridors.
+        /// Ferry / fishing stay BradleySkip.
+        /// </summary>
+        private static bool BradleyCanTourMonument(MonumentScanEntry m)
+        {
+            if (m == null || m.BradleySkip) return false;
+            // Interior baker / template C-roads are traps (S6 powerplant,
+            // launch ring). Only a named Path.Road through the lot is a tour,
+            // and even then a live highway is never swapped for it.
+            if (m.ThroughRoads == null || m.ThroughRoads.Count == 0) return false;
+            if (m.LaneX == null || m.LaneX.Count < 8) return false;
+            return string.Equals(m.Kind, "through", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Highway chain that clips a courtyard / skip lot (powerplant spur, gas).
+        /// Advance dest to the first node past that ring. Hull stays put.
+        /// </summary>
+        private int SkipBradleyCourtyardAhead(List<Vector3> route, Vector3 pos, int from)
+        {
+            // Highway patrol stays on the painted road through a plant / airfield.
+            // Skipping dest over S6 is how the tank left the asphalt.
+            return from;
+            if (route == null || from < 0 || from >= route.Count - 3) return from;
+            MonumentScanEntry mon = null;
+            int lookTo = Mathf.Min(from + 14, route.Count - 1);
+            for (int i = from; i <= lookTo; i++)
+            {
+                var hit = FindMonumentScanAt(route[i]);
+                if (hit == null) continue;
+                // Highway past stables / supermarket / gas / warehouse — keep driving.
+                if (hit.BradleySkip || hit.Kind == "roadside" || hit.Kind == "skip")
+                    continue;
+                // Only a monument that actually lists through-roads is a tour.
+                if (hit.ThroughRoads != null && hit.ThroughRoads.Count > 0)
+                    continue;
+                if (BradleyCanTourMonument(hit))
+                    continue;
+                bool yardish = string.Equals(hit.Kind, "courtyard", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(hit.Kind, "through", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(hit.Family, "yard", StringComparison.OrdinalIgnoreCase);
+                if (yardish)
+                {
+                    mon = hit;
+                    break;
+                }
+            }
+            if (mon == null) return from;
+            float r = (mon.Radius + 28f) * (mon.Radius + 28f);
+            for (int i = from + 1; i < route.Count; i++)
+            {
+                float dx = route[i].x - mon.X, dz = route[i].z - mon.Z;
+                if (dx * dx + dz * dz > r)
+                    return i;
+            }
+            return from;
+        }
+
+        /// <summary>
+        /// S7 sits just outside powerplant_1's 130m circle. Still a courtyard approach.
+        /// </summary>
+        private bool IsCourtyardNearby(Vector3 p, float maxDist)
+        {
+            if (!_monumentScanReady || _monumentScan.Count == 0) return IsHarborLot(p) || IsBradleyNoGoLot(p);
+            float maxSq = maxDist * maxDist;
+            for (int i = 0; i < _monumentScan.Count; i++)
+            {
+                var m = _monumentScan[i];
+                if (m == null) continue;
+                if (m.BradleySkip || m.Kind == "skip" || m.Kind == "roadside") continue;
+                bool yard = m.Kind == "courtyard" || m.Kind == "through"
+                            || string.Equals(m.Family, "yard", StringComparison.OrdinalIgnoreCase);
+                if (!yard) continue;
+                float dx = p.x - m.X, dz = p.z - m.Z;
+                if (dx * dx + dz * dz <= maxSq) return true;
+            }
+            float d;
+            string lab = ClosestMonumentLabel(p, out d);
+            if (d <= maxDist && YardMonumentName(lab)) return true;
+            return IsHarborLot(p);
+        }
+
+        /// <summary>
+        /// Keep a highway node only when it sits inside a monument that lists
+        /// ThroughRoads. Global _throughMonRoads tags whole Path.Road ids, so
+        /// road #1 was "through" at S6 even though powerplant_1.ThroughRoads=[].
+        /// </summary>
+        private bool PointIsMonumentThroughKeep(Vector3 p)
+        {
+            var m = FindMonumentScanAt(p);
+            if (m == null) return false;
+            if (m.ThroughRoads == null || m.ThroughRoads.Count == 0) return false;
+            if (m.BradleySkip || m.Kind == "skip" || m.Kind == "roadside") return false;
+            return true;
+        }
+
+        private static bool YardMonumentName(string n)
+        {
+            if (string.IsNullOrEmpty(n)) return false;
+            n = n.ToLowerInvariant();
+            return n.IndexOf("powerplant", StringComparison.Ordinal) >= 0
+                || n.IndexOf("power_plant", StringComparison.Ordinal) >= 0
+                || n.IndexOf("launch_site", StringComparison.Ordinal) >= 0
+                || n.IndexOf("launchsite", StringComparison.Ordinal) >= 0
+                || n.IndexOf("airfield", StringComparison.Ordinal) >= 0
+                || n.IndexOf("trainyard", StringComparison.Ordinal) >= 0
+                || n.IndexOf("train_yard", StringComparison.Ordinal) >= 0
+                || n.IndexOf("water_treatment", StringComparison.Ordinal) >= 0
+                || n.IndexOf("watertreatment", StringComparison.Ordinal) >= 0
+                || n.IndexOf("excavator", StringComparison.Ordinal) >= 0
+                || n.IndexOf("sphere_tank", StringComparison.Ordinal) >= 0
+                || n.IndexOf("military_tunnel", StringComparison.Ordinal) >= 0
+                || n.IndexOf("missile_silo", StringComparison.Ordinal) >= 0
+                || n.IndexOf("satellite", StringComparison.Ordinal) >= 0
+                || n.IndexOf("junkyard", StringComparison.Ordinal) >= 0
+                || n.IndexOf("sewer", StringComparison.Ordinal) >= 0
+                || n.IndexOf("arctic_research", StringComparison.Ordinal) >= 0
+                || n.IndexOf("desert_military", StringComparison.Ordinal) >= 0;
+        }
+
+        private bool OnMonumentThroughRoad(Vector3 p)
+        {
+            if (_throughMonRoads.Count == 0 || _roadCache.Count == 0) return false;
+            const float keepSq = 22f * 22f;
+            foreach (int rid in _throughMonRoads)
+            {
+                if (rid < 0 || rid >= _roadCache.Count) continue;
+                var pts = _roadCache[rid].Points;
+                if (pts == null) continue;
+                for (int i = 0; i < pts.Count; i++)
+                {
+                    float dx = pts[i].x - p.x, dz = pts[i].z - p.z;
+                    if (dx * dx + dz * dz <= keepSq) return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>NPC/core: "through" | "courtyard" | "roadside" | "skip" | "".</summary>
+        public object API_MonumentKind(Vector3 pos)
+        {
+            if (!_monumentScanReady) return "";
+            var m = FindMonumentScanAt(pos);
+            return m == null ? "" : (m.Kind ?? "");
+        }
+
+        /// <summary>True when pos is on a painted through-road that crosses a monument.</summary>
+        public object API_OnMonumentThroughRoad(Vector3 pos)
+        {
+            return OnMonumentThroughRoad(pos);
         }
 
         private bool BradleyPointNoRiver(Vector3 p)
@@ -5985,9 +7880,9 @@ namespace Oxide.Plugins
             for (int i = 0; i < raw.Count; i++)
             {
                 Vector3 p = raw[i];
-                if (IsBradleyNoGoLot(p))
+                if (IsBradleyNoGoLot(p) && !OnMonumentThroughRoad(p))
                 {
-                    // Do not jump the courtyard. Keep the approach skirt only.
+                    // Courtyard interior — keep the approach, do not jump the lot.
                     if (has && outp.Count >= 8) break;
                     continue;
                 }
@@ -6603,6 +8498,16 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             }
 
             entity.Spawn();
+            try
+            {
+                entity.enableSaving = false;
+                var apc0 = entity as BradleyAPC;
+                if (apc0 != null)
+                {
+                    try { apc0.RoadSpawned = true; } catch { }
+                }
+            }
+            catch { }
             InvalidateEntityCache("bradleyapc"); // also clears bradleyapc_live via fragment rules
             // Mark as ours so KillVanillaBradleys / OnEntitySpawned leave it alone
             try
@@ -6624,6 +8529,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                     InstallBradleyFullPath(bradley, route, 0);
                     // Keepalive: reassert path if AI clears it while fighting
                     StartBradleyPatrolRoute(bradley, route, 1, spawnRoad);
+                    AttachBradleyUnstick(bradley);
                 }
                 else
                     DebugLog("BradleyAPC cast failed - using vanilla AI only");
@@ -6711,26 +8617,19 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                     }
                     if (road.Width < 5f) continue;
                 }
-                // Spawn seeds: never start or finish inside a harbor lot.
-                // Joins: only reject a road that ENDS in a lot (start-in-lot is the escape).
-                if (dry.Count > 0)
-                {
-                    bool endLot = IsBradleyNoGoLot(dry[dry.Count - 1]);
-                    bool startLot = IsBradleyNoGoLot(dry[0]);
-                    if (nearHere)
-                    {
-                        if (endLot) continue;
-                    }
-                    else if (startLot || endLot)
-                    {
-                        continue;
-                    }
-                }
+                // Keep the arterial. Cut the courtyard/lot tail after pick.
+                if (dry.Count > 0 && IsBradleyNoGoLot(dry[0]) && !nearHere)
+                    continue;
                 pool.Add((i, dry, span, road.Width, near));
             }
             if (pool.Count == 0) return new List<Vector3>();
             pool.Sort((a, b) =>
             {
+                if (!nearHere)
+                {
+                    bool am = _roadCache[a.id].IsMain, bm = _roadCache[b.id].IsMain;
+                    if (am != bm) return bm.CompareTo(am);
+                }
                 bool aa = a.width >= 5f, ab = b.width >= 5f;
                 if (aa != ab) return ab.CompareTo(aa);
                 if (nearHere)
@@ -6740,8 +8639,8 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 }
                 return b.span.CompareTo(a.span);
             });
-            // Longest asphalt, but rotate so we do not spawn K7 every event.
-            int take = nearHere ? 1 : Mathf.Min(4, pool.Count);
+            // Seed: pick among the longest arterials so each event is a new tour.
+            int take = nearHere ? 1 : Mathf.Min(8, pool.Count);
             var pick = pool[0];
             if (!nearHere && take > 1)
             {
@@ -6754,6 +8653,15 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 if (choices.Count == 0) choices.Add(pool[0]);
                 pick = choices[UnityEngine.Random.Range(0, choices.Count)];
                 _lastBradleySeedId = pick.id;
+                if (UnityEngine.Random.value < 0.5f && pick.pts.Count > 8)
+                    pick.pts.Reverse();
+                // Start partway down a long road so H8 is not every spawn.
+                if (pick.pts.Count > 24)
+                {
+                    int drop = UnityEngine.Random.Range(0, Mathf.Min(12, pick.pts.Count / 4));
+                    if (drop > 0)
+                        pick.pts.RemoveRange(0, drop);
+                }
             }
             pickedId = pick.id;
             DebugLog($"Bradley named-road #{pick.id} {PositionToGrid(pick.pts[0])} -> {PositionToGrid(pick.pts[pick.pts.Count - 1])} pts={pick.pts.Count} span={pick.span:F0}m width={pick.width:F1}");
@@ -6775,6 +8683,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             var used = new HashSet<int>();
             var seed = PickNamedBradleyRoad(used, Vector3.zero, Vector3.zero, false, maxPts, out seedId);
             if (seed == null || seed.Count < 5) return seed ?? new List<Vector3>();
+            if (seed.Count < 8) return new List<Vector3>();
             if (seedId >= 0) used.Add(seedId);
 
             var chain = new List<Vector3>(128);
@@ -6800,31 +8709,22 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                     DebugLog($"Bradley reject wet-join #{nextId} at {PositionToGrid(end)}");
                     continue;
                 }
-                int monHits = 0, monTot = 0;
-                int lim = Mathf.Min(next.Count, start + 20);
-                for (int m = start; m < lim; m++)
-                {
-                    monTot++;
-                    if (IsMonumentRoadPoint(next[m])) monHits++;
-                }
-                if (monTot > 0 && monHits * 2 >= monTot)
-                {
-                    DebugLog($"Bradley reject monument-join #{nextId} {monHits}/{monTot}");
-                    continue;
-                }
-                if (IsBradleyNoGoLot(next[start]) || IsBradleyNoGoLot(next[next.Count - 1]))
-                {
-                    DebugLog($"Bradley reject lot-join #{nextId} at {PositionToGrid(next[start])}");
-                    continue;
-                }
+                // Named Path.Road through a monument is the patrol — keep it.
                 for (int i = start; i < next.Count; i++)
                     chain.Add(next[i]);
                 joins++;
-                DebugLog($"Bradley chain +road#{nextId} pts={chain.Count} span={BradleyRouteSpan(chain):F0}m -> {PositionToGrid(chain[chain.Count - 1])}");
+                DebugLog($"Bradley chain +road#{nextId} pts={chain.Count} span={BradleyRouteSpan(chain):F0}m cut=0 -> {PositionToGrid(chain[chain.Count - 1])}");
             }
-            DebugLog($"Bradley spawn-chain roads={joins + 1} pts={chain.Count} span={BradleyRouteSpan(chain):F0}m {PositionToGrid(chain[0])} -> {PositionToGrid(chain[chain.Count - 1])}");
+            StripBradleyHazardPads(chain);
+            int spliced = SpliceBradleyMonumentCorridors(chain);
+            _bradleyLastChainUsed.Clear();
+            foreach (int id in used) _bradleyLastChainUsed.Add(id);
+            DebugLog($"Bradley spawn-chain roads={joins + 1} pts={chain.Count} span={BradleyRouteSpan(chain):F0}m splice={spliced} {PositionToGrid(chain[0])} -> {PositionToGrid(chain[chain.Count - 1])}");
             return chain;
         }
+
+        private float _bradleyClearAt;
+        private float _bradleyNoJoinAt;
 
         private void ForceBradleyOneWay(BradleyAPC bradley)
         {
@@ -6837,6 +8737,66 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 var loopField = typeof(BradleyAPC).GetField("pathLooping", flags);
                 if (loopField != null && loopField.FieldType == typeof(bool))
                     loopField.SetValue(bradley, false);
+            }
+            catch { }
+            BradleyClearPathObstacles(bradley);
+        }
+
+        /// <summary>
+        /// Vanilla Bradley shoots threats, not parked cars. If something sits on
+        /// the hull's forward cone, paint it as the main gun target so the tank
+        /// can push through a road instead of idling.
+        /// </summary>
+        private void BradleyClearPathObstacles(BradleyAPC bradley)
+        {
+            if (bradley == null || bradley.IsDestroyed) return;
+            if (Time.realtimeSinceStartup < _bradleyClearAt) return;
+            _bradleyClearAt = Time.realtimeSinceStartup + 3.5f;
+            try
+            {
+                Vector3 pos = bradley.transform.position;
+                Vector3 fwd = bradley.transform.forward;
+                fwd.y = 0f;
+                if (fwd.sqrMagnitude < 0.01f) fwd = Vector3.forward;
+                fwd.Normalize();
+                var hits = new List<BaseEntity>();
+                Vis.Entities(pos + fwd * 10f, 14f, hits);
+                BaseCombatEntity pick = null;
+                float pickD = 22f * 22f;
+                for (int i = 0; i < hits.Count; i++)
+                {
+                    var e = hits[i];
+                    if (e == null || e.IsDestroyed || e == bradley) continue;
+                    if (e is BradleyAPC) continue;
+                    if (e is BuildingBlock) continue;
+                    if (e is BuildingPrivlidge) continue;
+                    var combat = e as BaseCombatEntity;
+                    if (combat == null || combat.IsDead()) continue;
+                    bool ok = e is BaseVehicle
+                           || e is ScientistNPC
+                           || e is NPCPlayer
+                           || e is Barricade
+                           || e is RidableHorse;
+                    var player = e as BasePlayer;
+                    if (player != null && !player.IsNpc)
+                        ok = !player.IsSleeping();
+                    if (!ok) continue;
+                    Vector3 to = e.transform.position - pos;
+                    to.y = 0f;
+                    if (to.sqrMagnitude > pickD) continue;
+                    if (Vector3.Dot(fwd, to.normalized) < 0.25f) continue;
+                    pick = combat;
+                    pickD = to.sqrMagnitude;
+                }
+                if (pick == null) return;
+                var flags = System.Reflection.BindingFlags.Instance |
+                            System.Reflection.BindingFlags.Public |
+                            System.Reflection.BindingFlags.NonPublic;
+                var gun = typeof(BradleyAPC).GetField("mainGunTarget", flags)
+                       ?? typeof(BradleyAPC).GetField("target", flags);
+                if (gun != null && typeof(BaseCombatEntity).IsAssignableFrom(gun.FieldType))
+                    gun.SetValue(bradley, pick);
+                DebugLog($"Bradley path-clear {PositionToGrid(pos)} -> {pick.ShortPrefabName}");
             }
             catch { }
         }
@@ -6872,7 +8832,12 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                             || n.IndexOf("lighthouse", StringComparison.Ordinal) >= 0
                             || n.IndexOf("gas_station", StringComparison.Ordinal) >= 0
                             || n.IndexOf("supermarket", StringComparison.Ordinal) >= 0
+                            || n.IndexOf("bus_stop", StringComparison.Ordinal) >= 0
+                            || n.IndexOf("busstop", StringComparison.Ordinal) >= 0
                             || n.IndexOf("warehouse", StringComparison.Ordinal) >= 0
+                            || n.IndexOf("apartment", StringComparison.Ordinal) >= 0
+                            || n.IndexOf("outpost", StringComparison.Ordinal) >= 0
+                            || n.IndexOf("compound", StringComparison.Ordinal) >= 0
                             || n.IndexOf("junkyard", StringComparison.Ordinal) >= 0)
                             return true;
                     }
@@ -6999,10 +8964,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 if (toFar.sqrMagnitude < 80f * 80f) continue;
                 float dot = Vector3.Dot(heading, toFar.normalized);
                 if (dot < minDot)
-                {
-                    DebugLog($"Bradley reject back-join #{i} dot={dot:F2}");
                     continue;
-                }
                 float span = BradleyRouteSpan(oriented);
                 if (span < Mathf.Clamp(ScaleOnMap(250f), 160f, 280f))
                 {
@@ -7021,7 +8983,8 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 }
                 if (tot > 0 && hit * 2 >= tot)
                 {
-                    DebugLog($"Bradley reject overlap-join #{i} {hit}/{tot}");
+                    if (Time.realtimeSinceStartup >= _bradleyNoJoinAt)
+                        DebugLog($"Bradley reject overlap-join #{i} {hit}/{tot}");
                     continue;
                 }
 
@@ -7029,7 +8992,11 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             }
             if (pool.Count == 0)
             {
-                DebugLog($"Bradley no-join at {PositionToGrid(here)} used={used?.Count ?? 0}");
+                if (Time.realtimeSinceStartup >= _bradleyNoJoinAt)
+                {
+                    _bradleyNoJoinAt = Time.realtimeSinceStartup + 8f;
+                    DebugLog($"Bradley no-join at {PositionToGrid(here)} used={used?.Count ?? 0}");
+                }
                 return null;
             }
             pool.Sort((a, b) =>
@@ -7048,8 +9015,107 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             return pool[0].pts;
         }
 
+        /// <summary>
+        /// True terminus (ferry spit / cul-de-sac): walk 180–850 m back along
+        /// the current asphalt and pick a third arm at that junction. The tank
+        /// drives back on the road it already used — no teleport, no full-route
+        /// reverse, no off-road crawl.
+        /// </summary>
+        private bool TryBradleyBackupJunction(
+            List<Vector3> route,
+            Vector3 pos,
+            HashSet<int> usedRoads,
+            out List<Vector3> spliced,
+            out int pickedId,
+            out string viaGrid)
+        {
+            spliced = null;
+            pickedId = -1;
+            viaGrid = "";
+            if (route == null || route.Count < 12) return false;
+
+            int here = FindClosestRouteIndex(route, pos);
+            if (here < 0) here = route.Count - 1;
+            // Mid-chain stall: treat the hull as the terminus so we measure
+            // "leave this lot", not "distance to the unused O12 tail".
+            bool midStall = here < route.Count - 8;
+            Vector3 deadEnd = midStall ? route[here] : route[route.Count - 1];
+            string deadGrid = PositionToGrid(deadEnd);
+            var driven = new List<Vector3>();
+            for (int p = 0; p <= here && p < route.Count; p += 2)
+                driven.Add(route[p]);
+
+            int startI = Math.Min(here, route.Count - 5) - 3;
+            for (int i = startI; i >= 8; i -= 3)
+            {
+                Vector3 junction = route[i];
+                float back = Vector3.Distance(
+                    new Vector3(junction.x, 0f, junction.z),
+                    new Vector3(deadEnd.x, 0f, deadEnd.z));
+                if (back < 180f) continue;
+                if (back > 850f) break;
+
+                int a = Math.Max(0, i - 2);
+                int b = Math.Min(route.Count - 1, i + 2);
+                Vector3 heading = new Vector3(route[b].x - route[a].x, 0f, route[b].z - route[a].z);
+                if (heading.sqrMagnitude < 1f) continue;
+
+                int id = -1;
+                // Side arm first (3-way). Then a mild forward that is not the spit.
+                var side = PickForwardNamedRoad(junction, heading, usedRoads, driven, -0.35f, out id);
+                if (side == null)
+                    side = PickForwardNamedRoad(junction, heading, usedRoads, driven, 0.05f, out id);
+                if (side == null || side.Count < 6) continue;
+
+                Vector3 far = side[side.Count - 1];
+                if (string.Equals(PositionToGrid(far), deadGrid, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (IsBradleyNoGoLot(far) || IsHarborLot(far) || IsCourtyardNearby(far, 130f))
+                    continue;
+                float leaveSpit = Vector3.Distance(
+                    new Vector3(far.x, 0f, far.z),
+                    new Vector3(deadEnd.x, 0f, deadEnd.z));
+                if (leaveSpit < 250f) continue;
+                if (BradleyRouteSpan(side) < 200f) continue;
+
+                var backPts = new List<Vector3>();
+                if (here > i)
+                {
+                    for (int p = here; p >= i; p--)
+                        backPts.Add(route[p]);
+                }
+                else
+                {
+                    backPts.Add(junction);
+                }
+
+                int skip = 0;
+                if (side.Count > 0 && backPts.Count > 0)
+                {
+                    float sx = side[0].x - backPts[backPts.Count - 1].x;
+                    float sz = side[0].z - backPts[backPts.Count - 1].z;
+                    if (sx * sx + sz * sz < 25f * 25f) skip = 1;
+                }
+
+                var outR = new List<Vector3>(backPts.Count + side.Count);
+                outR.AddRange(backPts);
+                for (int p = skip; p < side.Count; p++)
+                    outR.Add(side[p]);
+                if (outR.Count < 8) continue;
+                if (!BradleySegmentDry(outR[0], outR[Math.Min(3, outR.Count - 1)]))
+                    continue;
+
+                spliced = outR;
+                pickedId = id;
+                viaGrid = PositionToGrid(junction);
+                return true;
+            }
+            return false;
+        }
+
         private readonly Dictionary<ulong, Timer> _bradleyRouteTimers = new Dictionary<ulong, Timer>();
         private int _lastBradleySeedId = -1;
+        private readonly HashSet<int> _bradleyLastChainUsed = new HashSet<int>();
 
         /// <summary>
         /// Keepalive only — do NOT rebuild currentPath every tick (that causes
@@ -7083,11 +9149,27 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             int reinstalls = 0;
             bool pathEnded = false;
             bool spurReversed = false;
+            bool yardMode = false;
+            int yardMonId = -1;
+            float yardEnterAt = 0f;
+            float yardCooldownUntil = 0f;
+            int yardCooldownMonId = -1;
+            int lastPushHull = -1;
+            int lastPushDest = -1;
+            int stallEscalations = 0;
             int lastSnapWp = -1;
+            int lastInstallStart = -1;
             int sameSnap = 0;
+            float skipUntil = 0f;
+            int backupJoins = 0;
+            string lastMissGrid = "";
+            float lastMissAt = 0f;
+            string lastLotSkipHull = "";
             var recentEnds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var usedRoads = new HashSet<int>();
             if (startRoad >= 0) usedRoads.Add(startRoad);
+            foreach (int id in _bradleyLastChainUsed)
+                usedRoads.Add(id);
 
             DebugLog($"Bradley lifetime armed for {lifetimeMin:F0}m (road hops like heavies)");
 
@@ -7138,6 +9220,168 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                             haveLast = true;
                         }
                         lastPos = pos;
+                        string gridNow = PositionToGrid(pos);
+
+                        // Highway still has tail (O12→K7 via S7): stay on it.
+                        // 150 looped yard-escape S7 → road#1 K7 every 22s and never rolled.
+                        float remainHwy = 0f;
+                        if (route != null && hopIndex >= 0 && hopIndex < route.Count)
+                            remainHwy = Vector3.Distance(
+                                new Vector3(pos.x, 0f, pos.z),
+                                new Vector3(route[route.Count - 1].x, 0f, route[route.Count - 1].z));
+                        bool hwyAlive = route != null && route.Count >= 16
+                                        && hopIndex < route.Count - 8
+                                        && remainHwy > 160f;
+                        if (!yardMode && !hwyAlive && Time.realtimeSinceStartup - lastMovedAt > 18f
+                            && Time.realtimeSinceStartup >= skipUntil)
+                        {
+                            var trap = FindMonumentScanAt(pos);
+                            bool trapYard = trap != null
+                                && !trap.BradleySkip
+                                && (trap.Kind == "through" || trap.Kind == "courtyard"
+                                    || string.Equals(trap.Family, "yard", StringComparison.OrdinalIgnoreCase))
+                                && (trap.ThroughRoads == null || trap.ThroughRoads.Count == 0);
+                            if (trapYard)
+                            {
+                                Vector3 heading = bradley.transform.forward;
+                                if (route != null && hopIndex + 1 < route.Count)
+                                {
+                                    var ha = route[Mathf.Clamp(hopIndex, 0, route.Count - 1)];
+                                    var hb = route[Mathf.Min(hopIndex + 3, route.Count - 1)];
+                                    heading = new Vector3(hb.x - ha.x, 0f, hb.z - ha.z);
+                                }
+                                int leaveId = -1;
+                                var leave = PickForwardNamedRoad(pos, heading, usedRoads, route, -0.15f, out leaveId);
+                                if (leave == null)
+                                    leave = PickForwardNamedRoad(pos, heading, new HashSet<int>(), null, 0.10f, out leaveId);
+                                if (leave != null && leave.Count >= 8)
+                                {
+                                    TrimBradleyYardTail(leave);
+                                    StripBradleyYardInterior(leave);
+                                    if (leave.Count >= 8)
+                                    {
+                                        route = leave;
+                                        AdoptBradleyRoute(ref route);
+                                        hopIndex = FirstAwayIndex(route, pos, 50f);
+                                        if (leaveId >= 0) NoteBradleyUsedRoad(usedRoads, leaveId);
+                                        sameSnap = 0;
+                                        stallEscalations = 0;
+                                        skipUntil = Time.realtimeSinceStartup + 22f;
+                                        lastMovedAt = Time.realtimeSinceStartup;
+                                        InstallBradleyFullPath(bradley, route, hopIndex);
+                                        DebugLog($"Bradley yard-escape {gridNow} mon={trap.Prefab} road#{leaveId} -> {PositionToGrid(route[route.Count - 1])} pts={route.Count}");
+                                        return;
+                                    }
+                                }
+                                int warpTo;
+                                if (WarpBradleyOutOfYard(bradley, route, trap, hopIndex, out warpTo))
+                                {
+                                    hopIndex = warpTo;
+                                    sameSnap = 0;
+                                    stallEscalations = 0;
+                                    skipUntil = Time.realtimeSinceStartup + 18f;
+                                    lastMovedAt = Time.realtimeSinceStartup;
+                                    InstallBradleyFullPath(bradley, route, hopIndex);
+                                    DebugLog($"Bradley yard-warp {gridNow} mon={trap.Prefab} -> {PositionToGrid(route[hopIndex])} wp={hopIndex}/{route.Count}");
+                                    return;
+                                }
+                            }
+                        }
+
+                        // Yard mode: follow the monument lane. Road mode: named Path.Roads.
+                        // Enter at a gate, exit at the other end, then pick the next road.
+                        if (!yardMode)
+                        {
+                            var enterMon = FindMonumentScanAt(pos);
+                            bool highwayAlive = route.Count >= 20 && hopIndex < route.Count - 8;
+                            if (enterMon != null && BradleyCanTourMonument(enterMon)
+                                && !highwayAlive
+                                && !(enterMon.Id == yardCooldownMonId && Time.realtimeSinceStartup < yardCooldownUntil)
+                                && !(enterMon.ThroughRoads != null && enterMon.ThroughRoads.Count > 0 && OnMonumentThroughRoad(pos)))
+                            {
+                                var lane = GetMonumentLane(enterMon);
+                                if (LaneHasTwoGates(lane))
+                                {
+                                    float dStart = (lane[0].x - pos.x) * (lane[0].x - pos.x) + (lane[0].z - pos.z) * (lane[0].z - pos.z);
+                                    float dEnd = (lane[lane.Count - 1].x - pos.x) * (lane[lane.Count - 1].x - pos.x)
+                                               + (lane[lane.Count - 1].z - pos.z) * (lane[lane.Count - 1].z - pos.z);
+                                    if (dEnd < dStart)
+                                        lane.Reverse();
+                                    // Launch_site r=216 swallows the ring road. Only enter
+                                    // when the hull is on the lane / a gate — not "inside radius".
+                                    if (NearMonumentLane(lane, pos, 55f))
+                                    {
+                                        route = lane;
+                                        hopIndex = FirstAwayIndex(route, pos, 80f);
+                                        yardMode = true;
+                                        yardMonId = enterMon.Id;
+                                        yardEnterAt = Time.realtimeSinceStartup;
+                                        pathEnded = false;
+                                        spurReversed = false;
+                                        sameSnap = 0;
+                                        skipUntil = Time.realtimeSinceStartup + 50f;
+                                        int enterHull = FindClosestRouteIndex(route, pos);
+                                        InstallBradleyFullPath(bradley, route, enterHull);
+                                        DebugLog($"Bradley YARD enter {enterMon.Name} @{gridNow} lane={route.Count} hull={enterHull} -> {PositionToGrid(route[route.Count - 1])}");
+                                        lastMovedAt = Time.realtimeSinceStartup;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            MonumentScanEntry yardEnt = null;
+                            for (int yi = 0; yi < _monumentScan.Count; yi++)
+                                if (_monumentScan[yi] != null && _monumentScan[yi].Id == yardMonId)
+                                { yardEnt = _monumentScan[yi]; break; }
+                            float ydx = yardEnt != null ? pos.x - yardEnt.X : 0f;
+                            float ydz = yardEnt != null ? pos.z - yardEnt.Z : 0f;
+                            float yRad = yardEnt != null ? yardEnt.Radius * 1.85f : 160f;
+                            bool inYard = yardEnt != null && (ydx * ydx + ydz * ydz) <= yRad * yRad;
+                            int needHops = Math.Max(5, route.Count / 4);
+                            bool progressed = hopIndex >= needHops;
+                            float exitDx = pos.x - route[route.Count - 1].x;
+                            float exitDz = pos.z - route[route.Count - 1].z;
+                            bool atFarGate = progressed && (exitDx * exitDx + exitDz * exitDz) < 45f * 45f;
+                            bool leftYard = progressed && !inYard;
+                            bool stallExit = Time.realtimeSinceStartup - lastMovedAt > 28f
+                                && Time.realtimeSinceStartup - yardEnterAt > 28f;
+                            if (atFarGate || leftYard || stallExit)
+                            {
+                                Vector3 heading = Vector3.forward;
+                                if (route.Count >= 2)
+                                {
+                                    var a = route[route.Count - 2];
+                                    var b = route[route.Count - 1];
+                                    heading = new Vector3(b.x - a.x, 0f, b.z - a.z);
+                                }
+                                int nextId = -1;
+                                var next = PickForwardNamedRoad(pos, heading, usedRoads, route, out nextId);
+                                if (next == null)
+                                    next = PickForwardNamedRoad(pos, heading, new HashSet<int>(), route, out nextId);
+                                if (next != null && next.Count >= 5)
+                                    TrimBradleyYardTail(next);
+                                if (next != null && next.Count >= 5)
+                                {
+                                    route = next;
+                                    hopIndex = FirstAwayIndex(route, pos, 40f);
+                                    if (nextId >= 0) NoteBradleyUsedRoad(usedRoads, nextId);
+                                    yardCooldownMonId = yardMonId;
+                                    yardCooldownUntil = Time.realtimeSinceStartup + 95f;
+                                    yardMode = false;
+                                    yardMonId = -1;
+                                    pathEnded = false;
+                                    spurReversed = false;
+                                    sameSnap = 0;
+                                    skipUntil = Time.realtimeSinceStartup + 20f;
+                                    InstallBradleyFullPath(bradley, route, hopIndex);
+                                    DebugLog($"Bradley ROAD exit {gridNow} road#{nextId} -> {PositionToGrid(route[route.Count - 1])} pts={route.Count}");
+                                    lastMovedAt = Time.realtimeSinceStartup;
+                                    return;
+                                }
+                            }
+                        }
 
                         Vector3 dest = route[Mathf.Clamp(hopIndex, 0, route.Count - 1)];
                         float dx = pos.x - dest.x;
@@ -7145,18 +9389,100 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                         bool inMonument = IsMonumentRoadPoint(pos);
                         float nearSq = inMonument ? 16f * 16f : 28f * 28f;
                         bool nearDest = dx * dx + dz * dz < nearSq;
-                        string gridNow = PositionToGrid(pos);
+                        // Closest node only. "Furthest within 80m" on a folded
+                        // backup path (F2→F4 over the same asphalt) jumped to wp=15
+                        // while the hull was still at F2, then snap installed a path
+                        // that started at F4.
+                        if (Time.realtimeSinceStartup >= skipUntil)
+                        {
+                            int caught = FindClosestRouteIndex(route, pos);
+                            float cx = route[caught].x - pos.x, cz = route[caught].z - pos.z;
+                            if (caught > hopIndex + 1 && caught < route.Count
+                                && cx * cx + cz * cz < 55f * 55f)
+                            {
+                                hopIndex = caught;
+                                dest = route[hopIndex];
+                                lastMovedAt = Time.realtimeSinceStartup;
+                                DebugLog($"Bradley hop-catch {gridNow} wp={hopIndex}/{route.Count}");
+                            }
+                        }
                         if (nearDest && hopIndex < route.Count - 1)
                         {
-                            hopIndex++;
-                            dest = route[hopIndex];
-                            DebugLog($"Bradley road HOP {hopIndex}/{route.Count} {gridNow} -> {PositionToGrid(dest)}");
-                            lastMovedAt = Time.realtimeSinceStartup;
+                            Vector3 nxt = route[hopIndex + 1];
+                            bool nxtYard = false;
+                            int lookTo = Mathf.Min(hopIndex + 8, route.Count - 1);
+                            for (int li = hopIndex + 1; li <= lookTo; li++)
+                            {
+                                var lookMon = FindMonumentScanAt(route[li]);
+                                bool yardKind = BradleyCanTourMonument(lookMon);
+                                if (yardKind)
+                                { nxtYard = true; nxt = route[li]; break; }
+                            }
+                            if (nxtYard && !yardMode && !(route.Count >= 20 && hopIndex < route.Count - 8))
+                            {
+                                var yardMon = FindMonumentScanAt(nxt) ?? FindMonumentScanAt(pos);
+                                if (yardMon != null && yardMon.BradleySkip) yardMon = null;
+                                if (yardMon != null && yardMon.Id == yardCooldownMonId && Time.realtimeSinceStartup < yardCooldownUntil)
+                                    yardMon = null;
+                                if (yardMon != null && yardMon.ThroughRoads != null && yardMon.ThroughRoads.Count > 0 && OnMonumentThroughRoad(pos))
+                                    yardMon = null;
+                                var yardLane = yardMon != null ? GetMonumentLane(yardMon) : null;
+                                if (yardLane != null && !NearMonumentLane(yardLane, pos, 55f))
+                                    yardLane = null;
+                                if (yardLane != null && LaneHasTwoGates(yardLane))
+                                {
+                                    float dStart = (yardLane[0].x - pos.x) * (yardLane[0].x - pos.x)
+                                                 + (yardLane[0].z - pos.z) * (yardLane[0].z - pos.z);
+                                    float dEnd = (yardLane[yardLane.Count - 1].x - pos.x) * (yardLane[yardLane.Count - 1].x - pos.x)
+                                               + (yardLane[yardLane.Count - 1].z - pos.z) * (yardLane[yardLane.Count - 1].z - pos.z);
+                                    if (dEnd < dStart) yardLane.Reverse();
+                                    route = yardLane;
+                                    hopIndex = FirstAwayIndex(route, pos, 80f);
+                                    yardMode = true;
+                                    yardMonId = yardMon.Id;
+                                    yardEnterAt = Time.realtimeSinceStartup;
+                                    pathEnded = false;
+                                    spurReversed = false;
+                                    sameSnap = 0;
+                                    skipUntil = Time.realtimeSinceStartup + 50f;
+                                    int lookHull = FindClosestRouteIndex(route, pos);
+                                    InstallBradleyFullPath(bradley, route, lookHull);
+                                    DebugLog($"Bradley YARD enter {yardMon.Name} @{gridNow} lane={route.Count} hull={lookHull} -> {PositionToGrid(route[route.Count - 1])}");
+                                    lastMovedAt = Time.realtimeSinceStartup;
+                                    return;
+                                }
+                                // No lane on file: keep driving the chain through the gate.
+                                hopIndex++;
+                                dest = route[hopIndex];
+                                DebugLog($"Bradley road HOP {hopIndex}/{route.Count} {gridNow} through-yard -> {PositionToGrid(dest)}");
+                                lastMovedAt = Time.realtimeSinceStartup;
+                            }
+                            else
+                            {
+                                hopIndex++;
+                                dest = route[hopIndex];
+                                DebugLog($"Bradley road HOP {hopIndex}/{route.Count} {gridNow} -> {PositionToGrid(dest)}");
+                                lastMovedAt = Time.realtimeSinceStartup;
+                            }
                         }
                         else if (!pathEnded && hopIndex < route.Count - 1
                             && Time.realtimeSinceStartup - lastMovedAt > 20f)
                         {
-                            int snap = FindNearestRouteIndex(route, pos);
+                            if (Time.realtimeSinceStartup < skipUntil)
+                                return;
+                            if (yardMode && Time.realtimeSinceStartup - yardEnterAt < 45f)
+                                return;
+                            int snap = FindClosestRouteIndex(route, pos);
+                            // Never rewind past a committed hop, but do not leap
+                            // ahead of the hull on a folded backup path.
+                            if (snap < hopIndex)
+                                snap = hopIndex;
+                            else if (snap > hopIndex + 3)
+                                snap = hopIndex;
+                            if (Time.realtimeSinceStartup < skipUntil)
+                                return;
+                            if (yardMode && Time.realtimeSinceStartup - yardEnterAt < 45f)
+                                return;
                             hopIndex = snap;
                             lastMovedAt = Time.realtimeSinceStartup;
                             if (snap == lastSnapWp) sameSnap++;
@@ -7164,9 +9490,249 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
 
                             float monDist;
                             string monName = ClosestMonumentLabel(pos, out monDist);
-                            bool inLot = IsBradleyNoGoLot(pos) || inMonument || monDist < 90f;
+                            bool roadside = BradleySkipLotName((monName ?? "").ToLowerInvariant());
+                            if (roadside) monDist = 9999f;
+                            bool harbor = !roadside && (IsHarborLot(pos) || HarborLotName((monName ?? "").ToLowerInvariant()));
+                            // Inside the courtyard circle — not "powerplant 130m that way" from a substation.
+                            var scanMon = FindMonumentScanAt(pos);
+                            bool yard = !roadside && scanMon != null
+                                && string.Equals(scanMon.Kind, "courtyard", StringComparison.OrdinalIgnoreCase);
+                            bool onThrough = OnMonumentThroughRoad(pos);
+                            bool inLot = (harbor || yard || (!roadside && (IsBradleyNoGoLot(pos) || (inMonument && monDist < 70f))))
+                                         && !onThrough;
                             bool nearPathEnd = snap >= route.Count - 4;
-                            bool leaveLot = inLot || nearPathEnd || sameSnap >= 2;
+                            bool midChain = snap < route.Count - 6 && route.Count >= 20;
+                            // Lot-skip is a last resort when the hull is in a dead yard.
+                            // S7 power_sub next to powerplant was matching IsCourtyardNearby(130)
+                            // and then installing a path that started at Q5 while the tank sat still.
+                            bool canSkip = inLot && !roadside && !onThrough && sameSnap >= 2
+                                           && !midChain
+                                           && lastLotSkipHull != gridNow;
+                            if (canSkip)
+                            {
+                                int jump = -1;
+                                for (int i = snap + 8; i < route.Count; i++)
+                                {
+                                    if (IsHarborLot(route[i]) || IsBradleyNoGoLot(route[i]))
+                                        continue;
+                                    var jm = FindMonumentScanAt(route[i]);
+                                    if (jm != null && string.Equals(jm.Kind, "courtyard", StringComparison.OrdinalIgnoreCase))
+                                        continue;
+                                    float jx = route[i].x - pos.x, jz = route[i].z - pos.z;
+                                    if (jx * jx + jz * jz < 80f * 80f) continue;
+                                    if (jx * jx + jz * jz > 220f * 220f) continue;
+                                    if (PositionToGrid(route[i]) == gridNow) continue;
+                                    jump = i;
+                                    break;
+                                }
+                                if (jump > snap)
+                                {
+                                    hopIndex = jump;
+                                    sameSnap = 0;
+                                    reinstalls = 0;
+                                    lastLotSkipHull = gridNow;
+                                    skipUntil = Time.realtimeSinceStartup + 35f;
+                                    lastMovedAt = Time.realtimeSinceStartup;
+                                    int installAt = FindClosestRouteIndex(route, pos);
+                                    InstallBradleyFullPath(bradley, route, installAt);
+                                    DebugLog($"Bradley lot-skip {gridNow} -> {PositionToGrid(route[hopIndex])} wp={hopIndex}/{route.Count}");
+                                    return;
+                                }
+                            }
+                            // Mid-chain stall on a roadside prop (stables, power_sub, gas)
+                            // is the same problem as a terminus: back up one junction.
+                            // Mid-chain P6: remaining H8→O12 tail is 60+ nodes. A backup
+                            // junction walks BACKWARD and U-turns onto road #11 (K7).
+                            // Only splice a new road when this highway is actually dying.
+                            float remain = 0f;
+                            if (hopIndex >= 0 && hopIndex < route.Count - 1)
+                                remain = Vector3.Distance(
+                                    new Vector3(pos.x, 0f, pos.z),
+                                    new Vector3(route[route.Count - 1].x, 0f, route[route.Count - 1].z));
+                            bool highwayLeft = midChain && hopIndex < route.Count - 10 && remain > 220f;
+                            bool subLot = roadside || (monName ?? "").IndexOf("power_sub", StringComparison.OrdinalIgnoreCase) >= 0
+                                          || (monName ?? "").IndexOf("powersub", StringComparison.OrdinalIgnoreCase) >= 0
+                                          || (monName ?? "").IndexOf("trainyard", StringComparison.OrdinalIgnoreCase) >= 0
+                                          || (monName ?? "").IndexOf("warehouse", StringComparison.OrdinalIgnoreCase) >= 0;
+                            int hullNow = FindClosestRouteIndex(route, pos);
+                            bool destStuck = hopIndex <= hullNow + 2;
+                            // Dest advancing 79→101 still I8: key off grid, not waypoint.
+                            if (sameSnap >= 2 && hopIndex < route.Count - 5
+                                && (destStuck || Time.realtimeSinceStartup - lastMovedAt > 16f))
+                            {
+                                int hullWp = FindClosestRouteIndex(route, pos);
+                                int jump = Mathf.Min(hullWp + 12, route.Count - 1);
+                                var pinMon = FindMonumentScanAt(pos);
+                                float need = 90f;
+                                if (pinMon != null) need = Mathf.Max(need, pinMon.Radius + 24f);
+                                for (int k = hullWp + 3; k < route.Count; k++)
+                                {
+                                    float jx = route[k].x - pos.x, jz = route[k].z - pos.z;
+                                    if (jx * jx + jz * jz < need * need) continue;
+                                    if (!BradleyPointDry(route[k])) continue;
+                                    if (pinMon != null)
+                                    {
+                                        float mx = route[k].x - pinMon.X, mz = route[k].z - pinMon.Z;
+                                        float rr = pinMon.Radius + 20f;
+                                        if (mx * mx + mz * mz <= rr * rr) continue;
+                                    }
+                                    jump = k;
+                                    break;
+                                }
+                                hopIndex = jump;
+                                sameSnap = 0;
+                                skipUntil = Time.realtimeSinceStartup + 16f;
+                                lastMovedAt = Time.realtimeSinceStartup;
+                                try
+                                {
+                                    Vector3 w = route[hopIndex];
+                                    w.y = TerrainMeta.HeightMap != null ? TerrainMeta.HeightMap.GetHeight(w) + 1.2f : w.y;
+                                    bradley.transform.position = w;
+                                    var wrb = bradley.GetComponent<Rigidbody>();
+                                    if (wrb != null) wrb.linearVelocity = Vector3.zero;
+                                }
+                                catch { }
+                                InstallBradleyFullPathSkipping(bradley, route, Mathf.Max(0, hopIndex - 1), hopIndex);
+                                DebugLog($"Bradley skip-pin {gridNow} mon={monName} -> {PositionToGrid(route[hopIndex])} wp={hopIndex}/{route.Count}");
+                                return;
+                            }
+                            if (sameSnap >= 3 && backupJoins < 3 && midChain && !highwayLeft)
+                            {
+                                List<Vector3> stuckBackup = null;
+                                int stuckId = -1;
+                                string stuckVia = "";
+                                bool tryBackup = lastMissGrid != gridNow
+                                    || (Time.realtimeSinceStartup - lastMissAt) > 90f;
+                                if (tryBackup && TryBradleyBackupJunction(route, pos, usedRoads, out stuckBackup, out stuckId, out stuckVia)
+                                    && stuckBackup != null && stuckBackup.Count >= 8)
+                                {
+                                    backupJoins++;
+                                    route = stuckBackup;
+                                    AdoptBradleyRoute(ref route);
+                                    hopIndex = FirstAwayIndex(route, pos, 70f);
+                                    if (stuckId >= 0) NoteBradleyUsedRoad(usedRoads, stuckId);
+                                    spurReversed = false;
+                                    pathEnded = false;
+                                    sameSnap = 0;
+                                    reinstalls = 0;
+                                    skipUntil = Time.realtimeSinceStartup + 45f;
+                                    InstallBradleyFullPath(bradley, route, hopIndex);
+                                    lastMovedAt = Time.realtimeSinceStartup;
+                                    DebugLog($"Bradley stall-backup {gridNow} mon={monName} via {stuckVia} road#{stuckId} start={hopIndex} -> {PositionToGrid(route[route.Count - 1])}");
+                                    return;
+                                }
+                                if (tryBackup)
+                                {
+                                    lastMissGrid = gridNow;
+                                    lastMissAt = Time.realtimeSinceStartup;
+                                    DebugLog($"Bradley stall-backup miss {gridNow} mon={monName} d={monDist:F0}");
+                                }
+                                if (midChain && hopIndex < route.Count - 4)
+                                {
+                                    int hullWp = FindClosestRouteIndex(route, pos);
+                                    int pushDest = Mathf.Min(Mathf.Max(hopIndex, hullWp + 1), route.Count - 1);
+                                    if (hullWp == lastPushHull && pushDest == lastPushDest)
+                                    {
+                                        stallEscalations++;
+                                        Vector3 headingNow = Vector3.forward;
+                                        if (hullWp + 1 < route.Count)
+                                        {
+                                            var ha = route[hullWp];
+                                            var hb = route[Mathf.Min(hullWp + 2, route.Count - 1)];
+                                            headingNow = new Vector3(hb.x - ha.x, 0f, hb.z - ha.z);
+                                        }
+                                        // 1) longer skip on this highway
+                                        // 2) side road from the HULL (not a junction 300m back)
+                                        // 3) 18m paved nudge so the APC leaves the pothole
+                                        if (stallEscalations >= 3)
+                                        {
+                                            int sideId = -1;
+                                            var side = PickForwardNamedRoad(pos, headingNow, usedRoads, route, -0.20f, out sideId);
+                                            if (side == null)
+                                                side = PickForwardNamedRoad(pos, headingNow, new HashSet<int>(), route, 0.15f, out sideId);
+                                            if (side != null && side.Count >= 8 && BradleyRouteSpan(side) >= 160f)
+                                            {
+                                                TrimBradleyYardTail(side);
+                                                route = side;
+                                                hopIndex = FirstAwayIndex(route, pos, 50f);
+                                                if (sideId >= 0) NoteBradleyUsedRoad(usedRoads, sideId);
+                                                lastPushHull = -1;
+                                                lastPushDest = -1;
+                                                stallEscalations = 0;
+                                                sameSnap = 0;
+                                                skipUntil = Time.realtimeSinceStartup + 20f;
+                                                lastMovedAt = Time.realtimeSinceStartup;
+                                                InstallBradleyFullPath(bradley, route, 0);
+                                                DebugLog($"Bradley stall-side {gridNow} road#{sideId} pts={route.Count} -> {PositionToGrid(route[route.Count - 1])}");
+                                                return;
+                                            }
+                                        }
+                                        if (stallEscalations >= 4)
+                                        {
+                                            if (NudgeBradleyAlongRoute(bradley, route, hullWp))
+                                            {
+                                                hopIndex = Mathf.Min(hullWp + 3, route.Count - 1);
+                                                lastPushHull = -1;
+                                                lastPushDest = -1;
+                                                sameSnap = 0;
+                                                skipUntil = Time.realtimeSinceStartup + 12f;
+                                                lastMovedAt = Time.realtimeSinceStartup;
+                                                InstallBradleyFullPathSkipping(bradley, route, hullWp, hopIndex);
+                                                DebugLog($"Bradley stall-nudge {gridNow} -> {PositionToGrid(route[hopIndex])} wp={hopIndex}/{route.Count}");
+                                                return;
+                                            }
+                                        }
+                                        int step = stallEscalations <= 1 ? 6 : 12;
+                                        int jump = Mathf.Min(hullWp + step, route.Count - 1);
+                                        int pick = jump;
+                                        for (int j = hullWp + 3; j <= jump; j++)
+                                        {
+                                            if (j >= route.Count) break;
+                                            if (!BradleyPointDry(route[j])) continue;
+                                            pick = j;
+                                        }
+                                        hopIndex = Mathf.Max(pick, hullWp + 3);
+                                        lastPushHull = hullWp;
+                                        lastPushDest = hopIndex;
+                                        sameSnap = 0;
+                                        skipUntil = Time.realtimeSinceStartup + 16f;
+                                        lastMovedAt = Time.realtimeSinceStartup;
+                                        InstallBradleyFullPathSkipping(bradley, route, hullWp, hopIndex);
+                                        DebugLog($"Bradley stall-skip {gridNow} e={stallEscalations} hull={hullWp} wp={hopIndex}/{route.Count} -> {PositionToGrid(route[hopIndex])}");
+                                        return;
+                                    }
+                                    stallEscalations = 0;
+                                    hopIndex = pushDest;
+                                    lastPushHull = hullWp;
+                                    lastPushDest = pushDest;
+                                    sameSnap = 0;
+                                    skipUntil = Time.realtimeSinceStartup + 16f;
+                                    InstallBradleyFullPath(bradley, route, hullWp);
+                                    DebugLog($"Bradley road-push {gridNow} hull={hullWp} dest={hopIndex}/{route.Count} -> {PositionToGrid(route[hopIndex])}");
+                                    return;
+                                }
+                                if (!spurReversed && hopIndex >= 6 && !midChain)
+                                {
+                                    var rev = new List<Vector3>(hopIndex + 1);
+                                    for (int ri = hopIndex; ri >= 0; ri--)
+                                        rev.Add(route[ri]);
+                                    if (rev.Count >= 8)
+                                    {
+                                        route = rev;
+                                        hopIndex = FirstAwayIndex(route, pos, 70f);
+                                        spurReversed = true;
+                                        pathEnded = false;
+                                        sameSnap = 0;
+                                        reinstalls = 0;
+                                        skipUntil = Time.realtimeSinceStartup + 45f;
+                                        InstallBradleyFullPath(bradley, route, hopIndex);
+                                        lastMovedAt = Time.realtimeSinceStartup;
+                                        DebugLog($"Bradley stall-backup reverse inbound {gridNow} start={hopIndex} -> {PositionToGrid(route[route.Count - 1])} pts={route.Count}");
+                                        return;
+                                    }
+                                }
+                            }
+                            bool leaveLot = nearPathEnd || ((harbor || yard) && !midChain) || (inLot && !midChain) || (sameSnap >= 4 && !midChain);
                             if (leaveLot)
                             {
                                 Vector3 heading = bradley.transform.forward;
@@ -7177,7 +9743,8 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                     heading = new Vector3(b.x - a.x, 0f, b.z - a.z);
                                 }
                                 int exitId = -1;
-                                List<Vector3> exit = PickForwardNamedRoad(pos, heading, new HashSet<int>(), null, -1f, out exitId);
+                                // prev=route blocks inbound U-turn; usedRoads blocks the last arm.
+                                List<Vector3> exit = PickForwardNamedRoad(pos, heading, usedRoads, route, -1f, out exitId);
                                 if (exit == null)
                                     exit = PickForwardNamedRoad(pos, heading, usedRoads, route, out exitId);
                                 if (exit != null && exit.Count >= 6)
@@ -7192,7 +9759,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                     InstallBradleyFullPath(bradley, route, 0);
                                     DebugLog($"Bradley monument-exit {gridNow} mon={monName} d={monDist:F0} road#{exitId} -> {PositionToGrid(route[route.Count - 1])}");
                                 }
-                                else if (!spurReversed)
+                                else if (!spurReversed && !nearPathEnd)
                                 {
                                     route.Reverse();
                                     hopIndex = FindNearestRouteIndex(route, pos);
@@ -7203,9 +9770,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                     reinstalls = 0;
                                     pathEnded = false;
                                     InstallBradleyFullPath(bradley, route, hopIndex);
-                                    DebugLog(inLot
-                                        ? $"Bradley lot-escape {gridNow} reverse inbound"
-                                        : $"Bradley reverse {gridNow} at road end wp={hopIndex}/{route.Count}");
+                                    DebugLog($"Bradley lot-escape {gridNow} reverse inbound");
                                 }
                                 else if (nearPathEnd)
                                 {
@@ -7221,10 +9786,23 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                             }
                             else if (reinstalls < 8)
                             {
+                                int hullWp = FindClosestRouteIndex(route, pos);
+                                hopIndex = Mathf.Max(hopIndex, hullWp);
+                                int skipTo = SkipBradleyCourtyardAhead(route, pos, hopIndex);
+                                if (skipTo > hopIndex + 2)
+                                {
+                                    hopIndex = skipTo;
+                                    DebugLog($"Bradley skip-yard {gridNow} dest={hopIndex}/{route.Count} -> {PositionToGrid(route[hopIndex])}");
+                                }
+                                if (hopIndex <= hullWp)
+                                    hopIndex = Mathf.Min(hullWp + 1, route.Count - 1);
+                                if (hullWp == lastInstallStart)
+                                    return;
                                 reinstalls++;
-                                hopIndex = Mathf.Min(snap + 1, route.Count - 1);
-                                InstallBradleyFullPath(bradley, route, hopIndex);
-                                DebugLog($"Bradley snap {gridNow} wp={hopIndex}/{route.Count} on-road mon={monName} d={monDist:F0}");
+                                lastInstallStart = hullWp;
+                                lastSnapWp = hullWp;
+                                InstallBradleyFullPath(bradley, route, hullWp);
+                                DebugLog($"Bradley snap {gridNow} hull={hullWp} dest={hopIndex}/{route.Count} on-road mon={monName} d={monDist:F0}");
                             }
                         }
 
@@ -7248,16 +9826,27 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                             if (next == null)
                                 next = PickForwardNamedRoad(pos, heading, usedRoads, route, out nextId);
                             if (next == null)
-                                next = PickForwardNamedRoad(pos, heading, new HashSet<int>(), null, -0.82f, out nextId);
+                            {
+                                // Keep prev=route so overlap rejects the inbound U-turn (J14→E9 on #3).
+                                next = PickForwardNamedRoad(pos, heading, new HashSet<int>(), route, -0.82f, out nextId);
+                            }
+                            if (next != null && next.Count >= 5)
+                            {
+                                TrimBradleyYardTail(next);
+                                if (next.Count < 5) next = null;
+                            }
+                            if (next != null && nextId >= 0 && usedRoads != null && usedRoads.Contains(nextId))
+                                next = null;
                             if (next != null && next.Count >= 5)
                             {
                                 route = next;
-                                hopIndex = 0;
+                                hopIndex = FirstAwayIndex(route, pos, 70f);
                                 if (nextId >= 0) NoteBradleyUsedRoad(usedRoads, nextId);
                                 spurReversed = false;
                                 pathEnded = false;
                                 DebugLog($"Bradley FORWARD road#{nextId} {gridNow} -> {PositionToGrid(route[route.Count - 1])} pts={route.Count}");
-                                InstallBradleyFullPath(bradley, route, 0);
+                                int hullFwd = FindClosestRouteIndex(route, pos);
+                                InstallBradleyFullPath(bradley, route, hullFwd);
                                 lastMovedAt = Time.realtimeSinceStartup;
                             }
                             else if (!spurReversed && IsBradleyMonumentSpur(pos, route))
@@ -7273,9 +9862,33 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                             }
                             else
                             {
-                                pathEnded = true;
-                                HoldBradleyHere(bradley, pos);
-                                DebugLog($"Bradley no forward road at {gridNow} — hold on asphalt (no off-road extend)");
+                                List<Vector3> backup = null;
+                                int backupId = -1;
+                                string viaGrid = "";
+                                if (backupJoins < 3
+                                    && TryBradleyBackupJunction(route, pos, usedRoads, out backup, out backupId, out viaGrid)
+                                    && backup != null && backup.Count >= 8)
+                                {
+                                    backupJoins++;
+                                    route = backup;
+                                    AdoptBradleyRoute(ref route);
+                                    hopIndex = FirstAwayIndex(route, pos, 55f);
+                                    if (backupId >= 0) NoteBradleyUsedRoad(usedRoads, backupId);
+                                    spurReversed = false;
+                                    pathEnded = false;
+                                    sameSnap = 0;
+                                    reinstalls = 0;
+                                    skipUntil = Time.realtimeSinceStartup + 45f;
+                                    InstallBradleyFullPath(bradley, route, 0);
+                                    lastMovedAt = Time.realtimeSinceStartup;
+                                    DebugLog($"Bradley backup-junction {gridNow} via {viaGrid} road#{backupId} -> {PositionToGrid(route[route.Count - 1])} pts={route.Count}");
+                                }
+                                else
+                                {
+                                    pathEnded = true;
+                                    HoldBradleyHere(bradley, pos);
+                                    DebugLog($"Bradley no forward road at {gridNow} — hold on asphalt (no off-road extend)");
+                                }
                             }
                         }
                     }
@@ -7335,6 +9948,21 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             return outPts;
         }
 
+        private static int FindClosestRouteIndex(List<Vector3> route, Vector3 pos)
+        {
+            int nearest = 0;
+            float best = float.MaxValue;
+            if (route == null || route.Count == 0) return 0;
+            for (int i = 0; i < route.Count; i++)
+            {
+                float dx = route[i].x - pos.x;
+                float dz = route[i].z - pos.z;
+                float d = dx * dx + dz * dz;
+                if (d < best) { best = d; nearest = i; }
+            }
+            return nearest;
+        }
+
         private static int FindNearestRouteIndex(List<Vector3> route, Vector3 pos)
         {
             int nearest = 0;
@@ -7370,6 +9998,503 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
         /// 1) RuntimePath + linked nodes + InstallPatrolPath when available
         /// 2) currentPath list + index + throttle + moveForceMax
         /// </summary>
+        /// <summary>
+        /// Keep the arterial. Drop only trailing nodes that sit in a courtyard / no-go lot.
+        /// Through-roads (launch, radtown) are left intact.
+        /// </summary>
+        private int StripBradleyYardInterior(List<Vector3> pts)
+        {
+            if (pts == null || pts.Count < 10) return 0;
+            int removed = 0;
+            for (int i = pts.Count - 2; i >= 1; i--)
+            {
+                float nd;
+                string nl = ClosestMonumentLabel(pts[i], out nd);
+                if (!IsCourtyardNearby(pts[i], 160f) && !(nd <= 170f && YardMonumentName(nl))) continue;
+                if (PointIsMonumentThroughKeep(pts[i])) continue;
+                pts.RemoveAt(i);
+                removed++;
+            }
+            return removed;
+        }
+
+        private bool WarpBradleyOutOfYard(BradleyAPC bradley, List<Vector3> route, MonumentScanEntry trap, int hullWp, out int destWp)
+        {
+            destWp = hullWp;
+            if (bradley == null || bradley.IsDestroyed || trap == null || route == null || route.Count < 4)
+                return false;
+            float r2 = (trap.Radius + 26f) * (trap.Radius + 26f);
+            int start = Mathf.Clamp(hullWp, 0, route.Count - 1);
+            int pick = -1;
+            for (int i = start + 2; i < route.Count; i++)
+            {
+                float dx = route[i].x - trap.X, dz = route[i].z - trap.Z;
+                if (dx * dx + dz * dz < r2) continue;
+                if (!BradleyPointDry(route[i])) continue;
+                pick = i;
+                break;
+            }
+            if (pick < 0) return false;
+            Vector3 dest = route[pick];
+            try { dest.y = TerrainMeta.HeightMap.GetHeight(dest) + 0.8f; }
+            catch { dest.y = bradley.transform.position.y; }
+            Vector3 look = dest;
+            if (pick + 1 < route.Count)
+                look = route[pick + 1];
+            Vector3 dir = new Vector3(look.x - dest.x, 0f, look.z - dest.z);
+            try
+            {
+                var rb = bradley.GetComponent<Rigidbody>();
+                if (rb != null)
+                {
+                    rb.velocity = Vector3.zero;
+                    rb.angularVelocity = Vector3.zero;
+                }
+            }
+            catch { }
+            try
+            {
+                bradley.transform.position = dest;
+                if (dir.sqrMagnitude > 0.05f)
+                    bradley.transform.rotation = Quaternion.LookRotation(dir.normalized, Vector3.up);
+            }
+            catch { return false; }
+            destWp = pick;
+            return true;
+        }
+
+        private int TrimBradleyYardTail(List<Vector3> pts)
+        {
+            if (pts == null || pts.Count < 4) return 0;
+            int cut = 0;
+            while (pts.Count > 8)
+            {
+                var last = pts[pts.Count - 1];
+                // Powerplant / launch / trainyard used to keep Kind=through
+                // so the seed highway was allowed to die inside S6.
+                float td;
+                string tl = ClosestMonumentLabel(last, out td);
+                bool yard = (IsCourtyardNearby(last, 180f) || (td <= 180f && YardMonumentName(tl)))
+                            && !PointIsMonumentThroughKeep(last);
+                bool lot = IsBradleyNoGoLot(last) && !PointIsMonumentThroughKeep(last);
+                if (!yard && !lot) break;
+                pts.RemoveAt(pts.Count - 1);
+                cut++;
+            }
+            return cut;
+        }
+
+        private static int FirstAwayIndex(List<Vector3> route, Vector3 pos, float minMeters)
+        {
+            if (route == null || route.Count < 2) return 0;
+            float min2 = minMeters * minMeters;
+            for (int i = 1; i < route.Count; i++)
+            {
+                float dx = route[i].x - pos.x;
+                float dz = route[i].z - pos.z;
+                if (dx * dx + dz * dz >= min2) return i;
+            }
+            return Mathf.Min(4, route.Count - 1);
+        }
+
+        /// <summary>
+        /// Keep hull node 0, jump dest as node 1, then the rest of the highway.
+        /// Avoids currentPath starting 80m ahead of a tank that cannot teleport.
+        /// </summary>
+        private void InstallBradleyFullPathSkipping(BradleyAPC bradley, List<Vector3> route, int hullWp, int destWp)
+        {
+            if (bradley == null || route == null || route.Count < 2) return;
+            hullWp = Mathf.Clamp(hullWp, 0, route.Count - 1);
+            destWp = Mathf.Clamp(destWp, hullWp, route.Count - 1);
+            if (destWp <= hullWp + 1)
+            {
+                InstallBradleyFullPath(bradley, route, hullWp);
+                return;
+            }
+            var slim = new List<Vector3>(route.Count - destWp + 2);
+            slim.Add(route[hullWp]);
+            slim.Add(route[destWp]);
+            for (int i = destWp + 1; i < route.Count; i++)
+                slim.Add(route[i]);
+            InstallBradleyFullPath(bradley, slim, 0);
+        }
+
+        /// <summary>
+        /// Slide the APC 18m along the painted highway when skip-ahead
+        /// still leaves it sitting in a pothole / substation apron.
+        /// </summary>
+        private void AttachBradleyUnstick(BradleyAPC bradley)
+        {
+            if (bradley == null || bradley.IsDestroyed) return;
+            try
+            {
+                var old = bradley.GetComponent<BradleyUnstick>();
+                if (old != null) UnityEngine.Object.Destroy(old);
+                var drive = bradley.gameObject.AddComponent<BradleyUnstick>();
+                drive.Owner = this;
+                drive.Apc = bradley;
+            }
+            catch (Exception ex)
+            {
+                DebugLog($"Bradley unstick attach: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// MonumentBradley recovery: one path, shove the hull. Do not rewrite the
+        /// highway when a modular car / plant apron pins the tank.
+        /// </summary>
+        private class BradleyUnstick : MonoBehaviour
+        {
+            public LiveStatsEvents Owner;
+            public BradleyAPC Apc;
+            private Vector3 _last;
+            private float _lastMove;
+            private float _recoverUntil;
+            private float _reverseUntil;
+            private float _nextScan;
+            private int _bursts;
+            private readonly List<Collider> _ignored = new List<Collider>();
+            private readonly Dictionary<Collider, float> _blocking = new Dictionary<Collider, float>();
+            private Collider[] _selfCols;
+            private System.Reflection.FieldInfo _throttle;
+            private System.Reflection.FieldInfo _force;
+            private float _forceOrig = 2000f;
+            private static readonly System.Reflection.BindingFlags BF = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+
+            private void Awake()
+            {
+                if (Apc == null) Apc = GetComponent<BradleyAPC>();
+                _last = transform.position;
+                _lastMove = Time.time;
+                try
+                {
+                    _selfCols = GetComponentsInChildren<Collider>();
+                    _throttle = typeof(BradleyAPC).GetField("throttle", BF);
+                    _force = typeof(BradleyAPC).GetField("moveForceMax", BF);
+                    if (_force != null && Apc != null)
+                        _forceOrig = (float)_force.GetValue(Apc);
+                }
+                catch { }
+            }
+
+            private void OnDestroy()
+            {
+                RestoreCollisions();
+                SetForce(_forceOrig);
+            }
+
+            // MonumentBradley: track what the hull is actually sitting on.
+            private void OnCollisionStay(Collision collision)
+            {
+                var c = collision != null ? collision.collider : null;
+                if (c == null || c.isTrigger || c is TerrainCollider) return;
+                if (_selfCols != null)
+                {
+                    for (int i = 0; i < _selfCols.Length; i++)
+                        if (_selfCols[i] == c) return;
+                }
+                _blocking[c] = Time.time;
+            }
+
+            private void OnCollisionEnter(Collision collision)
+            {
+                OnCollisionStay(collision);
+                if (Apc == null || collision == null) return;
+                try
+                {
+                    var go = collision.gameObject;
+                    if (go == null) return;
+                    var car = go.GetComponentInParent<ModularCar>();
+                    if (car != null && !car.IsDestroyed)
+                    {
+                        var rb = car.GetComponent<Rigidbody>();
+                        if (rb != null)
+                        {
+                            if (rb.IsSleeping()) rb.WakeUp();
+                            rb.AddForce((transform.forward + transform.right * 0.3f) * 80f, ForceMode.Acceleration);
+                        }
+                        try
+                        {
+                            var hit = new HitInfo(Apc, car, Rust.DamageType.Explosion, 80f, car.transform.position);
+                            hit.damageTypes.Add(Rust.DamageType.AntiVehicle, 40f);
+                            car.Hurt(hit);
+                        }
+                        catch { }
+                        if (Owner != null)
+                            Owner.DebugLog($"Bradley shove-car {Owner.PositionToGrid(transform.position)}");
+                        return;
+                    }
+                    var loot = go.GetComponentInParent<LootContainer>();
+                    if (loot != null && !(loot is HackableLockedCrate) && !(loot is SupplyDrop) && !loot.IsDestroyed)
+                    {
+                        var rb = loot.GetComponent<Rigidbody>();
+                        if (rb != null) rb.AddForce(transform.forward * 50f, ForceMode.Acceleration);
+                        else
+                        {
+                            try { loot.Die(new HitInfo(Apc, loot, Rust.DamageType.Blunt, 200f)); } catch { }
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            private void OnCollisionExit(Collision collision)
+            {
+                if (collision != null && collision.collider != null)
+                    _blocking.Remove(collision.collider);
+            }
+
+            private void FixedUpdate()
+            {
+                if (Apc == null || Apc.IsDestroyed)
+                {
+                    Destroy(this);
+                    return;
+                }
+
+                Vector3 pos = transform.position;
+                try
+                {
+                    if (TerrainMeta.HeightMap != null)
+                    {
+                        float gy = TerrainMeta.HeightMap.GetHeight(pos);
+                        if (pos.y < gy - 2f || pos.y < -20f)
+                        {
+                            pos.y = gy + 1.2f;
+                            transform.position = pos;
+                            var rbFix = Apc.GetComponent<Rigidbody>();
+                            if (rbFix != null)
+                            {
+                                rbFix.linearVelocity = Vector3.zero;
+                                rbFix.angularVelocity = Vector3.zero;
+                            }
+                            RestoreCollisions();
+                            _recoverUntil = 0f;
+                            _reverseUntil = 0f;
+                            _bursts = 4;
+                            if (Owner != null) Owner.DebugLog($"Bradley unstick-clamp {Owner.PositionToGrid(pos)} y={gy:F0}");
+                        }
+                    }
+                }
+                catch { }
+                float dx = pos.x - _last.x, dz = pos.z - _last.z;
+                if (dx * dx + dz * dz > 2.2f * 2.2f)
+                {
+                    _last = pos;
+                    _lastMove = Time.time;
+                    if (Time.time >= _recoverUntil && Time.time >= _reverseUntil)
+                        _bursts = 0;
+                }
+
+                if (Time.time < _reverseUntil)
+                {
+                    SetThrottle(-1f);
+                    PushBodies();
+                    return;
+                }
+
+                if (Time.time < _recoverUntil)
+                {
+                    SetThrottle(1f);
+                    SetForce(_forceOrig * 2.2f);
+                    var rb = Apc.GetComponent<Rigidbody>();
+                    if (rb != null && !rb.isKinematic && rb.linearVelocity.magnitude < 4.5f)
+                    {
+                        Vector3 dir = Vector3.ProjectOnPlane(transform.forward, Vector3.up).normalized;
+                        rb.AddForce(dir * 5f, ForceMode.Acceleration);
+                    }
+                    PushBodies();
+                    return;
+                }
+
+                if (Time.time >= _recoverUntil && _ignored.Count > 0)
+                {
+                    RestoreCollisions();
+                    SetForce(_forceOrig);
+                }
+
+                if (Time.time - _lastMove < 12f) return;
+                if (_bursts >= 4) return;
+                _bursts++;
+                _lastMove = Time.time;
+                if ((_bursts % 2) == 0)
+                {
+                    _reverseUntil = Time.time + 2.4f;
+                    SetThrottle(-1f);
+                    if (Owner != null)
+                        Owner.DebugLog($"Bradley unstick-reverse {Owner.PositionToGrid(pos)} burst={_bursts}");
+                }
+                else
+                {
+                    IgnoreNearby();
+                    IgnoreBlockingContacts();
+                    _recoverUntil = Time.time + 5f;
+                    SetThrottle(1f);
+                    SetForce(_forceOrig * 2.2f);
+                    if (Owner != null)
+                        Owner.DebugLog($"Bradley unstick-push {Owner.PositionToGrid(pos)} burst={_bursts}");
+                }
+            }
+
+            private void SetThrottle(float v)
+            {
+                try
+                {
+                    if (_throttle != null && Apc != null)
+                        _throttle.SetValue(Apc, v);
+                    foreach (var n in new[] { "leftThrottle", "rightThrottle" })
+                    {
+                        var f = typeof(BradleyAPC).GetField(n, BF);
+                        if (f != null) f.SetValue(Apc, v);
+                    }
+                }
+                catch { }
+            }
+
+            private void SetForce(float v)
+            {
+                try
+                {
+                    if (_force != null && Apc != null)
+                        _force.SetValue(Apc, v);
+                }
+                catch { }
+            }
+
+            private void PushBodies()
+            {
+                if (Time.time < _nextScan) return;
+                _nextScan = Time.time + 0.35f;
+                try
+                {
+                    var hits = Physics.OverlapSphere(transform.position, 8f, ~0, QueryTriggerInteraction.Ignore);
+                    Vector3 fwd = transform.forward;
+                    foreach (var h in hits)
+                    {
+                        if (h == null) continue;
+                        var rb = h.attachedRigidbody;
+                        if (rb == null || rb.transform == transform) continue;
+                        if (rb.isKinematic) continue;
+                        rb.AddForce((fwd + transform.right) * 40f, ForceMode.Acceleration);
+                    }
+                }
+                catch { }
+            }
+
+            private void IgnoreNearby()
+            {
+                RestoreCollisions();
+                if (_selfCols == null) return;
+                try
+                {
+                    var hits = Physics.OverlapSphere(transform.position, 7f, ~0, QueryTriggerInteraction.Ignore);
+                    foreach (var h in hits)
+                    {
+                        if (h == null || h.transform.root == transform.root) continue;
+                        string n = (h.name ?? "") + " " + (h.transform.root.name ?? "");
+                        n = n.ToLowerInvariant();
+                        bool veh = n.IndexOf("module", StringComparison.Ordinal) >= 0
+                            || n.IndexOf("vehicle", StringComparison.Ordinal) >= 0
+                            || n.IndexOf("sedan", StringComparison.Ordinal) >= 0
+                            || n.IndexOf("bike", StringComparison.Ordinal) >= 0
+                            || n.IndexOf("snowmobile", StringComparison.Ordinal) >= 0
+                            || n.IndexOf("pedal", StringComparison.Ordinal) >= 0
+                            || n.IndexOf("rhib", StringComparison.Ordinal) >= 0;
+                        if (!veh) continue;
+                        foreach (var c in _selfCols)
+                        {
+                            if (c == null) continue;
+                            Physics.IgnoreCollision(c, h, true);
+                        }
+                        _ignored.Add(h);
+                    }
+                }
+                catch { }
+            }
+
+            private void IgnoreBlockingContacts()
+            {
+                if (_selfCols == null) return;
+                float now = Time.time;
+                var keys = new List<Collider>(_blocking.Keys);
+                foreach (var h in keys)
+                {
+                    if (h == null)
+                    {
+                        _blocking.Remove(h);
+                        continue;
+                    }
+                    float t;
+                    if (!_blocking.TryGetValue(h, out t) || now - t > 1.5f) continue;
+                    foreach (var c in _selfCols)
+                    {
+                        if (c == null || c.isTrigger) continue;
+                        try { Physics.IgnoreCollision(c, h, true); } catch { }
+                    }
+                    if (!_ignored.Contains(h)) _ignored.Add(h);
+                }
+            }
+
+            private void RestoreCollisions()
+            {
+                if (_selfCols == null || _ignored.Count == 0)
+                {
+                    _ignored.Clear();
+                    return;
+                }
+                foreach (var h in _ignored)
+                {
+                    if (h == null) continue;
+                    foreach (var c in _selfCols)
+                    {
+                        if (c == null) continue;
+                        try { Physics.IgnoreCollision(c, h, false); } catch { }
+                    }
+                }
+                _ignored.Clear();
+            }
+        }
+
+        private bool NudgeBradleyAlongRoute(BradleyAPC bradley, List<Vector3> route, int hullWp)
+        {
+            if (bradley == null || bradley.IsDestroyed || route == null || route.Count < 3)
+                return false;
+            hullWp = Mathf.Clamp(hullWp, 0, route.Count - 2);
+            Vector3 pos = bradley.transform.position;
+            Vector3 tgt = route[Mathf.Min(hullWp + 3, route.Count - 1)];
+            Vector3 dir = new Vector3(tgt.x - pos.x, 0f, tgt.z - pos.z);
+            if (dir.sqrMagnitude < 9f)
+            {
+                tgt = route[Mathf.Min(hullWp + 6, route.Count - 1)];
+                dir = new Vector3(tgt.x - pos.x, 0f, tgt.z - pos.z);
+            }
+            if (dir.sqrMagnitude < 4f) return false;
+            dir.Normalize();
+            Vector3 dest = pos + dir * 18f;
+            if (!BradleyPointDry(dest)) return false;
+            try { dest.y = TerrainMeta.HeightMap.GetHeight(dest) + 0.7f; }
+            catch { dest.y = pos.y; }
+            try
+            {
+                var rb = bradley.GetComponent<Rigidbody>();
+                if (rb != null)
+                {
+                    rb.velocity = Vector3.zero;
+                    rb.angularVelocity = Vector3.zero;
+                }
+            }
+            catch { }
+            try
+            {
+                bradley.transform.position = dest;
+                if (dir.sqrMagnitude > 0.01f)
+                    bradley.transform.rotation = Quaternion.LookRotation(dir, Vector3.up);
+            }
+            catch { return false; }
+            return true;
+        }
+
         private void InstallBradleyFullPath(BradleyAPC bradley, List<Vector3> route, int startIndex)
         {
             if (bradley == null || bradley.IsDestroyed || route == null || route.Count == 0) return;
@@ -9340,7 +12465,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
 
             // reload + status must work even when the event system is not running
             // (e.g. Enabled=false or LiveStatsWorld missing) so admins can fix it
-            if (sub != "reload" && sub != "status" && !_ready)
+            if (sub != "reload" && sub != "status" && sub != "monbake" && sub != "bake" && !_ready)
             {
                 SendReply(player, Msg("WorldRequired", player?.UserIDString));
                 return;
@@ -9364,6 +12489,11 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                     }
                     else
                         SendActiveEventEntities(player);
+                    break;
+                case "monbake":
+                case "bake":
+                    ForceRebuildMonumentBaker();
+                    SendReply(player, "Monument skeleton baker rebuilt (" + MonumentScanVersion + " / " + BradleyPathVersion + "). Check oxide/data/LiveStatsMonuments.json and LiveStatsBradleyPaths.json.");
                     break;
                 case "reload":
                     LoadConfig();
@@ -10305,7 +13435,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 ["ConfigReloadedDisabled"] = "Config reloaded. Events are disabled in config (Enabled = false).",
                 ["StatusStopped"] = "Event system is stopped (Enabled = false in config). Use /event reload after enabling.",
                 ["UnknownEvent"] = "Unknown event type. See /event for full list.",
-                ["UsageEvent"] = "Usage: /event <supplydrop|cargo|heli|chinook|bradley|attackheli|tugboat|balloon|heavies|hackablecrate|sub|scrapheli|mini|ambush|tunnel|subway|mine|peacekeepers|raid|airfield|f15|status|reload>",
+                ["UsageEvent"] = "Usage: /event <supplydrop|cargo|heli|chinook|bradley|attackheli|tugboat|balloon|heavies|hackablecrate|sub|scrapheli|mini|ambush|tunnel|subway|mine|peacekeepers|raid|airfield|f15|status|reload|monbake>",
                 ["ForcedEvent"] = "Forced event: {0}",
                 ["StatusEnabled"] = "Events Enabled: {0}",
                 ["StatusMode"] = "Mode: {0}",
