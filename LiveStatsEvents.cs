@@ -11,7 +11,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.161")]
+    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.167")]
     [Description("Core event scheduler + classic world events (Cargo, Airdrop, Heli, Chinook, Bradley, F-15, Hackable). Requires LiveStatsWorld. NPC events require LiveStatsEventsNPC. Vehicle events+despawn require LiveStatsEventsVehicles. Configs: core owns schedule + classic events; LiveStatsEventsNPC owns NPC behavior; LiveStatsEventsVehicles owns vehicle limits/despawn.")]
     class LiveStatsEvents : RustPlugin
     {
@@ -306,7 +306,7 @@ namespace Oxide.Plugins
             permission.RegisterPermission(AdminPermission, this);
             // Do NOT register livestats.admin / livestatsworld.admin – those belong to other plugins.
             LoadDefaultMessages();
-            Puts("LiveStatsEvents v1.13.161 — skip-pin must leave the lot; no junkyard splice");
+            Puts("LiveStatsEvents v1.13.167 — radtown gate jump, blocked highway dropped");
             // Earliest possible vanilla gate — EventSchedule may queue before OnServerInitialized
             EarlyVanillaSuppress();
         }
@@ -2131,8 +2131,19 @@ namespace Oxide.Plugins
                             var flags = System.Reflection.BindingFlags.Instance
                                       | System.Reflection.BindingFlags.Public
                                       | System.Reflection.BindingFlags.NonPublic;
-                            typeof(CargoShip).GetMethod("RefreshCurrentPosition", flags)?.Invoke(cargo, null);
-                            DebugLog($"CargoShip snapped to {PositionToGrid(pos)} for ocean path");
+                            DebugLog($"CargoShip ingress hold at {PositionToGrid(cargo.transform.position)} (no path snap)");
+                            var cargoHold = cargo;
+                            var holdPos = pos;
+                            timer.Once(18f, () =>
+                            {
+                                try
+                                {
+                                    if (cargoHold == null || cargoHold.IsDestroyed) return;
+                                    typeof(CargoShip).GetMethod("RefreshCurrentPosition", flags)?.Invoke(cargoHold, null);
+                                    DebugLog($"CargoShip joined ocean path at {PositionToGrid(cargoHold.transform.position)}");
+                                }
+                                catch { }
+                            });
                         }
                     }
                     catch (Exception ex)
@@ -2307,7 +2318,7 @@ namespace Oxide.Plugins
             {
                 Vector3 p = pool[i];
                 float r = Mathf.Sqrt(p.x * p.x + p.z * p.z);
-                if (r < halfMap * 0.50f || r > halfMap * 1.15f) continue;
+                if (r < halfMap * 0.88f || r > halfMap * 1.25f) continue;
                 float water = 0f;
                 try { if (TerrainMeta.WaterMap != null) water = TerrainMeta.WaterMap.GetHeight(p); } catch { }
                 if (water < -20f || water > 80f) water = 0f;
@@ -2315,8 +2326,31 @@ namespace Oxide.Plugins
                 usable.Add(p);
             }
             if (usable.Count < 3) usable = pool;
-            result = usable[UnityEngine.Random.Range(0, usable.Count)];
-            DebugLog($"Cargo ocean PATH node {PositionToGrid(result)} pool={usable.Count}/{pool.Count}");
+            Vector3 best = usable[0];
+            float bestR = -1f;
+            for (int i = 0; i < usable.Count; i++)
+            {
+                float rr = Mathf.Sqrt(usable[i].x * usable[i].x + usable[i].z * usable[i].z);
+                if (rr > bestR) { bestR = rr; best = usable[i]; }
+            }
+            Vector3 dir = new Vector3(best.x, 0f, best.z);
+            if (dir.sqrMagnitude < 1f) dir = Vector3.forward;
+            dir.Normalize();
+            // Past the terrain square so the hull is not sitting on a Deep Sea map tile.
+            float ax = Mathf.Abs(dir.x), az = Mathf.Abs(dir.z);
+            float denom = Mathf.Max(ax, az);
+            if (denom < 0.05f) denom = 1f;
+            float margin = 640f;
+            result = dir * ((halfMap + margin) / denom);
+            if (Mathf.Abs(result.x) < halfMap + 400f && Mathf.Abs(result.z) < halfMap + 400f)
+            {
+                if (Mathf.Abs(result.x) >= Mathf.Abs(result.z))
+                    result.x = Mathf.Sign(result.x == 0f ? 1f : result.x) * (halfMap + margin);
+                else
+                    result.z = Mathf.Sign(result.z == 0f ? 1f : result.z) * (halfMap + margin);
+            }
+            result.y = best.y > 0.5f ? best.y : 1.5f;
+            DebugLog($"Cargo ocean PATH node {PositionToGrid(best)} -> offmap {PositionToGrid(result)} ({result.x:F0},{result.z:F0}) half={halfMap:F0} pool={usable.Count}/{pool.Count}");
             return true;
         }
 
@@ -3043,17 +3077,9 @@ namespace Oxide.Plugins
 
                         if (off || nearRim)
                         {
-                            SnapHeliToMapEdgeToward(heliAI, interest, cruise);
-                            Vector3 after = heliAI.helicopterBase.transform.position;
-                            if (IsDeepSeaOrOffMap(after) || new Vector3(after.x, 0f, after.z).magnitude > half * 0.90f)
-                            {
-                                Vector3 fix = spawnAt;
-                                fix.y = Mathf.Max(GetHeliCruiseAltitude(fix, cruise), 120f);
-                                heliAI.helicopterBase.transform.position = fix;
-                                try { heliAI.helicopterBase.TransformChanged(); } catch { }
-                            }
+                            // Ingress: stay off-map and fly toward interest. Do not snap inland.
                             ForceHeliLandInterest(heliAI, interest, forceMove: true);
-                            DebugLog($"PatrolHeli spawn-lock @{d:F1}s {(off ? "OFFMAP" : "RIM")} -> {PositionToGrid(heliAI.helicopterBase.transform.position)}");
+                            DebugLog($"PatrolHeli ingress @{d:F1}s {PositionToGrid(p)} -> {PositionToGrid(interest)}");
                         }
                         else if (low)
                         {
@@ -3150,6 +3176,23 @@ namespace Oxide.Plugins
         /// Spawn just outside the map boundary on the SAME side as the interest.
         /// Opposite-side approach forces a full-map deep-sea crossing (heli never arrives).
         /// </summary>
+        private Vector3 GetMapRimEntry(Vector3 toward, float cruiseAlt)
+        {
+            float half = 2000f;
+            try { half = TerrainMeta.Size.x * 0.5f; } catch { }
+            Vector3 flat = new Vector3(toward.x, 0f, toward.z);
+            if (flat.sqrMagnitude < 1f)
+                flat = new Vector3(UnityEngine.Random.Range(-1f, 1f), 0f, UnityEngine.Random.Range(-1f, 1f));
+            flat.Normalize();
+            Vector3 rim = flat * (half * 0.96f);
+            rim.y = Mathf.Max(GetHeliCruiseAltitude(rim, cruiseAlt), 130f);
+            return rim;
+        }
+
+        /// <summary>
+        /// True off-map approach on the SAME side as the interest, then fly/sail in.
+        /// Inland 0.70–0.82 spawn made cargo/heli/chinook pop over the playable grid.
+        /// </summary>
         private Vector3 GetMapEdgeApproach(Vector3 toward, float cruiseAlt)
         {
             float half = 2000f;
@@ -3160,22 +3203,23 @@ namespace Oxide.Plugins
                 flat = new Vector3(UnityEngine.Random.Range(-1f, 1f), 0f, UnityEngine.Random.Range(-1f, 1f));
             flat.Normalize();
 
-            // Spawn further inland so AI has less chance to latch onto ocean-path nodes.
-            // 0.82–0.90 still produced frequent 1s OFFMAP snaps in 1.7.3 logs.
-            float edgeDist = half * UnityEngine.Random.Range(0.70f, 0.82f);
-            Vector3 edge = flat * edgeDist;
-
-            // Slight lateral offset so approach isn't a perfect radial line
+            // Square edge, not radius. 1.22*half still lands in a corner (A21).
+            float margin = UnityEngine.Random.Range(520f, 780f);
+            float ax = Mathf.Abs(flat.x), az = Mathf.Abs(flat.z);
+            float denom = Mathf.Max(ax, az);
+            if (denom < 0.05f) denom = 1f;
+            Vector3 edge = flat * ((half + margin) / denom);
             Vector3 perp = new Vector3(-flat.z, 0f, flat.x);
-            edge += perp * UnityEngine.Random.Range(-180f, 180f);
-
-            // Clamp well inside the playable rim
-            float limit = half * 0.80f;
-            edge.x = Mathf.Clamp(edge.x, -limit, limit);
-            edge.z = Mathf.Clamp(edge.z, -limit, limit);
-
-            edge.y = GetHeliCruiseAltitude(edge, cruiseAlt);
-            edge.y = Mathf.Max(edge.y, 120f);
+            edge += perp * UnityEngine.Random.Range(-160f, 160f);
+            // Keep the exit axis outside the square after the lateral nudge.
+            if (Mathf.Abs(edge.x) < half + 280f && Mathf.Abs(edge.z) < half + 280f)
+            {
+                if (Mathf.Abs(edge.x) >= Mathf.Abs(edge.z))
+                    edge.x = Mathf.Sign(edge.x == 0f ? 1f : edge.x) * (half + margin);
+                else
+                    edge.z = Mathf.Sign(edge.z == 0f ? 1f : edge.z) * (half + margin);
+            }
+            edge.y = Mathf.Max(GetHeliCruiseAltitude(edge, cruiseAlt), 140f);
             return edge;
         }
 
@@ -3789,7 +3833,11 @@ namespace Oxide.Plugins
                     bool off = IsDeepSeaOrOffMap(pos);
                     bool low = pos.y < 70f;
 
-                    if (off && (now - lastRecovery) >= 25f)
+                    if (off && age < 80f)
+                    {
+                        // Still crossing the rim — do not teleport over the grid.
+                    }
+                    else if (off && (now - lastRecovery) >= 25f)
                     {
                         lastRecovery = now;
                         offMapRecoveryCount++;
@@ -4289,35 +4337,10 @@ namespace Oxide.Plugins
             GetChinookInboundPosition(out flyToward);
             float cruise = Mathf.Max(90f, config.ChinookPatrol != null ? config.ChinookPatrol.CruiseAltitude : 110f);
             Vector3 pos = GetMapEdgeApproach(flyToward, cruise);
-            try
-            {
-                Vector3 inward = flyToward;
-                inward.y = 0f;
-                if (inward.sqrMagnitude < 1f) inward = Vector3.forward;
-                inward.Normalize();
-                // Opposite rim from the interest so the bird flies across the map
-                float half = GetWorldHalf();
-                Vector3 edge = -inward * (half * 0.92f);
-                for (int i = 0; i < 8; i++)
-                {
-                    float r = half * (0.92f - i * 0.03f);
-                    Vector3 cand = -inward * r;
-                    if (IsDeepSeaOrOffMap(cand)) continue;
-                    if (IsOverWater(cand) || i >= 5)
-                    {
-                        edge = cand;
-                        break;
-                    }
-                }
-                float limit = half * 0.94f;
-                edge.x = Mathf.Clamp(edge.x, -limit, limit);
-                edge.z = Mathf.Clamp(edge.z, -limit, limit);
-                edge.y = GetHeliCruiseAltitude(edge, cruise);
-                pos = edge;
-            }
-            catch { }
+            pos.y = Mathf.Max(pos.y, cruise, 140f);
 
             DebugLog($"Chinook vanilla inbound at {PositionToGrid(pos)} ({pos.x:F0}, {pos.y:F0}, {pos.z:F0}) -> interest {PositionToGrid(flyToward)}");
+            Vector3 chinookIngress = pos;
 
             CH47HelicopterAIController ch47 = null;
             try
@@ -4348,37 +4371,11 @@ namespace Oxide.Plugins
                 InvalidateEntityCache();
                 Vector3 hull = ch47.transform.position;
                 Puts($"[Events] Chinook ingress {PositionToGrid(hull)} ({hull.x:F0},{hull.z:F0}) -> {PositionToGrid(flyToward)}");
-                if (IsDeepSeaOrOffMap(hull))
-                {
-                    Puts("[Events] Chinook hull opened off-map — killing and using map-center spawn");
-                    try { ch47.Kill(); } catch { }
-                    ch47 = null;
-                    float halfC = 2000f;
-                    try { halfC = TerrainMeta.Size.x * 0.5f; } catch { }
-                    pos = new Vector3(0f, 0f, 0f);
-                    pos.y = GetHeliCruiseAltitude(pos, cruise);
-                    var ent2 = GameManager.server.CreateEntity(
-                        "assets/prefabs/npc/ch47/ch47scientists.entity.prefab", pos, Quaternion.identity, true);
-                    ch47 = ent2 as CH47HelicopterAIController;
-                    if (ch47 == null)
-                    {
-                        try { if (ent2 != null) ent2.Kill(); } catch { }
-                        return false;
-                    }
-                    ch47.Spawn();
-                    hull = ch47.transform.position;
-                    Puts($"[Events] Chinook retry hull {PositionToGrid(hull)} ({hull.x:F0},{hull.z:F0})");
-                    if (IsDeepSeaOrOffMap(hull))
-                    {
-                        Puts("[Events] Chinook retry still off-map — abort spawn");
-                        try { ch47.Kill(); } catch { }
-                        return false;
-                    }
-                }
+                // Off-map hull is the ingress — do not recenter over the grid.
 
                 // Only respawn if the hull is truly in the void / under-map
                 Vector3 spawnedAt = ch47.transform.position;
-                if (IsDeepSeaOrOffMap(spawnedAt) || spawnedAt.y < -30f || spawnedAt.y > 800f)
+                if (spawnedAt.y < -30f || spawnedAt.y > 800f)
                 {
                     DebugLog($"Chinook void spawn at {PositionToGrid(spawnedAt)} — border respawn");
                     try { ch47.Kill(); } catch { }
@@ -4403,6 +4400,32 @@ namespace Oxide.Plugins
 
                 try { ch47.SetMoveTarget(flyToward); } catch { }
                 DebugLog("Chinook vanilla AI — one inbound target, then brain owns flight");
+                var holdBird = ch47;
+                var holdPos = chinookIngress;
+                holdPos.y = Mathf.Max(holdPos.y, 140f);
+                foreach (float d in new[] { 0.2f, 0.8f, 2.0f, 4.0f })
+                {
+                    float delay = d;
+                    timer.Once(delay, () =>
+                    {
+                        try
+                        {
+                            if (holdBird == null || holdBird.IsDestroyed) return;
+                            Vector3 now = holdBird.transform.position;
+                            float halfH = 2000f;
+                            try { halfH = TerrainMeta.Size.x * 0.5f; } catch { }
+                            bool inside = Mathf.Abs(now.x) < halfH + 200f && Mathf.Abs(now.z) < halfH + 200f;
+                            if (inside)
+                            {
+                                holdBird.transform.position = holdPos;
+                                try { holdBird.TransformChanged(); } catch { }
+                                try { holdBird.SetMoveTarget(flyToward); } catch { }
+                                DebugLog($"Chinook ingress-hold @{delay:F1}s back to {PositionToGrid(holdPos)}");
+                            }
+                        }
+                        catch { }
+                    });
+                }
             }
             catch (Exception ex)
             {
@@ -4453,25 +4476,13 @@ namespace Oxide.Plugins
             float cruiseY = Mathf.Clamp(Mathf.Max(groundTarget + 110f, 140f), 140f, 260f);
             flyToward.y = cruiseY;
 
-            Vector3 offset = new Vector3(
-                UnityEngine.Random.Range(-1f, 1f), 0f, UnityEngine.Random.Range(-1f, 1f));
-            if (offset.sqrMagnitude < 0.01f) offset = Vector3.forward;
-            offset.Normalize();
-
             float halfSafe = 1600f;
             try { halfSafe = TerrainMeta.Size.x * 0.5f * 0.62f; } catch { }
             flyToward.x = Mathf.Clamp(flyToward.x, -halfSafe, halfSafe);
             flyToward.z = Mathf.Clamp(flyToward.z, -halfSafe, halfSafe);
 
-            Vector3 pos = flyToward + offset * UnityEngine.Random.Range(280f, 420f);
-            pos.x = Mathf.Clamp(pos.x, -halfSafe, halfSafe);
-            pos.z = Mathf.Clamp(pos.z, -halfSafe, halfSafe);
-            float ground = 0f;
-            try { ground = TerrainMeta.HeightMap.GetHeight(pos); } catch { }
-            // Spawn near the same cruise altitude as the fly target (±20m) so the first
-            // leg is mostly lateral, not a vertical pop.
-            float spawnY = Mathf.Clamp(Mathf.Max(ground + 110f, cruiseY + UnityEngine.Random.Range(-15f, 20f)), 140f, 280f);
-            pos.y = spawnY;
+            Vector3 pos = GetMapEdgeApproach(flyToward, cruiseY);
+            pos.y = cruiseY;
             return pos;
         }
 
@@ -4669,7 +4680,7 @@ namespace Oxide.Plugins
                 bool hardVoid = p.y < -30f || p.y > 800f;
                 float half = GetWorldHalf();
                 bool pastWorld = Mathf.Abs(p.x) > half + 250f || Mathf.Abs(p.z) > half + 250f;
-                if (hardVoid || pastWorld)
+                if ((hardVoid || pastWorld) && age >= 90f)
                 {
                     if (voidSince < 0f) voidSince = now;
                     if (now - voidSince >= 30f)
@@ -6669,6 +6680,9 @@ namespace Oxide.Plugins
 
         private List<Vector3> GetMonumentDriveLane(MonumentScanEntry e)
         {
+            // Painted road through the lot beats a Razor/template ring (radtown via=tpl went around).
+            var thru = ClipThroughRoadLane(e);
+            if (LaneHasTwoGates(thru)) return thru;
             var razor = GetRazorLaneWorld(e);
             if (razor.Count >= 8) return razor;
             var tpl = GetPrefabTemplateLane(e);
@@ -6877,6 +6891,16 @@ namespace Oxide.Plugins
                 }
                 // 156 trainyard I8→H8 lane=9 was the rim, not the inner road.
                 string pref = (mon.Prefab ?? "") + " " + (mon.Name ?? "");
+                bool blockedHighway = pref.IndexOf("radtown", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (blockedHighway && last > first)
+                {
+                    // Highway is the only road and it dies inside the lot. Drop the interior
+                    // nodes so the route is entry stub -> exit stub. Tick warps the hull across.
+                    int drop = last - first + 1;
+                    chain.RemoveRange(first, drop);
+                    DebugLog($"Bradley radtown-bridge {mon.Prefab} {PositionToGrid(chain[Mathf.Max(0, first - 1)])} -> {PositionToGrid(chain[Mathf.Min(chain.Count - 1, first)])} dropped={drop}");
+                    continue;
+                }
                 bool noTankLot = pref.IndexOf("junkyard", StringComparison.OrdinalIgnoreCase) >= 0
                                  || pref.IndexOf("excavator", StringComparison.OrdinalIgnoreCase) >= 0;
                 if (noTankLot || arc.Count < 12 || span < 70f)
@@ -6888,7 +6912,8 @@ namespace Oxide.Plugins
                 chain.RemoveRange(first, last - first + 1);
                 chain.InsertRange(first, arc);
                 spliced++;
-                DebugLog($"Bradley splice {mon.Prefab} {PositionToGrid(chain[inIdx])} -> {PositionToGrid(arc[arc.Count - 1])} lane={arc.Count} via={(GetRazorLaneWorld(mon).Count >= 8 ? "razor" : "tpl")}");
+                string via = LaneHasTwoGates(ClipThroughRoadLane(mon)) ? "road" : (GetRazorLaneWorld(mon).Count >= 8 ? "razor" : "tpl");
+                DebugLog($"Bradley splice {mon.Prefab} {PositionToGrid(chain[inIdx])} -> {PositionToGrid(arc[arc.Count - 1])} lane={arc.Count} via={via}");
             }
             return spliced;
         }
@@ -9490,6 +9515,38 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
 
                             float monDist;
                             string monName = ClosestMonumentLabel(pos, out monDist);
+                            if ((monName ?? "").IndexOf("radtown", StringComparison.OrdinalIgnoreCase) >= 0
+                                && monDist < 140f && hopIndex < route.Count - 2)
+                            {
+                                int gate = -1;
+                                for (int k = hopIndex + 1; k < route.Count; k++)
+                                {
+                                    float mx = route[k].x - pos.x, mz = route[k].z - pos.z;
+                                    if (mx * mx + mz * mz < 110f * 110f) continue;
+                                    if (!BradleyPointDry(route[k])) continue;
+                                    gate = k;
+                                    break;
+                                }
+                                if (gate > hopIndex)
+                                {
+                                    hopIndex = gate;
+                                    sameSnap = 0;
+                                    skipUntil = Time.realtimeSinceStartup + 12f;
+                                    lastMovedAt = Time.realtimeSinceStartup;
+                                    try
+                                    {
+                                        Vector3 w = route[hopIndex];
+                                        w.y = TerrainMeta.HeightMap != null ? TerrainMeta.HeightMap.GetHeight(w) + 1.2f : w.y;
+                                        bradley.transform.position = w;
+                                        var wrb = bradley.GetComponent<Rigidbody>();
+                                        if (wrb != null) wrb.linearVelocity = Vector3.zero;
+                                    }
+                                    catch { }
+                                    InstallBradleyFullPathSkipping(bradley, route, Mathf.Max(0, hopIndex - 1), hopIndex);
+                                    DebugLog($"Bradley radtown-jump {gridNow} -> {PositionToGrid(route[hopIndex])} wp={hopIndex}/{route.Count}");
+                                    return;
+                                }
+                            }
                             bool roadside = BradleySkipLotName((monName ?? "").ToLowerInvariant());
                             if (roadside) monDist = 9999f;
                             bool harbor = !roadside && (IsHarborLot(pos) || HarborLotName((monName ?? "").ToLowerInvariant()));
@@ -9563,6 +9620,12 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                 int hullWp = FindClosestRouteIndex(route, pos);
                                 int jump = Mathf.Min(hullWp + 12, route.Count - 1);
                                 var pinMon = FindMonumentScanAt(pos);
+                                if (pinMon != null)
+                                {
+                                    string pn = ((pinMon.Prefab ?? "") + " " + (pinMon.Name ?? "")).ToLowerInvariant();
+                                    if (pn.Contains("swamp") || string.Equals(pinMon.Kind, "skip", StringComparison.OrdinalIgnoreCase))
+                                        pinMon = null;
+                                }
                                 float need = 90f;
                                 if (pinMon != null) need = Mathf.Max(need, pinMon.Radius + 24f);
                                 for (int k = hullWp + 3; k < route.Count; k++)
