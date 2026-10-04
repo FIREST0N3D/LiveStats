@@ -11,7 +11,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.173")]
+    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.176")]
     [Description("Core event scheduler + classic world events (Cargo, Airdrop, Heli, Chinook, Bradley, F-15, Hackable). Requires LiveStatsWorld. NPC events require LiveStatsEventsNPC. Vehicle events+despawn require LiveStatsEventsVehicles. Configs: core owns schedule + classic events; LiveStatsEventsNPC owns NPC behavior; LiveStatsEventsVehicles owns vehicle limits/despawn.")]
     class LiveStatsEvents : RustPlugin
     {
@@ -306,7 +306,7 @@ namespace Oxide.Plugins
             permission.RegisterPermission(AdminPermission, this);
             // Do NOT register livestats.admin / livestatsworld.admin – those belong to other plugins.
             LoadDefaultMessages();
-            Puts("LiveStatsEvents v1.13.173 — off-road skirt around blocked lots, no hull warp");
+            Puts("LiveStatsEvents v1.13.176 — highway only, no Razor loop, no skirt");
             // Earliest possible vanilla gate — EventSchedule may queue before OnServerInitialized
             EarlyVanillaSuppress();
         }
@@ -6904,25 +6904,13 @@ namespace Oxide.Plugins
                     || pref.IndexOf("outpost", StringComparison.OrdinalIgnoreCase) >= 0;
                 if (blockedLot && last > first)
                 {
-                    var skirt = BuildOffroadSkirt(chain[inIdx], chain[outIdx], mon.X, mon.Z, r + 18f);
-                    int drop = last - first + 1;
+                    int drop = chain.Count - first;
                     chain.RemoveRange(first, drop);
-                    if (skirt.Count >= 3)
-                        chain.InsertRange(first, skirt);
-                    DebugLog($"Bradley offroad-pass {mon.Prefab} {PositionToGrid(chain[inIdx])} -> {PositionToGrid(chain[Mathf.Min(chain.Count - 1, first + skirt.Count)])} skirt={skirt.Count} dropped={drop}");
+                    DebugLog($"Bradley highway-cut {mon.Prefab} ends {PositionToGrid(chain[Mathf.Max(0, chain.Count - 1)])} dropped={drop}");
                     continue;
                 }
-                if (arc.Count < 12 || span < 70f)
-                {
-                    DebugLog($"Bradley splice-skip {mon.Prefab} lane={arc.Count} span={span:F0}m (keep highway)");
-                    continue;
-                }
-                // Drop first/last arc points that duplicate the highway stubs.
-                chain.RemoveRange(first, last - first + 1);
-                chain.InsertRange(first, arc);
-                spliced++;
-                string via = LaneHasTwoGates(ClipThroughRoadLane(mon)) ? "road" : (GetRazorLaneWorld(mon).Count >= 8 ? "razor" : "tpl");
-                DebugLog($"Bradley splice {mon.Prefab} {PositionToGrid(chain[inIdx])} -> {PositionToGrid(arc[arc.Count - 1])} lane={arc.Count} via={via}");
+                DebugLog($"Bradley splice-skip {mon.Prefab} lane={arc.Count} span={span:F0}m (keep highway)");
+                continue;
             }
             return spliced;
         }
@@ -9440,8 +9428,8 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                         {
                             int caught = FindClosestRouteIndex(route, pos);
                             float cx = route[caught].x - pos.x, cz = route[caught].z - pos.z;
-                            if (caught > hopIndex + 1 && caught < route.Count
-                                && cx * cx + cz * cz < 55f * 55f)
+                            if (caught > hopIndex + 1 && caught <= hopIndex + 3
+                                && cx * cx + cz * cz < 40f * 40f)
                             {
                                 hopIndex = caught;
                                 dest = route[hopIndex];
@@ -9552,12 +9540,10 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                     lastMovedAt = Time.realtimeSinceStartup;
                                     return;
                                 }
-                                route.Reverse();
-                                hopIndex = 1;
+                                hopIndex = Mathf.Min(hopIndex + 4, route.Count - 1);
                                 sameSnap = 0;
-                                pathEnded = false;
-                                InstallBradleyFullPath(bradley, route, 0);
-                                DebugLog($"Bradley gate-turn {gridNow} mon={monName} reverse");
+                                InstallBradleyFullPath(bradley, route, hopIndex);
+                                DebugLog($"Bradley gate-pass {gridNow} mon={monName} wp={hopIndex}/{route.Count}");
                                 lastMovedAt = Time.realtimeSinceStartup;
                                 return;
                             }
@@ -9689,9 +9675,11 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                 }
                                 else
                                 {
-                                    hopIndex = Mathf.Min(hullWp + 2, route.Count - 1);
+                                    hopIndex = Mathf.Min(hullWp + 8, route.Count - 1);
+                                    var shove = bradley.GetComponent<BradleyUnstick>();
+                                    if (shove != null) shove.Kick(route[hopIndex]);
                                     InstallBradleyFullPath(bradley, route, hopIndex);
-                                    DebugLog($"Bradley roadside-hold {gridNow} mon={monName} wp={hopIndex}/{route.Count} (no warp)");
+                                    DebugLog($"Bradley roadside-pass {gridNow} mon={monName} wp={hopIndex}/{route.Count}");
                                 }
                                 return;
                             }
@@ -10269,10 +10257,21 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             public BradleyAPC Apc;
             public void Kick()
             {
-                _bursts = Math.Max(0, _bursts - 1);
+                Kick(transform.position + transform.forward * 24f);
+            }
+            public void Kick(Vector3 toward)
+            {
+                _aim = toward;
+                _bursts = 0;
                 _lastMove = 0f;
+                IgnoreNearby();
+                IgnoreBlockingContacts();
+                _recoverUntil = Time.time + 6f;
+                SetThrottle(1f);
+                SetForce(_forceOrig * 2.2f);
             }
             private Vector3 _last;
+            private Vector3 _aim;
             private float _lastMove;
             private float _recoverUntil;
             private float _reverseUntil;
@@ -10425,8 +10424,14 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                     var rb = Apc.GetComponent<Rigidbody>();
                     if (rb != null && !rb.isKinematic && rb.linearVelocity.magnitude < 4.5f)
                     {
-                        Vector3 dir = Vector3.ProjectOnPlane(transform.forward, Vector3.up).normalized;
-                        rb.AddForce(dir * 5f, ForceMode.Acceleration);
+                        Vector3 dir = _aim.sqrMagnitude > 1f
+                            ? Vector3.ProjectOnPlane(_aim - transform.position, Vector3.up)
+                            : Vector3.ProjectOnPlane(transform.forward, Vector3.up);
+                        if (dir.sqrMagnitude < 0.01f) dir = transform.forward;
+                        dir.Normalize();
+                        rb.AddForce(dir * 8f, ForceMode.Acceleration);
+                        if (dir.sqrMagnitude > 0.01f)
+                            transform.rotation = Quaternion.Slerp(transform.rotation, Quaternion.LookRotation(dir, Vector3.up), 0.35f);
                     }
                     PushBodies();
                     return;
@@ -10442,7 +10447,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 if (_bursts >= 4) return;
                 _bursts++;
                 _lastMove = Time.time;
-                if ((_bursts % 2) == 0)
+                if ((_bursts % 2) == 0 && _aim.sqrMagnitude < 1f)
                 {
                     _reverseUntil = Time.time + 2.4f;
                     SetThrottle(-1f);
@@ -10518,14 +10523,10 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                         if (h == null || h.transform.root == transform.root) continue;
                         string n = (h.name ?? "") + " " + (h.transform.root.name ?? "");
                         n = n.ToLowerInvariant();
-                        bool veh = n.IndexOf("module", StringComparison.Ordinal) >= 0
-                            || n.IndexOf("vehicle", StringComparison.Ordinal) >= 0
-                            || n.IndexOf("sedan", StringComparison.Ordinal) >= 0
-                            || n.IndexOf("bike", StringComparison.Ordinal) >= 0
-                            || n.IndexOf("snowmobile", StringComparison.Ordinal) >= 0
-                            || n.IndexOf("pedal", StringComparison.Ordinal) >= 0
-                            || n.IndexOf("rhib", StringComparison.Ordinal) >= 0;
-                        if (!veh) continue;
+                        bool terrain = n.IndexOf("terrain", StringComparison.Ordinal) >= 0
+                            || n.IndexOf("water", StringComparison.Ordinal) >= 0
+                            || n.IndexOf("ground", StringComparison.Ordinal) >= 0;
+                        if (terrain) continue;
                         foreach (var c in _selfCols)
                         {
                             if (c == null) continue;
