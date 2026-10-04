@@ -11,7 +11,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.167")]
+    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.173")]
     [Description("Core event scheduler + classic world events (Cargo, Airdrop, Heli, Chinook, Bradley, F-15, Hackable). Requires LiveStatsWorld. NPC events require LiveStatsEventsNPC. Vehicle events+despawn require LiveStatsEventsVehicles. Configs: core owns schedule + classic events; LiveStatsEventsNPC owns NPC behavior; LiveStatsEventsVehicles owns vehicle limits/despawn.")]
     class LiveStatsEvents : RustPlugin
     {
@@ -306,7 +306,7 @@ namespace Oxide.Plugins
             permission.RegisterPermission(AdminPermission, this);
             // Do NOT register livestats.admin / livestatsworld.admin – those belong to other plugins.
             LoadDefaultMessages();
-            Puts("LiveStatsEvents v1.13.167 — radtown gate jump, blocked highway dropped");
+            Puts("LiveStatsEvents v1.13.173 — off-road skirt around blocked lots, no hull warp");
             // Earliest possible vanilla gate — EventSchedule may queue before OnServerInitialized
             EarlyVanillaSuppress();
         }
@@ -1243,10 +1243,10 @@ namespace Oxide.Plugins
                         return false;
                     }
                     int maxCh47 = Mathf.Max(1, config?.AirfieldChinook?.MaxInWorld ?? 1);
-                    int liveCh47 = CountPlayerChinooks();
-                    if (liveCh47 >= maxCh47)
+                    int seated = CountPlayerChinooks();
+                    if (seated >= maxCh47)
                     {
-                        DebugLog($"AirfieldChinook blocked — player CH47s in world {liveCh47} >= MaxInWorld {maxCh47}");
+                        DebugLog($"AirfieldChinook blocked — seated players {seated} >= MaxInWorld {maxCh47}");
                         return false;
                     }
                     int wipeDay = GetWipeDayFromData();
@@ -6002,7 +6002,7 @@ namespace Oxide.Plugins
             if (n.IndexOf("warehouse", StringComparison.Ordinal) >= 0) return "roadside";
             if (n.IndexOf("radtown_small", StringComparison.Ordinal) >= 0) return "roadside";
             if (n.IndexOf("entrance_bunker", StringComparison.Ordinal) >= 0) return "roadside";
-            if (n.IndexOf("apartment", StringComparison.Ordinal) >= 0) return "roadside";
+            if (n.IndexOf("apartment", StringComparison.Ordinal) >= 0) return "yard";
             if (n.IndexOf("outpost", StringComparison.Ordinal) >= 0) return "roadside";
             if (n.IndexOf("compound", StringComparison.Ordinal) >= 0) return "roadside";
             if (n.IndexOf("junkyard", StringComparison.Ordinal) >= 0) return "yard";
@@ -6892,18 +6892,27 @@ namespace Oxide.Plugins
                 // 156 trainyard I8→H8 lane=9 was the rim, not the inner road.
                 string pref = (mon.Prefab ?? "") + " " + (mon.Name ?? "");
                 bool blockedHighway = pref.IndexOf("radtown", StringComparison.OrdinalIgnoreCase) >= 0;
-                if (blockedHighway && last > first)
+                bool blockedLot = pref.IndexOf("radtown", StringComparison.OrdinalIgnoreCase) >= 0
+                    || pref.IndexOf("junkyard", StringComparison.OrdinalIgnoreCase) >= 0
+                    || pref.IndexOf("excavator", StringComparison.OrdinalIgnoreCase) >= 0
+                    || pref.IndexOf("apartment", StringComparison.OrdinalIgnoreCase) >= 0
+                    || pref.IndexOf("desert_military", StringComparison.OrdinalIgnoreCase) >= 0
+                    || pref.IndexOf("missile_silo", StringComparison.OrdinalIgnoreCase) >= 0
+                    || pref.IndexOf("arctic", StringComparison.OrdinalIgnoreCase) >= 0
+                    || pref.IndexOf("compound", StringComparison.OrdinalIgnoreCase) >= 0
+                    || pref.IndexOf("bandit", StringComparison.OrdinalIgnoreCase) >= 0
+                    || pref.IndexOf("outpost", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (blockedLot && last > first)
                 {
-                    // Highway is the only road and it dies inside the lot. Drop the interior
-                    // nodes so the route is entry stub -> exit stub. Tick warps the hull across.
+                    var skirt = BuildOffroadSkirt(chain[inIdx], chain[outIdx], mon.X, mon.Z, r + 18f);
                     int drop = last - first + 1;
                     chain.RemoveRange(first, drop);
-                    DebugLog($"Bradley radtown-bridge {mon.Prefab} {PositionToGrid(chain[Mathf.Max(0, first - 1)])} -> {PositionToGrid(chain[Mathf.Min(chain.Count - 1, first)])} dropped={drop}");
+                    if (skirt.Count >= 3)
+                        chain.InsertRange(first, skirt);
+                    DebugLog($"Bradley offroad-pass {mon.Prefab} {PositionToGrid(chain[inIdx])} -> {PositionToGrid(chain[Mathf.Min(chain.Count - 1, first + skirt.Count)])} skirt={skirt.Count} dropped={drop}");
                     continue;
                 }
-                bool noTankLot = pref.IndexOf("junkyard", StringComparison.OrdinalIgnoreCase) >= 0
-                                 || pref.IndexOf("excavator", StringComparison.OrdinalIgnoreCase) >= 0;
-                if (noTankLot || arc.Count < 12 || span < 70f)
+                if (arc.Count < 12 || span < 70f)
                 {
                     DebugLog($"Bradley splice-skip {mon.Prefab} lane={arc.Count} span={span:F0}m (keep highway)");
                     continue;
@@ -8664,26 +8673,31 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 }
                 return b.span.CompareTo(a.span);
             });
-            // Seed: pick among the longest arterials so each event is a new tour.
-            int take = nearHere ? 1 : Mathf.Min(8, pool.Count);
+            // Seed: any qualifying arterial, not the same eight long ones.
             var pick = pool[0];
-            if (!nearHere && take > 1)
+            if (!nearHere && pool.Count > 1)
             {
                 var choices = new List<(int id, List<Vector3> pts, float span, float width, float near)>();
-                for (int i = 0; i < take; i++)
+                for (int i = 0; i < pool.Count; i++)
                 {
-                    if (pool[i].id == _lastBradleySeedId && take > 1) continue;
+                    if (pool[i].id == _lastBradleySeedId) continue;
+                    if (_roadCache[pool[i].id].IsMain == false && pool[i].width < 6f) continue;
                     choices.Add(pool[i]);
+                }
+                if (choices.Count == 0)
+                {
+                    for (int i = 0; i < pool.Count; i++)
+                        if (pool[i].id != _lastBradleySeedId) choices.Add(pool[i]);
                 }
                 if (choices.Count == 0) choices.Add(pool[0]);
                 pick = choices[UnityEngine.Random.Range(0, choices.Count)];
                 _lastBradleySeedId = pick.id;
                 if (UnityEngine.Random.value < 0.5f && pick.pts.Count > 8)
                     pick.pts.Reverse();
-                // Start partway down a long road so H8 is not every spawn.
-                if (pick.pts.Count > 24)
+                if (pick.pts.Count > 16)
                 {
-                    int drop = UnityEngine.Random.Range(0, Mathf.Min(12, pick.pts.Count / 4));
+                    int hi = Mathf.Max(2, (int)(pick.pts.Count * 0.65f));
+                    int drop = UnityEngine.Random.Range(0, hi);
                     if (drop > 0)
                         pick.pts.RemoveRange(0, drop);
                 }
@@ -8991,7 +9005,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 if (dot < minDot)
                     continue;
                 float span = BradleyRouteSpan(oriented);
-                if (span < Mathf.Clamp(ScaleOnMap(250f), 160f, 280f))
+                if (span < 140f)
                 {
                     DebugLog($"Bradley reject short-join #{i} span={span:F0}m");
                     continue;
@@ -9298,16 +9312,20 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                         return;
                                     }
                                 }
-                                int warpTo;
-                                if (WarpBradleyOutOfYard(bradley, route, trap, hopIndex, out warpTo))
+                                var skirt = BuildOffroadSkirt(pos, route[Mathf.Min(hopIndex + 6, route.Count - 1)], trap.X, trap.Z, trap.Radius + 24f);
+                                if (skirt.Count >= 3)
                                 {
-                                    hopIndex = warpTo;
+                                    var pass = new List<Vector3> { pos };
+                                    pass.AddRange(skirt);
+                                    pass.Add(route[route.Count - 1]);
+                                    route = pass;
+                                    hopIndex = 1;
                                     sameSnap = 0;
                                     stallEscalations = 0;
                                     skipUntil = Time.realtimeSinceStartup + 18f;
                                     lastMovedAt = Time.realtimeSinceStartup;
-                                    InstallBradleyFullPath(bradley, route, hopIndex);
-                                    DebugLog($"Bradley yard-warp {gridNow} mon={trap.Prefab} -> {PositionToGrid(route[hopIndex])} wp={hopIndex}/{route.Count}");
+                                    InstallBradleyFullPath(bradley, route, 0);
+                                    DebugLog($"Bradley offroad-pass {gridNow} mon={trap.Prefab} skirt={skirt.Count}");
                                     return;
                                 }
                             }
@@ -9516,36 +9534,32 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                             float monDist;
                             string monName = ClosestMonumentLabel(pos, out monDist);
                             if ((monName ?? "").IndexOf("radtown", StringComparison.OrdinalIgnoreCase) >= 0
-                                && monDist < 140f && hopIndex < route.Count - 2)
+                                && monDist < 140f && sameSnap >= 2)
                             {
-                                int gate = -1;
-                                for (int k = hopIndex + 1; k < route.Count; k++)
+                                Vector3 away = bradley.transform.forward;
+                                if (away.sqrMagnitude < 0.01f) away = Vector3.forward;
+                                int turnId;
+                                var turned = PickForwardNamedRoad(pos, -away, usedRoads, route, -0.2f, out turnId);
+                                if (turned != null && turned.Count >= 6)
                                 {
-                                    float mx = route[k].x - pos.x, mz = route[k].z - pos.z;
-                                    if (mx * mx + mz * mz < 110f * 110f) continue;
-                                    if (!BradleyPointDry(route[k])) continue;
-                                    gate = k;
-                                    break;
-                                }
-                                if (gate > hopIndex)
-                                {
-                                    hopIndex = gate;
+                                    route = turned;
+                                    hopIndex = 1;
+                                    pathEnded = false;
                                     sameSnap = 0;
-                                    skipUntil = Time.realtimeSinceStartup + 12f;
+                                    if (turnId >= 0) NoteBradleyUsedRoad(usedRoads, turnId);
+                                    InstallBradleyFullPath(bradley, route, 0);
+                                    DebugLog($"Bradley gate-turn {gridNow} mon={monName} road#{turnId} -> {PositionToGrid(route[route.Count - 1])}");
                                     lastMovedAt = Time.realtimeSinceStartup;
-                                    try
-                                    {
-                                        Vector3 w = route[hopIndex];
-                                        w.y = TerrainMeta.HeightMap != null ? TerrainMeta.HeightMap.GetHeight(w) + 1.2f : w.y;
-                                        bradley.transform.position = w;
-                                        var wrb = bradley.GetComponent<Rigidbody>();
-                                        if (wrb != null) wrb.linearVelocity = Vector3.zero;
-                                    }
-                                    catch { }
-                                    InstallBradleyFullPathSkipping(bradley, route, Mathf.Max(0, hopIndex - 1), hopIndex);
-                                    DebugLog($"Bradley radtown-jump {gridNow} -> {PositionToGrid(route[hopIndex])} wp={hopIndex}/{route.Count}");
                                     return;
                                 }
+                                route.Reverse();
+                                hopIndex = 1;
+                                sameSnap = 0;
+                                pathEnded = false;
+                                InstallBradleyFullPath(bradley, route, 0);
+                                DebugLog($"Bradley gate-turn {gridNow} mon={monName} reverse");
+                                lastMovedAt = Time.realtimeSinceStartup;
+                                return;
                             }
                             bool roadside = BradleySkipLotName((monName ?? "").ToLowerInvariant());
                             if (roadside) monDist = 9999f;
@@ -9646,17 +9660,39 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                 sameSnap = 0;
                                 skipUntil = Time.realtimeSinceStartup + 16f;
                                 lastMovedAt = Time.realtimeSinceStartup;
-                                try
+                                // Lighthouse, power_sub and swamp were warping the hull
+                                // P18->O18, L14->M13, M12->K10. Only a blocked lot may teleport.
+                                string lot = (monName ?? "").ToLowerInvariant();
+                                bool blockedLot = lot.Contains("radtown") || lot.Contains("junkyard")
+                                    || lot.Contains("excavator") || lot.Contains("desert_military");
+                                if (blockedLot)
                                 {
-                                    Vector3 w = route[hopIndex];
-                                    w.y = TerrainMeta.HeightMap != null ? TerrainMeta.HeightMap.GetHeight(w) + 1.2f : w.y;
-                                    bradley.transform.position = w;
-                                    var wrb = bradley.GetComponent<Rigidbody>();
-                                    if (wrb != null) wrb.linearVelocity = Vector3.zero;
+                                    Vector3 away = bradley.transform.forward;
+                                    if (away.sqrMagnitude < 0.01f) away = Vector3.forward;
+                                    int turnId;
+                                    var turned = PickForwardNamedRoad(pos, -away, usedRoads, route, -0.2f, out turnId);
+                                    if (turned != null && turned.Count >= 6)
+                                    {
+                                        route = turned;
+                                        hopIndex = 1;
+                                        if (turnId >= 0) NoteBradleyUsedRoad(usedRoads, turnId);
+                                        InstallBradleyFullPath(bradley, route, 0);
+                                        DebugLog($"Bradley gate-turn {gridNow} mon={monName} road#{turnId} -> {PositionToGrid(route[route.Count - 1])}");
+                                    }
+                                    else
+                                    {
+                                        route.Reverse();
+                                        hopIndex = 1;
+                                        InstallBradleyFullPath(bradley, route, 0);
+                                        DebugLog($"Bradley gate-turn {gridNow} mon={monName} reverse");
+                                    }
                                 }
-                                catch { }
-                                InstallBradleyFullPathSkipping(bradley, route, Mathf.Max(0, hopIndex - 1), hopIndex);
-                                DebugLog($"Bradley skip-pin {gridNow} mon={monName} -> {PositionToGrid(route[hopIndex])} wp={hopIndex}/{route.Count}");
+                                else
+                                {
+                                    hopIndex = Mathf.Min(hullWp + 2, route.Count - 1);
+                                    InstallBradleyFullPath(bradley, route, hopIndex);
+                                    DebugLog($"Bradley roadside-hold {gridNow} mon={monName} wp={hopIndex}/{route.Count} (no warp)");
+                                }
                                 return;
                             }
                             if (sameSnap >= 3 && backupJoins < 3 && midChain && !highwayLeft)
@@ -9732,18 +9768,12 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                         }
                                         if (stallEscalations >= 4)
                                         {
-                                            if (NudgeBradleyAlongRoute(bradley, route, hullWp))
-                                            {
-                                                hopIndex = Mathf.Min(hullWp + 3, route.Count - 1);
-                                                lastPushHull = -1;
-                                                lastPushDest = -1;
-                                                sameSnap = 0;
-                                                skipUntil = Time.realtimeSinceStartup + 12f;
-                                                lastMovedAt = Time.realtimeSinceStartup;
-                                                InstallBradleyFullPathSkipping(bradley, route, hullWp, hopIndex);
-                                                DebugLog($"Bradley stall-nudge {gridNow} -> {PositionToGrid(route[hopIndex])} wp={hopIndex}/{route.Count}");
-                                                return;
-                                            }
+                                            var shove = bradley.GetComponent<BradleyUnstick>();
+                                            if (shove != null) shove.Kick();
+                                            skipUntil = Time.realtimeSinceStartup + 8f;
+                                            lastMovedAt = Time.realtimeSinceStartup;
+                                            DebugLog($"Bradley stall-shove {gridNow} wp={hopIndex}/{route.Count}");
+                                            return;
                                         }
                                         int step = stallEscalations <= 1 ? 6 : 12;
                                         int jump = Mathf.Min(hullWp + step, route.Count - 1);
@@ -10115,15 +10145,41 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 }
             }
             catch { }
-            try
-            {
-                bradley.transform.position = dest;
-                if (dir.sqrMagnitude > 0.05f)
-                    bradley.transform.rotation = Quaternion.LookRotation(dir.normalized, Vector3.up);
-            }
-            catch { return false; }
+            // No hull teleport. Caller installs a skirt or a reverse join instead.
             destWp = pick;
-            return true;
+            return false;
+        }
+
+        private List<Vector3> BuildOffroadSkirt(Vector3 entry, Vector3 exit, float cx, float cz, float radius)
+        {
+            var arc = new List<Vector3>();
+            Vector2 a = new Vector2(entry.x - cx, entry.z - cz);
+            Vector2 b = new Vector2(exit.x - cx, exit.z - cz);
+            if (a.sqrMagnitude < 4f) a = Vector2.right * radius;
+            if (b.sqrMagnitude < 4f) b = Vector2.left * radius;
+            float angA = Mathf.Atan2(a.y, a.x);
+            float angB = Mathf.Atan2(b.y, b.x);
+            float sweep = Mathf.DeltaAngle(angA * Mathf.Rad2Deg, angB * Mathf.Rad2Deg) * Mathf.Deg2Rad;
+            if (Mathf.Abs(sweep) < 0.2f) sweep = sweep >= 0f ? 1.2f : -1.2f;
+            // Prefer the shorter side. Flip if that side is wet.
+            if (Mathf.Abs(sweep) > Mathf.PI) sweep -= Mathf.Sign(sweep) * Mathf.PI * 2f;
+            int steps = 7;
+            for (int i = 1; i < steps; i++)
+            {
+                float t = i / (float)steps;
+                float ang = angA + sweep * t;
+                Vector3 p = new Vector3(cx + Mathf.Cos(ang) * radius, 0f, cz + Mathf.Sin(ang) * radius);
+                if (!BradleyPointDry(p))
+                {
+                    ang = angA - sweep * t;
+                    p = new Vector3(cx + Mathf.Cos(ang) * radius, 0f, cz + Mathf.Sin(ang) * radius);
+                    if (!BradleyPointDry(p)) continue;
+                }
+                try { p.y = TerrainMeta.HeightMap != null ? TerrainMeta.HeightMap.GetHeight(p) + 0.4f : entry.y; }
+                catch { p.y = entry.y; }
+                arc.Add(p);
+            }
+            return arc;
         }
 
         private int TrimBradleyYardTail(List<Vector3> pts)
@@ -10211,6 +10267,11 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
         {
             public LiveStatsEvents Owner;
             public BradleyAPC Apc;
+            public void Kick()
+            {
+                _bursts = Math.Max(0, _bursts - 1);
+                _lastMove = 0f;
+            }
             private Vector3 _last;
             private float _lastMove;
             private float _recoverUntil;
@@ -10548,14 +10609,8 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 }
             }
             catch { }
-            try
-            {
-                bradley.transform.position = dest;
-                if (dir.sqrMagnitude > 0.01f)
-                    bradley.transform.rotation = Quaternion.LookRotation(dir, Vector3.up);
-            }
-            catch { return false; }
-            return true;
+            // 18m position set was a teleport. Reinstall the path; do not move the hull.
+            return false;
         }
 
         private void InstallBradleyFullPath(BradleyAPC bradley, List<Vector3> route, int startIndex)
@@ -10903,26 +10958,58 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
 
 
 
-        /// <summary>Player-flyable CH47s only (ch47.entity). Scientist crate Chinooks are excluded.</summary>
+        /// <summary>A real player sitting in a flyable CH47. NPC crews and empty hulls do not count.</summary>
         private int CountPlayerChinooks()
         {
             int n = 0;
+            int seen = 0;
             try
             {
                 foreach (var ent in BaseNetworkable.serverEntities)
                 {
-                    if (ent == null) continue;
-                    var be = ent as BaseEntity;
-                    if (be == null || be.IsDestroyed) continue;
-                    string prefab = (be.PrefabName ?? be.ShortPrefabName ?? "").ToLowerInvariant();
-                    if (prefab.IndexOf("ch47", StringComparison.Ordinal) < 0) continue;
-                    if (prefab.IndexOf("scientist", StringComparison.Ordinal) >= 0) continue;
-                    if (prefab.IndexOf("gib", StringComparison.Ordinal) >= 0) continue;
+                    var heli = ent as CH47Helicopter;
+                    if (heli == null || heli.IsDestroyed) continue;
+                    seen++;
+                    if (heli is CH47HelicopterAIController) continue;
+                    string prefab = (heli.ShortPrefabName ?? "").ToLowerInvariant();
+                    if (prefab.Contains("scientist") || prefab.Contains("ch47scientists")) continue;
+                    if (!HasRealPlayerMounted(heli)) continue;
                     n++;
+                    DebugLog($"AirfieldChinook seated CH47 {prefab} at {PositionToGrid(heli.transform.position)}");
                 }
             }
             catch { }
+            if (seen > 0 && n == 0)
+                DebugLog($"AirfieldChinook CH47 hulls in world {seen}, seated players 0");
             return n;
+        }
+
+        private bool HasRealPlayerMounted(BaseEntity ent)
+        {
+            if (ent == null || ent.IsDestroyed) return false;
+            try
+            {
+                var vehicle = ent as BaseVehicle;
+                if (vehicle != null && vehicle.mountPoints != null)
+                {
+                    foreach (var mount in vehicle.mountPoints)
+                    {
+                        var seated = mount?.mountable?.GetMounted() as BasePlayer;
+                        if (seated != null && !seated.IsNpc && seated.userID > 10000) return true;
+                    }
+                }
+                if (ent.children != null)
+                {
+                    foreach (var child in ent.children)
+                    {
+                        var seat = child as BaseMountable;
+                        var seated = seat?.GetMounted() as BasePlayer;
+                        if (seated != null && !seated.IsNpc && seated.userID > 10000) return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
         }
 
         private bool TryFindAirfield(out Vector3 pos)
