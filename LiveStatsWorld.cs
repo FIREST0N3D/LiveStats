@@ -9,8 +9,8 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.53")]
-    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.53: climate-gated cyclone passage and monsoon bias. Tornado spawn off.")]
+    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.54")]
+    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.54: tide knob slews between samples. Cyclone passage stays opt-in.")]
     class LiveStatsWorld : RustPlugin
     {
         private enum CloudSwapPhase
@@ -172,6 +172,7 @@ namespace Oxide.Plugins
         private Timer _weatherPollTimer;
         private Timer _timeSyncTimer;
         private Timer _tideTimer;
+        private Timer _tideSlewTimer;
         private Timer _cycloneTimer;
 
         private bool _ready = false;
@@ -195,6 +196,8 @@ namespace Oxide.Plugins
         private float lastTideAmplitude = 0f;
         private string lastTideState = "Unknown";
         private float _appliedOceanLevel = float.NaN;
+        private float _tideTargetLevel = float.NaN;
+        private float _tideSlewStamp = 0f;
         private float _cycloneSurge = 0f;
         private float _cycloneStartedAt = 0f;
         private string _cyclonePhase = "idle";
@@ -317,7 +320,7 @@ namespace Oxide.Plugins
         {
             permission.RegisterPermission(AdminPermission, this);
             LoadDefaultMessages();
-            Puts("LiveStatsWorld v1.1.53 loaded (cyclone timeline + monsoon bias, tornado off)");
+            Puts("LiveStatsWorld v1.1.54 loaded (tide slew + cyclone timeline)");
         }
 
         private void OnPlayerConnected(BasePlayer player)
@@ -530,6 +533,7 @@ namespace Oxide.Plugins
             StopTimer(ref _lightningFlashTimer);
             StopTimer(ref _weatherRetryTimer);
             StopTimer(ref _tideTimer);
+            StopTimer(ref _tideSlewTimer);
             StopTimer(ref _cycloneTimer);
             StopCloudSwapTicker();
         }
@@ -654,8 +658,9 @@ namespace Oxide.Plugins
             if (config?.Tide == null || !config.Tide.Enabled) return;
             float interval = Mathf.Clamp(config.Tide.UpdateIntervalSeconds, 5f, 120f);
             RestartEvery(ref _tideTimer, interval, ApplyLunarTide);
+            RestartEvery(ref _tideSlewTimer, 1f, RollOceanLevel);
             timer.Once(8f, ApplyLunarTide);
-            Puts($"[Tide] Lunar tides on (every {interval:F0}s). oceanlevel = base {config.Tide.BaseOceanLevel:F2} ± spring {config.Tide.SpringAmplitude:F2} / neap {config.Tide.SpringAmplitude * Mathf.Clamp01(config.Tide.NeapScale):F2}. Conflicts with other oceanlevel plugins.");
+            Puts($"[Tide] Lunar tides on (target every {interval:F0}s, knob slew {config.Tide.SlewPerSecond:F3}/s). oceanlevel = base {config.Tide.BaseOceanLevel:F2} ± spring {config.Tide.SpringAmplitude:F2} / neap {config.Tide.SpringAmplitude * Mathf.Clamp01(config.Tide.NeapScale):F2}. Conflicts with other oceanlevel plugins.");
         }
 
         private void RestoreTideOceanLevel()
@@ -713,7 +718,8 @@ namespace Oxide.Plugins
                 lastTideLevel = level;
                 lastTideAmplitude = amp;
                 lastTideState = state;
-                SetOceanLevel(level, force: false);
+                _tideTargetLevel = level;
+                RollOceanLevel();
 
                 if (config.DebugMode)
                     Puts($"[Tide] {state} oceanlevel={level:F3} amp={amp:F3} phase={phase:F3} ({GetMoonPhaseName(phase)})");
@@ -727,9 +733,10 @@ namespace Oxide.Plugins
         private void SetOceanLevel(float level, bool force)
         {
             float q = Mathf.Round(level * 1000f) / 1000f;
-            if (!force && !float.IsNaN(_appliedOceanLevel) && Mathf.Abs(q - _appliedOceanLevel) < 0.015f)
+            if (!force)
             {
-                _appliedOceanLevel = q;
+                _tideTargetLevel = q;
+                RollOceanLevel();
                 return;
             }
 
@@ -738,6 +745,31 @@ namespace Oxide.Plugins
                 opt = opt.Quiet();
             ConsoleSystem.Run(opt, $"oceanlevel {q.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)}");
             _appliedOceanLevel = q;
+            _tideTargetLevel = q;
+        }
+
+        private void RollOceanLevel()
+        {
+            if (float.IsNaN(_tideTargetLevel)) return;
+            float now = Time.realtimeSinceStartup;
+            float dt = _tideSlewStamp <= 0f ? 1f : Mathf.Clamp(now - _tideSlewStamp, 0.05f, 2f);
+            _tideSlewStamp = now;
+
+            if (float.IsNaN(_appliedOceanLevel))
+                _appliedOceanLevel = config?.Tide != null ? config.Tide.BaseOceanLevel : 0f;
+
+            float slew = config?.Tide != null ? Mathf.Max(0.001f, config.Tide.SlewPerSecond) : 0.008f;
+            float next = Mathf.MoveTowards(_appliedOceanLevel, _tideTargetLevel, slew * dt);
+            next = Mathf.Round(next * 1000f) / 1000f;
+            if (Mathf.Abs(next - _appliedOceanLevel) < 0.001f)
+                return;
+
+            var opt = ConsoleSystem.Option.Server;
+            if (config != null && config.QuietWeatherConvars)
+                opt = opt.Quiet();
+            ConsoleSystem.Run(opt, $"oceanlevel {next.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)}");
+            _appliedOceanLevel = next;
+            lastTideLevel = next;
         }
 
         private struct ClimateGate
@@ -4585,6 +4617,8 @@ namespace Oxide.Plugins
             /// <summary>Neap range as a fraction of spring. 0.4 = much smaller quarter-moon tides.</summary>
             [JsonProperty("NeapScale")] public float NeapScale { get; set; } = 0.42f;
             [JsonProperty("UpdateIntervalSeconds")] public float UpdateIntervalSeconds { get; set; } = 20f;
+            /// <summary>Max oceanlevel change per second. The knob rolls toward the lunar target instead of stepping.</summary>
+            [JsonProperty("SlewPerSecond")] public float SlewPerSecond { get; set; } = 0.008f;
             /// <summary>When true, phase comes from the real calendar even if MoonMode is ForceFull/ForceNew.</summary>
             [JsonProperty("UseRealMoon")] public bool UseRealMoon { get; set; } = true;
             /// <summary>Add a small solar semi-diurnal so the two daily highs are not identical.</summary>
@@ -4880,6 +4914,7 @@ namespace Oxide.Plugins
             config.Tide.NeapScale = Mathf.Clamp(config.Tide.NeapScale, 0.15f, 1f);
             config.Tide.BaseOceanLevel = Mathf.Clamp(config.Tide.BaseOceanLevel, -5f, 5f);
             config.Tide.UpdateIntervalSeconds = Mathf.Clamp(config.Tide.UpdateIntervalSeconds, 5f, 120f);
+            config.Tide.SlewPerSecond = Mathf.Clamp(config.Tide.SlewPerSecond, 0.001f, 0.05f);
             if (config.Extreme == null)
                 config.Extreme = new ExtremeWeatherConfig();
             config.Extreme.CycloneChance = Mathf.Clamp01(config.Extreme.CycloneChance);
