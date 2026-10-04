@@ -11,7 +11,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.176")]
+    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.182")]
     [Description("Core event scheduler + classic world events (Cargo, Airdrop, Heli, Chinook, Bradley, F-15, Hackable). Requires LiveStatsWorld. NPC events require LiveStatsEventsNPC. Vehicle events+despawn require LiveStatsEventsVehicles. Configs: core owns schedule + classic events; LiveStatsEventsNPC owns NPC behavior; LiveStatsEventsVehicles owns vehicle limits/despawn.")]
     class LiveStatsEvents : RustPlugin
     {
@@ -306,7 +306,7 @@ namespace Oxide.Plugins
             permission.RegisterPermission(AdminPermission, this);
             // Do NOT register livestats.admin / livestatsworld.admin – those belong to other plugins.
             LoadDefaultMessages();
-            Puts("LiveStatsEvents v1.13.176 — highway only, no Razor loop, no skirt");
+            Puts("LiveStatsEvents v1.13.182 — chain must extend; no spawn snap, no spawn reverse");
             // Earliest possible vanilla gate — EventSchedule may queue before OnServerInitialized
             EarlyVanillaSuppress();
         }
@@ -6802,7 +6802,9 @@ namespace Oxide.Plugins
         {
             if (route == null || route.Count < 8) return;
             StripBradleyHazardPads(route);
+            CutBradleyRouteGaps(route, 140f);
             SpliceBradleyMonumentCorridors(route);
+            CutBradleyRouteGaps(route, 140f);
         }
 
         private static List<Vector3> WalkLaneThrough(List<Vector3> lane, int a, int b, float cx, float cz)
@@ -8727,23 +8729,34 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 int nextId = -1;
                 var next = PickForwardNamedRoad(end, heading, used, chain, out nextId);
                 if (next == null || next.Count < 5) break;
-                if (nextId >= 0) used.Add(nextId);
-                int start = 0;
-                float dx = next[0].x - end.x, dz = next[0].z - end.z;
-                if (dx * dx + dz * dz < 25f * 25f) start = 1;
-                if (start >= next.Count || !BradleySegmentDry(end, next[start]))
+                int before = chain.Count;
+                float beforeSpan = BradleyRouteSpan(chain);
+                if (!AppendBradleyJoin(chain, next, nextId))
                 {
-                    DebugLog($"Bradley reject wet-join #{nextId} at {PositionToGrid(end)}");
+                    if (nextId >= 0) used.Add(nextId);
                     continue;
                 }
-                // Named Path.Road through a monument is the patrol — keep it.
-                for (int i = start; i < next.Count; i++)
-                    chain.Add(next[i]);
+                Vector3 newEnd = chain[chain.Count - 1];
+                Vector3 step = new Vector3(newEnd.x - end.x, 0f, newEnd.z - end.z);
+                float stepDot = step.sqrMagnitude > 1f ? Vector3.Dot(heading.normalized, step.normalized) : -1f;
+                float newSpan = BradleyRouteSpan(chain);
+                // #7 met G8 and ended at D7. Span fell 286→252 and the APC folded west
+                // instead of taking the south highway. A join has to extend the chain.
+                if (stepDot < 0.05f || newSpan < beforeSpan + 60f)
+                {
+                    if (chain.Count > before) chain.RemoveRange(before, chain.Count - before);
+                    if (nextId >= 0) used.Add(nextId);
+                    DebugLog($"Bradley reject fold-join #{nextId} at {PositionToGrid(end)} -> {PositionToGrid(newEnd)} dot={stepDot:F2} span {beforeSpan:F0}->{newSpan:F0}");
+                    continue;
+                }
+                if (nextId >= 0) used.Add(nextId);
                 joins++;
-                DebugLog($"Bradley chain +road#{nextId} pts={chain.Count} span={BradleyRouteSpan(chain):F0}m cut=0 -> {PositionToGrid(chain[chain.Count - 1])}");
+                DebugLog($"Bradley chain +road#{nextId} pts={chain.Count} span={newSpan:F0}m cut=0 -> {PositionToGrid(chain[chain.Count - 1])}");
             }
             StripBradleyHazardPads(chain);
+            CutBradleyRouteGaps(chain, 140f);
             int spliced = SpliceBradleyMonumentCorridors(chain);
+            CutBradleyRouteGaps(chain, 140f);
             _bradleyLastChainUsed.Clear();
             foreach (int id in used) _bradleyLastChainUsed.Add(id);
             DebugLog($"Bradley spawn-chain roads={joins + 1} pts={chain.Count} span={BradleyRouteSpan(chain):F0}m splice={spliced} {PositionToGrid(chain[0])} -> {PositionToGrid(chain[chain.Count - 1])}");
@@ -8872,16 +8885,15 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             }
             catch { }
 
+            // A short highway is not a spur. Only a real monument lot with a
+            // short inbound arm counts — that was the G8 U-turn.
             float span = BradleyRouteSpan(route);
-            if (span > 0f && span < 500f && route != null && route.Count < 20)
-                return true;
-
             try
             {
                 if (TerrainMeta.TopologyMap != null)
                 {
                     int topo = TerrainMeta.TopologyMap.GetTopology(pos);
-                    if ((topo & (int)TerrainTopology.Enum.Monument) != 0 && span < 700f)
+                    if ((topo & (int)TerrainTopology.Enum.Monument) != 0 && span > 0f && span < 280f)
                         return true;
                 }
             }
@@ -8939,7 +8951,10 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 float d0 = (dry[0].x - here.x) * (dry[0].x - here.x) + (dry[0].z - here.z) * (dry[0].z - here.z);
                 float d1 = (dry[dry.Count - 1].x - here.x) * (dry[dry.Count - 1].x - here.x)
                          + (dry[dry.Count - 1].z - here.z) * (dry[dry.Count - 1].z - here.z);
-                const float joinSq = 320f * 320f;
+                // Procedural Path.Road points are often 70-100m apart. 56m missed
+                // the south arm at G8. 110m stays inside one grid (~146m) so it
+                // cannot repeat the 320m G8→H10 off-asphalt hop.
+                const float joinSq = 110f * 110f;
                 bool at0 = d0 <= joinSq;
                 bool at1 = d1 <= joinSq;
 
@@ -8954,7 +8969,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 {
                     // Same painted road, different TerrainMeta id — pick up mid-span.
                     int best = -1;
-                    float bestSq = 150f * 150f;
+                    float bestSq = 110f * 110f;
                     for (int p = 0; p < dry.Count; p++)
                     {
                         float dx = dry[p].x - here.x, dz = dry[p].z - here.z;
@@ -8977,8 +8992,24 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                         var t = new Vector3(back[back.Count - 1].x - here.x, 0f, back[back.Count - 1].z - here.z);
                         if (t.sqrMagnitude > 1f) backDot = Vector3.Dot(heading, t.normalized);
                     }
-                    if (fwdDot >= backDot && fwd.Count >= 6) oriented = fwd;
-                    else if (backDot > 0.05f && back.Count >= 6) oriented = back;
+                    // Longer remaining arm wins if the first step is not a U-turn.
+                    // Far-end dot dropped the south highway when it curved later.
+                    float fwdStep = 0f, backStep = 0f;
+                    if (fwd.Count >= 2)
+                    {
+                        var s = new Vector3(fwd[Mathf.Min(3, fwd.Count - 1)].x - here.x, 0f, fwd[Mathf.Min(3, fwd.Count - 1)].z - here.z);
+                        if (s.sqrMagnitude > 1f) fwdStep = Vector3.Dot(heading, s.normalized);
+                    }
+                    if (back.Count >= 2)
+                    {
+                        var s = new Vector3(back[Mathf.Min(3, back.Count - 1)].x - here.x, 0f, back[Mathf.Min(3, back.Count - 1)].z - here.z);
+                        if (s.sqrMagnitude > 1f) backStep = Vector3.Dot(heading, s.normalized);
+                    }
+                    float fwdLen = BradleyPolylineLength(fwd);
+                    float backLen = BradleyPolylineLength(back);
+                    if (fwdLen >= backLen && fwd.Count >= 6 && fwdStep >= -0.45f) oriented = fwd;
+                    else if (back.Count >= 6 && backStep >= -0.45f) oriented = back;
+                    else if (fwd.Count >= 6 && fwdStep >= -0.45f) oriented = fwd;
                     else continue;
                 }
                 if (oriented.Count < 6) continue;
@@ -9008,10 +9039,12 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                     tot++;
                     if (prevGrids.Contains(PositionToGrid(oriented[g]))) hit++;
                 }
-                if (tot > 0 && hit * 2 >= tot)
+                // Junction grids overlap the inbound road. That is the highway
+                // continuing, not a U-turn. Only reject when the far end is behind.
+                if (tot > 0 && hit * 2 >= tot && dot < 0.15f)
                 {
                     if (Time.realtimeSinceStartup >= _bradleyNoJoinAt)
-                        DebugLog($"Bradley reject overlap-join #{i} {hit}/{tot}");
+                        DebugLog($"Bradley reject overlap-join #{i} {hit}/{tot} dot={dot:F2}");
                     continue;
                 }
 
@@ -9028,15 +9061,11 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             }
             pool.Sort((a, b) =>
             {
-                // At a 3-way the long unused arm beats "far from spawn".
-                if (minDot < 0f)
-                {
-                    int s = b.span.CompareTo(a.span);
-                    if (s != 0) return s;
-                }
-                int c = b.cover.CompareTo(a.cover);
-                if (c != 0) return c;
-                return b.span.CompareTo(a.span);
+                // Longest asphalt wins forward and in reverse. Cover-first
+                // made a short spur beat the highway behind the hull.
+                int s = b.span.CompareTo(a.span);
+                if (s != 0) return s;
+                return b.cover.CompareTo(a.cover);
             });
             pickedId = pool[0].id;
             return pool[0].pts;
@@ -9143,6 +9172,143 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
         private readonly Dictionary<ulong, Timer> _bradleyRouteTimers = new Dictionary<ulong, Timer>();
         private int _lastBradleySeedId = -1;
         private readonly HashSet<int> _bradleyLastChainUsed = new HashSet<int>();
+
+
+        private static float BradleyPolylineLength(List<Vector3> pts)
+        {
+            if (pts == null || pts.Count < 2) return 0f;
+            float n = 0f;
+            for (int i = 1; i < pts.Count; i++)
+            {
+                float dx = pts[i].x - pts[i - 1].x;
+                float dz = pts[i].z - pts[i - 1].z;
+                n += Mathf.Sqrt(dx * dx + dz * dz);
+            }
+            return n;
+        }
+
+        /// <summary>Append only the part of next that meets the chain end. A 300 m gap is not a junction.</summary>
+        private bool AppendBradleyJoin(List<Vector3> chain, List<Vector3> next, int nextId)
+        {
+            if (chain == null || chain.Count == 0 || next == null || next.Count < 5) return false;
+            Vector3 end = chain[chain.Count - 1];
+            int best = 0;
+            float bestSq = float.MaxValue;
+            for (int i = 0; i < next.Count; i++)
+            {
+                float dx = next[i].x - end.x, dz = next[i].z - end.z;
+                float sq = dx * dx + dz * dz;
+                if (sq < bestSq) { bestSq = sq; best = i; }
+            }
+            const float maxJoin = 110f;
+            if (bestSq > maxJoin * maxJoin)
+            {
+                DebugLog($"Bradley reject gap-join #{nextId} at {PositionToGrid(end)} — {Mathf.Sqrt(bestSq):F0}m to {PositionToGrid(next[best])}");
+                return false;
+            }
+            int start = best;
+            float ndx = next[start].x - end.x, ndz = next[start].z - end.z;
+            if (ndx * ndx + ndz * ndz < 18f * 18f) start++;
+            if (start >= next.Count) return true;
+            if (!BradleySegmentDry(end, next[start]))
+            {
+                DebugLog($"Bradley reject wet-join #{nextId} at {PositionToGrid(end)}");
+                return false;
+            }
+            for (int i = start; i < next.Count; i++)
+                chain.Add(next[i]);
+            return true;
+        }
+
+        private int CutBradleyRouteGaps(List<Vector3> route, float maxGap)
+        {
+            if (route == null || route.Count < 3) return 0;
+            float maxSq = maxGap * maxGap;
+            for (int i = 1; i < route.Count; i++)
+            {
+                float dx = route[i].x - route[i - 1].x;
+                float dz = route[i].z - route[i - 1].z;
+                if (dx * dx + dz * dz <= maxSq) continue;
+                int drop = route.Count - i;
+                string nxt = PositionToGrid(route[i]);
+                route.RemoveRange(i, drop);
+                DebugLog($"Bradley gap-cut chain at {PositionToGrid(route[route.Count - 1])} — dropped {drop} pts (next {nxt} was {Mathf.Sqrt(dx * dx + dz * dz):F0}m)");
+                return drop;
+            }
+            return 0;
+        }
+
+        /// <summary>
+        /// Longest painted road that meets the hull. Both directions are scored,
+        /// so a reverse still takes the long arm. 70 m join — no grid hop, no teleport.
+        /// </summary>
+        private List<Vector3> PickLongestMeetRoad(Vector3 here, HashSet<int> used, out int pickedId)
+        {
+            pickedId = -1;
+            if (_roadCache.Count == 0) BuildRoadCache();
+            List<Vector3> best = null;
+            float bestLen = 0f;
+            const float joinSq = 70f * 70f;
+            for (int i = 0; i < _roadCache.Count; i++)
+            {
+                if (used != null && used.Contains(i)) continue;
+                var road = _roadCache[i];
+                if (road == null || road.Points == null || road.Width < 4.5f) continue;
+                var dry = PrepareNamedRoad(road, 200);
+                if (dry.Count < 6) continue;
+                int near = -1;
+                float nearSq = joinSq;
+                for (int p = 0; p < dry.Count; p++)
+                {
+                    float dx = dry[p].x - here.x, dz = dry[p].z - here.z;
+                    float sq = dx * dx + dz * dz;
+                    if (sq < nearSq) { nearSq = sq; near = p; }
+                }
+                if (near < 0) continue;
+                var fwd = new List<Vector3>();
+                for (int p = near; p < dry.Count; p++) fwd.Add(dry[p]);
+                var back = new List<Vector3>();
+                for (int p = near; p >= 0; p--) back.Add(dry[p]);
+                float fwdLen = BradleyPolylineLength(fwd);
+                float backLen = BradleyPolylineLength(back);
+                var arm = fwdLen >= backLen ? fwd : back;
+                float len = Mathf.Max(fwdLen, backLen);
+                if (arm.Count < 6 || len < 180f) continue;
+                if (len <= bestLen) continue;
+                bestLen = len;
+                best = arm;
+                pickedId = i;
+            }
+            if (best != null)
+                DebugLog($"Bradley longest-road #{pickedId} {PositionToGrid(here)} -> {PositionToGrid(best[best.Count - 1])} len={bestLen:F0}m pts={best.Count}");
+            return best;
+        }
+
+        private bool TakeLongestReverse(BradleyAPC bradley, ref List<Vector3> route, Vector3 pos, HashSet<int> usedRoads, out int hopIndex)
+        {
+            hopIndex = 1;
+            int id;
+            var longest = PickLongestMeetRoad(pos, usedRoads, out id);
+            float curLen = BradleyPolylineLength(route);
+            if (longest != null && longest.Count >= 6 && BradleyPolylineLength(longest) + 30f >= curLen)
+            {
+                route = longest;
+                AdoptBradleyRoute(ref route);
+                hopIndex = FirstAwayIndex(route, pos, 40f);
+                if (id >= 0 && usedRoads != null) NoteBradleyUsedRoad(usedRoads, id);
+                InstallBradleyFullPath(bradley, route, hopIndex);
+                return true;
+            }
+            if (route != null && route.Count >= 4)
+            {
+                route.Reverse();
+                hopIndex = FindNearestRouteIndex(route, pos);
+                if (hopIndex > route.Count - 4) hopIndex = 0;
+                InstallBradleyFullPath(bradley, route, hopIndex);
+                return true;
+            }
+            return false;
+        }
 
         /// <summary>
         /// Keepalive only — do NOT rebuild currentPath every tick (that causes
@@ -9300,20 +9466,15 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                         return;
                                     }
                                 }
-                                var skirt = BuildOffroadSkirt(pos, route[Mathf.Min(hopIndex + 6, route.Count - 1)], trap.X, trap.Z, trap.Radius + 24f);
-                                if (skirt.Count >= 3)
+                                int skirtWp;
+                                if (TakeLongestReverse(bradley, ref route, pos, usedRoads, out skirtWp))
                                 {
-                                    var pass = new List<Vector3> { pos };
-                                    pass.AddRange(skirt);
-                                    pass.Add(route[route.Count - 1]);
-                                    route = pass;
-                                    hopIndex = 1;
+                                    hopIndex = skirtWp;
                                     sameSnap = 0;
                                     stallEscalations = 0;
                                     skipUntil = Time.realtimeSinceStartup + 18f;
                                     lastMovedAt = Time.realtimeSinceStartup;
-                                    InstallBradleyFullPath(bradley, route, 0);
-                                    DebugLog($"Bradley offroad-pass {gridNow} mon={trap.Prefab} skirt={skirt.Count}");
+                                    DebugLog($"Bradley yard-longest {gridNow} mon={trap.Prefab} -> {PositionToGrid(route[route.Count - 1])} pts={route.Count}");
                                     return;
                                 }
                             }
@@ -9420,11 +9581,26 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                         bool inMonument = IsMonumentRoadPoint(pos);
                         float nearSq = inMonument ? 16f * 16f : 28f * 28f;
                         bool nearDest = dx * dx + dz * dz < nearSq;
+                        if (!pathEnded && nearDest && hopIndex < route.Count - 1)
+                        {
+                            Vector3 gapNxt = route[hopIndex + 1];
+                            float gap = Vector3.Distance(new Vector3(pos.x, 0f, pos.z), new Vector3(gapNxt.x, 0f, gapNxt.z));
+                            if (gap > 140f)
+                            {
+                                int drop = route.Count - (hopIndex + 1);
+                                DebugLog($"Bradley gap-cut {gridNow} wp={hopIndex}/{route.Count} next={PositionToGrid(gapNxt)} gap={gap:F0}m — stay on asphalt");
+                                route.RemoveRange(hopIndex + 1, drop);
+                                pathEnded = false;
+                                lastMovedAt = Time.realtimeSinceStartup;
+                                InstallBradleyFullPath(bradley, route, hopIndex);
+                                return;
+                            }
+                        }
                         // Closest node only. "Furthest within 80m" on a folded
                         // backup path (F2→F4 over the same asphalt) jumped to wp=15
                         // while the hull was still at F2, then snap installed a path
                         // that started at F4.
-                        if (Time.realtimeSinceStartup >= skipUntil)
+                        if (!pathEnded && Time.realtimeSinceStartup >= skipUntil)
                         {
                             int caught = FindClosestRouteIndex(route, pos);
                             float cx = route[caught].x - pos.x, cz = route[caught].z - pos.z;
@@ -9437,7 +9613,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                 DebugLog($"Bradley hop-catch {gridNow} wp={hopIndex}/{route.Count}");
                             }
                         }
-                        if (nearDest && hopIndex < route.Count - 1)
+                        if (!pathEnded && nearDest && hopIndex < route.Count - 1)
                         {
                             Vector3 nxt = route[hopIndex + 1];
                             bool nxtYard = false;
@@ -9667,10 +9843,12 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                     }
                                     else
                                     {
-                                        route.Reverse();
-                                        hopIndex = 1;
-                                        InstallBradleyFullPath(bradley, route, 0);
-                                        DebugLog($"Bradley gate-turn {gridNow} mon={monName} reverse");
+                                        int longWp;
+                                        if (TakeLongestReverse(bradley, ref route, pos, usedRoads, out longWp))
+                                        {
+                                            hopIndex = longWp;
+                                            DebugLog($"Bradley gate-turn longest {gridNow} mon={monName} -> {PositionToGrid(route[route.Count - 1])}");
+                                        }
                                     }
                                 }
                                 else
@@ -9794,21 +9972,17 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                 }
                                 if (!spurReversed && hopIndex >= 6 && !midChain)
                                 {
-                                    var rev = new List<Vector3>(hopIndex + 1);
-                                    for (int ri = hopIndex; ri >= 0; ri--)
-                                        rev.Add(route[ri]);
-                                    if (rev.Count >= 8)
+                                    int longWp;
+                                    if (TakeLongestReverse(bradley, ref route, pos, usedRoads, out longWp))
                                     {
-                                        route = rev;
-                                        hopIndex = FirstAwayIndex(route, pos, 70f);
+                                        hopIndex = longWp;
                                         spurReversed = true;
                                         pathEnded = false;
                                         sameSnap = 0;
                                         reinstalls = 0;
                                         skipUntil = Time.realtimeSinceStartup + 45f;
-                                        InstallBradleyFullPath(bradley, route, hopIndex);
                                         lastMovedAt = Time.realtimeSinceStartup;
-                                        DebugLog($"Bradley stall-backup reverse inbound {gridNow} start={hopIndex} -> {PositionToGrid(route[route.Count - 1])} pts={route.Count}");
+                                        DebugLog($"Bradley stall-backup longest {gridNow} start={hopIndex} -> {PositionToGrid(route[route.Count - 1])} pts={route.Count}");
                                         return;
                                     }
                                 }
@@ -9842,16 +10016,17 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                 }
                                 else if (!spurReversed && !nearPathEnd)
                                 {
-                                    route.Reverse();
-                                    hopIndex = FindNearestRouteIndex(route, pos);
-                                    if (hopIndex < route.Count - 1) hopIndex++;
-                                    spurReversed = true;
-                                    usedRoads.Clear();
-                                    sameSnap = 0;
-                                    reinstalls = 0;
-                                    pathEnded = false;
-                                    InstallBradleyFullPath(bradley, route, hopIndex);
-                                    DebugLog($"Bradley lot-escape {gridNow} reverse inbound");
+                                    int longWp;
+                                    if (TakeLongestReverse(bradley, ref route, pos, usedRoads, out longWp))
+                                    {
+                                        hopIndex = longWp;
+                                        spurReversed = true;
+                                        usedRoads.Clear();
+                                        sameSnap = 0;
+                                        reinstalls = 0;
+                                        pathEnded = false;
+                                        DebugLog($"Bradley lot-escape longest {gridNow} -> {PositionToGrid(route[route.Count - 1])} pts={route.Count}");
+                                    }
                                 }
                                 else if (nearPathEnd)
                                 {
@@ -9865,7 +10040,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                                     DebugLog($"Bradley snap-continue {gridNow} wp={hopIndex}/{route.Count}");
                                 }
                             }
-                            else if (reinstalls < 8)
+                            else if (reinstalls < 8 && hopIndex >= 6)
                             {
                                 int hullWp = FindClosestRouteIndex(route, pos);
                                 hopIndex = Mathf.Max(hopIndex, hullWp);
@@ -9932,14 +10107,14 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                             }
                             else if (!spurReversed && IsBradleyMonumentSpur(pos, route))
                             {
-                                route.Reverse();
-                                hopIndex = FindNearestRouteIndex(route, pos);
-                                if (hopIndex > route.Count - 4)
-                                    hopIndex = 0;
-                                spurReversed = true;
-                                DebugLog($"Bradley SPUR reverse at {gridNow} — drive back to junction (once)");
-                                InstallBradleyFullPath(bradley, route, hopIndex);
-                                lastMovedAt = Time.realtimeSinceStartup;
+                                int longWp;
+                                if (TakeLongestReverse(bradley, ref route, pos, usedRoads, out longWp))
+                                {
+                                    hopIndex = longWp;
+                                    spurReversed = true;
+                                    DebugLog($"Bradley SPUR longest at {gridNow} -> {PositionToGrid(route[route.Count - 1])} pts={route.Count}");
+                                    lastMovedAt = Time.realtimeSinceStartup;
+                                }
                             }
                             else
                             {
@@ -10102,6 +10277,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
         private bool WarpBradleyOutOfYard(BradleyAPC bradley, List<Vector3> route, MonumentScanEntry trap, int hullWp, out int destWp)
         {
             destWp = hullWp;
+            return false;
             if (bradley == null || bradley.IsDestroyed || trap == null || route == null || route.Count < 4)
                 return false;
             float r2 = (trap.Radius + 26f) * (trap.Radius + 26f);
@@ -10382,7 +10558,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                     if (TerrainMeta.HeightMap != null)
                     {
                         float gy = TerrainMeta.HeightMap.GetHeight(pos);
-                        if (pos.y < gy - 2f || pos.y < -20f)
+                        if (pos.y < -20f)
                         {
                             pos.y = gy + 1.2f;
                             transform.position = pos;
@@ -10443,7 +10619,8 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                     SetForce(_forceOrig);
                 }
 
-                if (Time.time - _lastMove < 12f) return;
+                if (_lastMove <= 0f) _lastMove = Time.time;
+                if (Time.time - _lastMove < 20f) return;
                 if (_bursts >= 4) return;
                 _bursts++;
                 _lastMove = Time.time;
