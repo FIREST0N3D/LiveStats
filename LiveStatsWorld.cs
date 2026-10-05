@@ -9,7 +9,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.54")]
+    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.55")]
     [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.54: tide knob slews between samples. Cyclone passage stays opt-in.")]
     class LiveStatsWorld : RustPlugin
     {
@@ -174,6 +174,7 @@ namespace Oxide.Plugins
         private Timer _tideTimer;
         private Timer _tideSlewTimer;
         private Timer _cycloneTimer;
+        private int _worldClockN;
 
         private bool _ready = false;
 
@@ -320,7 +321,7 @@ namespace Oxide.Plugins
         {
             permission.RegisterPermission(AdminPermission, this);
             LoadDefaultMessages();
-            Puts("LiveStatsWorld v1.1.54 loaded (tide slew + cyclone timeline)");
+            Puts("LiveStatsWorld v1.1.55 loaded (shared 1s slew/blend clock, world stats +7s)");
         }
 
         private void OnPlayerConnected(BasePlayer player)
@@ -387,21 +388,30 @@ namespace Oxide.Plugins
                 timer.Once(25f, SyncLocalWeather);
                 float pollInterval = Mathf.Max(5, config.LocalWeatherUpdateIntervalMinutes) * 60f;
                 RestartEvery(ref _weatherPollTimer, pollInterval, SyncLocalWeather);
-                RestartEvery(ref _weatherBlendTimer, wx.WeatherBlendInterval, BlendLocalWeather);
+                // Blend rides the shared 1s clock (every other tick). Do not start a second blend timer.
+                _weatherBlendTimer?.Destroy();
+                _weatherBlendTimer = null;
             }
 
             if (config.CollectWorldStats)
             {
                 float interval = Mathf.Max(5f, config.WorldStatsUpdateInterval);
-                RestartEvery(ref _worldTimer, interval, CollectWorldStats);
-                timer.Once(5f, CollectWorldStats);
-                Puts($"World stats collection enabled (every {interval:F0}s)");
+                // +7s so world_stats.json does not share a frame with the pin file or live_stats.
+                timer.Once(7f, () =>
+                {
+                    CollectWorldStats();
+                    RestartEvery(ref _worldTimer, interval, CollectWorldStats);
+                });
+                Puts($"World stats collection enabled (every {interval:F0}s, first write +7s)");
             }
 
             ApplyCatchUpSpawnSubscription();
 
             if (config.Tide != null && config.Tide.Enabled)
                 StartTideSystem();
+
+            if (config.UseLocalWeather || (config.Tide != null && config.Tide.Enabled))
+                StartSharedWorldClock();
 
             var climate = EvaluateStormClimatology(DateTime.UtcNow);
             Puts($"[Climate] {climate.Label} tornado={(climate.Tornado ? "yes" : "no")} hurricane={(climate.HurricaneSeason ? "in season" : climate.HurricaneBasin ? "out of season" : "no")} monsoon={(climate.Monsoon ? "yes" : "no")}");
@@ -658,9 +668,9 @@ namespace Oxide.Plugins
             if (config?.Tide == null || !config.Tide.Enabled) return;
             float interval = Mathf.Clamp(config.Tide.UpdateIntervalSeconds, 5f, 120f);
             RestartEvery(ref _tideTimer, interval, ApplyLunarTide);
-            RestartEvery(ref _tideSlewTimer, 1f, RollOceanLevel);
+            // Slew is owned by the shared 1s clock so it does not stack with the weather blend timer.
             timer.Once(8f, ApplyLunarTide);
-            Puts($"[Tide] Lunar tides on (target every {interval:F0}s, knob slew {config.Tide.SlewPerSecond:F3}/s). oceanlevel = base {config.Tide.BaseOceanLevel:F2} ± spring {config.Tide.SpringAmplitude:F2} / neap {config.Tide.SpringAmplitude * Mathf.Clamp01(config.Tide.NeapScale):F2}. Conflicts with other oceanlevel plugins.");
+            Puts($"[Tide] Lunar tides on (target every {interval:F0}s, knob slew {config.Tide.SlewPerSecond:F3}/s on the shared 1s clock). oceanlevel = base {config.Tide.BaseOceanLevel:F2} ± spring {config.Tide.SpringAmplitude:F2} / neap {config.Tide.SpringAmplitude * Mathf.Clamp01(config.Tide.NeapScale):F2}. Conflicts with other oceanlevel plugins.");
         }
 
         private void RestoreTideOceanLevel()
@@ -670,6 +680,26 @@ namespace Oxide.Plugins
             float restore = config.Tide.BaseOceanLevel;
             SetOceanLevel(restore, force: true);
             Puts($"[Tide] Restored oceanlevel to {restore:F2}");
+        }
+
+        /// <summary>
+        /// One 1s clock for ocean slew and weather blend. Slew every tick.
+        /// Blend every other tick (~2s; was 1.5s, convars are epsilon-gated).
+        /// </summary>
+        private void StartSharedWorldClock()
+        {
+            _worldClockN = 0;
+            RestartEvery(ref _tideSlewTimer, 1f, SharedWorldClock);
+            Puts("[World] Shared 1s clock: tide slew every tick, weather blend every other tick");
+        }
+
+        private void SharedWorldClock()
+        {
+            _worldClockN++;
+            if (config?.Tide != null && config.Tide.Enabled)
+                RollOceanLevel();
+            if (config != null && config.UseLocalWeather && (_worldClockN & 1) == 0)
+                BlendLocalWeather();
         }
 
         private void ApplyLunarTide()
