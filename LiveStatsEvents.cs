@@ -11,7 +11,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.182")]
+    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.183")]
     [Description("Core event scheduler + classic world events (Cargo, Airdrop, Heli, Chinook, Bradley, F-15, Hackable). Requires LiveStatsWorld. NPC events require LiveStatsEventsNPC. Vehicle events+despawn require LiveStatsEventsVehicles. Configs: core owns schedule + classic events; LiveStatsEventsNPC owns NPC behavior; LiveStatsEventsVehicles owns vehicle limits/despawn.")]
     class LiveStatsEvents : RustPlugin
     {
@@ -134,6 +134,7 @@ namespace Oxide.Plugins
         private readonly Dictionary<ulong, CargoTrack> _cargoTracks = new Dictionary<ulong, CargoTrack>();
         private Timer _cargoMonitorTimer;
         private Timer _nightLightsTimer;
+        private int _maintPhase;
 
         // After a Chinook spawns, watch for locked crates it drops and announce their grid
         private float _chinookCrateWatchUntil = -1f;
@@ -306,7 +307,7 @@ namespace Oxide.Plugins
             permission.RegisterPermission(AdminPermission, this);
             // Do NOT register livestats.admin / livestatsworld.admin – those belong to other plugins.
             LoadDefaultMessages();
-            Puts("LiveStatsEvents v1.13.182 — chain must extend; no spawn snap, no spawn reverse");
+            Puts("LiveStatsEvents v1.13.183 — announce/cargo/lights/index share a 5s clock");
             // Earliest possible vanilla gate — EventSchedule may queue before OnServerInitialized
             EarlyVanillaSuppress();
         }
@@ -414,6 +415,23 @@ namespace Oxide.Plugins
         /// Safe to call after LoadConfig / when LiveStatsWorld appears / on server init.
         /// Destroys existing timers first so CheckIntervalSeconds and Enabled changes take effect.
         /// </summary>
+        /// <summary>
+        /// 5s clock. Announcements every fire. Cargo maintenance every 240s,
+        /// night lights every 480s, live-index sanity every 1200s.
+        /// Event roll is not on this clock.
+        /// </summary>
+        private void MaintenanceClock()
+        {
+            ProcessAnnouncements();
+            _maintPhase++;
+            if (_maintPhase % 48 == 0)
+                RunMaintenanceTick();
+            if (_maintPhase % 96 == 0)
+                UpdateAllSpawnedNightLights();
+            if (_maintPhase % 240 == 0)
+                RebuildLiveIndex(force: false);
+        }
+
         private void RestartEventSystem()
         {
             // Tear down any existing timers so interval / Enabled changes take effect
@@ -530,10 +548,20 @@ namespace Oxide.Plugins
                 }
             }
 
-            // Event tick: default ~75s, clamp 45–180s (was 30–120)
+            // Event roll stays on its own 45–180s timer. Announcements stay at 5s
+            // (a counter on the event tick would delay "inbound in 1 minute").
+            // Cargo 240s, night lights 480s, and live-index 1200s are phases of that 5s clock.
             float tick = Mathf.Clamp(config.CheckIntervalSeconds, 45f, 180f);
             _eventTimer = timer.Every(tick, EventTick);
-            _announceTimer = timer.Every(5f, ProcessAnnouncements);
+            _cargoMonitorTimer?.Destroy();
+            _cargoMonitorTimer = null;
+            _liveIndexTimer?.Destroy();
+            _liveIndexTimer = null;
+            _nightLightsTimer?.Destroy();
+            _nightLightsTimer = null;
+            _maintPhase = 0;
+            _announceTimer?.Destroy();
+            _announceTimer = timer.Every(5f, MaintenanceClock);
 
             // Vehicle despawn owned exclusively by LiveStatsEventsVehicles (core inline removed)
             bool vehiclesModule = _registeredModules.Contains(ModuleVehicles) || LiveStatsEventsVehicles != null;
@@ -542,25 +570,16 @@ namespace Oxide.Plugins
             else
                 Puts("[Events] WARNING: LiveStatsEventsVehicles not loaded — vehicle events/despawn inactive");
 
-            // Combined maintenance — slower tick reduces GC from world walks
-            _cargoMonitorTimer?.Destroy();
-            _cargoMonitorTimer = timer.Every(240f, RunMaintenanceTick);
             if (config.CargoShipLifecycle == null || config.CargoShipLifecycle.Enabled)
                 Puts($"[Events] Cargo lifecycle monitor on (egress after {config.CargoShipLifecycle?.MaxEventMinutes ?? 55:F0}m, kill after egress + {config.CargoShipLifecycle?.ForceKillMinutesAfterEgress ?? 15:F0}m)");
 
-            // Shared live-entity index — one world pass every ~3 min feeds counts / near-checks / despawn
-            _liveIndexTimer?.Destroy();
             RebuildLiveIndex(force: true);
             ProtectExistingHackableCrates();
-            _liveIndexTimer = timer.Every(LiveIndexMaxAge, () => RebuildLiveIndex(force: false));
-            Puts($"[Events] Live index: incremental spawn/kill + sanity rebuild every {LiveIndexMaxAge:F0}s");
+            Puts($"[Events] Live index: incremental spawn/kill + sanity rebuild every {LiveIndexMaxAge:F0}s (phased on the 5s clock)");
 
             CleanupStuckChinooks();
 
-            // Night lights only on day↔night transition
-            _nightLightsTimer?.Destroy();
             _lastNightLightsIsNight = null;
-            _nightLightsTimer = timer.Every(480f, UpdateAllSpawnedNightLights); // 8 min
 
             var mod = config.Modules ?? new ModuleConfig();
             Puts($"[Events] Started (mode: {(config.UseScheduledEvents ? "Scheduled" : "Random")}, tick every {tick:F0}s, min players {config.MinPlayersOnline}, live-index {LiveIndexMaxAge:F0}s)");
