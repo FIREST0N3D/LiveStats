@@ -10,7 +10,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStats", "FiREST0N3D", "1.9.818")]
+    [Info("LiveStats", "FiREST0N3D", "1.9.819")]
     [Description("Comprehensive player/NPC/animal stats, killfeed + optional idle kick. Dual wipe detection. Kill streak tracking (players/NPCs/animals) + isPlayerDead. Optional LiveStatsWorld extension for time/weather. CONFLICTS: none by default; idle kick is opt-in. Pair with LiveStatsWorld/LiveStatsEvents as a suite.")]
     class LiveStats : RustPlugin
     {
@@ -73,6 +73,7 @@ namespace Oxide.Plugins
         private bool _animalStatsDirty;
         private bool _envStatsDirty;
         private Timer _statsFlushTimer;
+        private int _statsClockN;
 
         private const string AdminPermission = "livestats.admin";
 
@@ -351,7 +352,7 @@ namespace Oxide.Plugins
             LoadDefaultMessages();
             LogLanguagePackInventory();
 
-            Puts("LiveStats v1.9.818 loaded (livestock + critters + crab swarm; last-hit/dedupe from 1.9.817)");
+            Puts("LiveStats v1.9.819 loaded (stats clock +4s; live/flush/bank share one timer)");
             LoadWipeIdentity();
             LoadStats();
             LoadNpcStats();
@@ -380,25 +381,18 @@ namespace Oxide.Plugins
             // fallback (seed|worldsize|level) for cases where OnNewSave was missed.
             CheckForWipe("OnServerInitialized");
 
-            // Main timer: live stats save (world stats handled by LiveStatsWorld extension)
-            // NOTE: Do NOT call SaveAllPlayerTimes() here. Session display uses sessionStarts
-            // (true connect time) while banking uses loginTimes (last bank point).
-            _timer = timer.Every(config.UpdateInterval, () =>
+            // One stats clock, offset +4s so live_stats.json does not share a frame
+            // with the event-feed pin write. Live file every UpdateInterval,
+            // player/npc/animal/env flush ~20s, playtime bank ~300s.
+            // SaveAllPlayerTimes only advances loginTimes; sessionStarts stays put.
+            _statsFlushTimer?.Destroy();
+            _statsFlushTimer = null;
+            float statsInterval = Mathf.Max(5f, config.UpdateInterval);
+            timer.Once(4f, () =>
             {
-                SaveLiveStats();
+                StatsClock();
+                _timer = timer.Every(statsInterval, StatsClock);
             });
-
-            // Persist playtime every 5 minutes so long sessions survive a crash.
-            // Only the banking point (loginTimes) is advanced; sessionStarts stays put
-            // so the displayed "Current session" continues to grow without resetting.
-            timer.Every(300f, () =>
-            {
-                SaveAllPlayerTimes();
-            });
-
-            // Debounce the large player/npc/animal/env JSON writes (deaths mark dirty).
-            // Live dashboard (live_stats.json) still uses UpdateInterval.
-            _statsFlushTimer = timer.Every(20f, FlushDirtyStats);
 
             // Player stats cleanup
             if (config.PlayerStatsCleanupDays > 0 && config.PlayerStatsCleanupIntervalMinutes > 0)
@@ -429,6 +423,22 @@ namespace Oxide.Plugins
                 SyncOxideLanguage(player);
 
             SaveLiveStats();
+        }
+
+        /// <summary>
+        /// Live dashboard every tick. Big stat files every ~20s. Playtime bank every ~300s.
+        /// </summary>
+        private void StatsClock()
+        {
+            _statsClockN++;
+            SaveLiveStats();
+            float interval = Mathf.Max(5f, config != null ? config.UpdateInterval : 10f);
+            int flushEvery = Mathf.Max(1, Mathf.RoundToInt(20f / interval));
+            int bankEvery = Mathf.Max(1, Mathf.RoundToInt(300f / interval));
+            if (_statsClockN % flushEvery == 0)
+                FlushDirtyStats();
+            if (_statsClockN % bankEvery == 0)
+                SaveAllPlayerTimes();
         }
 
 
