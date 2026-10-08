@@ -10,7 +10,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStats", "FiREST0N3D", "1.9.819")]
+    [Info("LiveStats", "FiREST0N3D", "1.9.821")]
     [Description("Comprehensive player/NPC/animal stats, killfeed + optional idle kick. Dual wipe detection. Kill streak tracking (players/NPCs/animals) + isPlayerDead. Optional LiveStatsWorld extension for time/weather. CONFLICTS: none by default; idle kick is opt-in. Pair with LiveStatsWorld/LiveStatsEvents as a suite.")]
     class LiveStats : RustPlugin
     {
@@ -34,6 +34,9 @@ namespace Oxide.Plugins
         private readonly Dictionary<ulong, DamageTrackEntry> lastPlayerAttacker = new Dictionary<ulong, DamageTrackEntry>(); // display name
         private readonly Dictionary<ulong, DamageTrackEntry> lastPlayerAttackerId = new Dictionary<ulong, DamageTrackEntry>(); // Steam UserIDString
         private readonly Dictionary<ulong, DamageTrackEntry> lastAnimalAttacker = new Dictionary<ulong, DamageTrackEntry>();
+        // Last player hit on an animal. Death HitInfo usually has no impact point, so the kill shot is read from here.
+        private readonly Dictionary<ulong, AnimalHeadshotTrack> lastAnimalHeadshot = new Dictionary<ulong, AnimalHeadshotTrack>(64);
+        private const float AnimalHeadshotFreshSeconds = 4f;
 
         // Idle / AFK tracking
         private readonly Dictionary<string, float> lastActivity = new Dictionary<string, float>(256);
@@ -57,6 +60,13 @@ namespace Oxide.Plugins
             public string Value;
             public string Prefab; // victim prefab at write time — rejects recycled netIds
             public float Time;
+        }
+
+        private struct AnimalHeadshotTrack
+        {
+            public string Prefab;
+            public float Time;
+            public bool Headshot;
         }
 
         private ConfigData config;
@@ -182,6 +192,33 @@ namespace Oxide.Plugins
             [JsonProperty("PlayerStatsCleanupIntervalMinutes")] public int PlayerStatsCleanupIntervalMinutes { get; set; } = 60;
             [JsonProperty("UpdateInterval")] public float UpdateInterval { get; set; } = 10f;
             [JsonProperty("EnableAnimalStats")] public bool EnableAnimalStats { get; set; } = true;
+            // Kill-shot only, same rule as NPC headshots. Position vs head bone — animals have no head collider.
+            [JsonProperty("EnableAnimalHeadshots")] public bool EnableAnimalHeadshots { get; set; } = true;
+            // Prefab fragment -> metres. Longest matching key wins. "default" is the fallback.
+            [JsonProperty("AnimalHeadshotRadii")] public Dictionary<string, float> AnimalHeadshotRadii { get; set; } = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "polarbear", 0.45f },
+                { "bear", 0.42f },
+                { "wolf", 0.22f },
+                { "boar", 0.24f },
+                { "stag", 0.30f },
+                { "horse", 0.34f },
+                { "foal", 0.22f },
+                { "chicken", 0.12f },
+                { "crocodile", 0.28f },
+                { "croc", 0.28f },
+                { "shark", 0.40f },
+                { "snake", 0.10f },
+                { "panther", 0.22f },
+                { "tiger", 0.24f },
+                { "bull", 0.42f },
+                { "cow", 0.40f },
+                { "calf", 0.22f },
+                { "sheep", 0.22f },
+                { "goat", 0.20f },
+                { "rabbit", 0.10f },
+                { "default", 0.25f }
+            };
             [JsonProperty("EnableRecentDeaths")] public bool EnableRecentDeaths { get; set; } = true;
 
             [JsonProperty("DebugMode")] public bool DebugMode { get; set; } = false;
@@ -352,7 +389,7 @@ namespace Oxide.Plugins
             LoadDefaultMessages();
             LogLanguagePackInventory();
 
-            Puts("LiveStats v1.9.819 loaded (stats clock +4s; live/flush/bank share one timer)");
+            Puts("LiveStats v1.9.821 loaded (animal kill-shot headshots from last hit; stats clock +4s)");
             LoadWipeIdentity();
             LoadStats();
             LoadNpcStats();
@@ -467,6 +504,13 @@ namespace Oxide.Plugins
             // Ensure any newly-added fields have sensible defaults (e.g. after plugin updates)
             if (config.CustomKillerNames == null)
                 config.CustomKillerNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (config.AnimalHeadshotRadii == null)
+                config.AnimalHeadshotRadii = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+            foreach (var seed in DefaultAnimalHeadRadii())
+            {
+                if (!config.AnimalHeadshotRadii.ContainsKey(seed.Key))
+                    config.AnimalHeadshotRadii[seed.Key] = seed.Value;
+            }
 
             // Always write the config so a missing file is created and new defaults are persisted
             SaveConfig();
@@ -1361,6 +1405,7 @@ namespace Oxide.Plugins
             lastPlayerAttacker.Clear();
             lastPlayerAttackerId.Clear();
             lastAnimalAttacker.Clear();
+            lastAnimalHeadshot.Clear();
             loginTimes.Clear();
             sessionStarts.Clear();
             lastActivity.Clear();
@@ -1425,6 +1470,20 @@ namespace Oxide.Plugins
                     lastPlayerAttackerId.Remove(netId);
                     lastNpcAttacker.Remove(netId);
                 }
+            }
+
+            // Animals have no head collider. The death HitInfo usually has a zero impact point,
+            // so remember the last player hit (the kill shot) while the position is still valid.
+            if (config.EnableAnimalHeadshots && IsValidAnimal(entity)
+                && info.InitiatorPlayer != null && info.InitiatorPlayer.userID.IsSteamId()
+                && !IsSamePlayer(entity, info.InitiatorPlayer))
+            {
+                lastAnimalHeadshot[netId] = new AnimalHeadshotTrack
+                {
+                    Prefab = victimPrefab,
+                    Time = Time.realtimeSinceStartup,
+                    Headshot = IsAnimalKillHeadshot(entity, info)
+                };
             }
 
             // Soft size cap — full prune runs on a timer
@@ -1721,6 +1780,10 @@ namespace Oxide.Plugins
         {
             BaseEntity initiator = info?.Initiator;
             bool isHeadshot = info?.isHeadshot == true;
+            // Animals never set isHeadshot. Death HitInfo usually has no impact point, so use the last player hit.
+            if (!isHeadshot && classification.IsAnimal)
+                isHeadshot = ResolveAnimalKillHeadshot(entity, info, netId, shortName);
+            lastAnimalHeadshot.Remove(netId);
             bool isSuicide = false;
 
             string killerNameRaw = "Environment";
@@ -2003,7 +2066,7 @@ namespace Oxide.Plugins
                 {
                     kStats.headshots++;
                     if (classification.IsNpcEntity) kStats.npcHeadshots++;
-                    // Animals have no conventional headshot hitboxes — do not count animalHeadshots
+                    else if (classification.IsAnimal) kStats.animalHeadshots++;
                     else if (classification.IsRealPlayer) kStats.playerHeadshots++;
                 }
 
@@ -2543,7 +2606,7 @@ private void LoadDefaultMessages()
         ["TotalKills"] = "<color=#44ff44>Total Kills:</color>",
         ["TotalDeaths"] = "<color=#ff4444>Total Deaths:</color>",
         ["KD"] = "<color=#ffff44>K/D:</color>",
-        ["HeadshotsBreakdown"] = "Headshots: {0} (PvP: {1} | NPC: {2})",
+        ["HeadshotsBreakdown"] = "Headshots: {0} (PvP: {1} | NPC: {2} | Animals: {3})",
         ["AnimalKD"] = "<color=#44ff44>Animal K/D:</color> {0} (Kills: {1} | Deaths: {2})",
         ["AnimalsKilledList"] = "Animals killed: {0}",
         ["KilledByAnimalsList"] = "Killed by animals: {0}",
@@ -2795,6 +2858,185 @@ private void LoadDefaultMessages()
             return name.Contains("plant") || name.Contains("corn") || name.Contains("berry") || name.Contains("hemp") || name.Contains("pumpkin");
         }
 
+        private readonly HashSet<string> _loggedMissingAnimalHead = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Kill-shot headshot for animals. Vanilla never sets HitInfo.isHeadshot on them
+        /// (no head collider). Compare the killing hit point to the head bone.
+        /// Body shots and missing bones stay false, so animalHeadshots only moves on a killing head hit.
+        /// </summary>
+        private static Dictionary<string, float> DefaultAnimalHeadRadii()
+        {
+            return new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "polarbear", 0.45f },
+                { "bear", 0.42f },
+                { "wolf", 0.22f },
+                { "boar", 0.24f },
+                { "stag", 0.30f },
+                { "horse", 0.34f },
+                { "foal", 0.22f },
+                { "chicken", 0.12f },
+                { "crocodile", 0.28f },
+                { "croc", 0.28f },
+                { "shark", 0.40f },
+                { "snake", 0.10f },
+                { "panther", 0.22f },
+                { "tiger", 0.24f },
+                { "bull", 0.42f },
+                { "cow", 0.40f },
+                { "calf", 0.22f },
+                { "sheep", 0.22f },
+                { "goat", 0.20f },
+                { "rabbit", 0.10f },
+                { "default", 0.25f }
+            };
+        }
+
+        private bool ResolveAnimalKillHeadshot(BaseCombatEntity entity, HitInfo info, ulong netId, string shortName)
+        {
+            if (config != null && !config.EnableAnimalHeadshots) return false;
+
+            bool deathHasPoint = HasUsableHitPoint(info, entity);
+            if (deathHasPoint && IsAnimalKillHeadshot(entity, info))
+                return true;
+
+            if (lastAnimalHeadshot.TryGetValue(netId, out var track))
+            {
+                bool fresh = Time.realtimeSinceStartup - track.Time <= AnimalHeadshotFreshSeconds;
+                bool same = string.IsNullOrEmpty(track.Prefab) || string.IsNullOrEmpty(shortName)
+                    || string.Equals(track.Prefab, shortName, StringComparison.OrdinalIgnoreCase);
+                if (fresh && same)
+                {
+                    if (config != null && config.DebugMode)
+                        Puts($"[AnimalHS] {shortName} using last hit ({Time.realtimeSinceStartup - track.Time:F2}s ago) headshot={track.Headshot} deathPoint={deathHasPoint}");
+                    return track.Headshot;
+                }
+            }
+
+            if (config != null && config.DebugMode)
+                Puts($"[AnimalHS] {shortName} no usable kill-shot point and no fresh last hit");
+            return false;
+        }
+
+        private static bool HasUsableHitPoint(HitInfo info, BaseEntity entity)
+        {
+            if (info == null || entity == null) return false;
+            Vector3 hit = ResolveHitPoint(info, entity);
+            if (hit.sqrMagnitude < 0.01f) return false;
+            // Die() often copies the entity origin into the hit point. That is not an impact.
+            var origin = entity.transform != null ? entity.transform.position : Vector3.zero;
+            return (hit - origin).sqrMagnitude > 0.04f;
+        }
+
+        private static Vector3 ResolveHitPoint(HitInfo info, BaseEntity entity)
+        {
+            if (info == null) return Vector3.zero;
+            if (info.HitPositionWorld.sqrMagnitude > 0.01f)
+                return info.HitPositionWorld;
+            if (info.PointEnd.sqrMagnitude > 0.01f)
+                return info.PointEnd;
+            if (info.HitPositionLocal.sqrMagnitude > 0.01f && entity != null && entity.transform != null)
+                return entity.transform.TransformPoint(info.HitPositionLocal);
+            return Vector3.zero;
+        }
+
+        private bool IsAnimalKillHeadshot(BaseCombatEntity entity, HitInfo info)
+        {
+            if (entity == null || info == null) return false;
+            if (config != null && !config.EnableAnimalHeadshots) return false;
+
+            Vector3 hit = ResolveHitPoint(info, entity);
+            if (hit.sqrMagnitude < 0.01f)
+                return false;
+
+            Transform head = FindAnimalHeadBone(entity);
+            if (head == null)
+            {
+                if (config != null && config.DebugMode)
+                {
+                    string prefab = entity.ShortPrefabName ?? "";
+                    if (_loggedMissingAnimalHead.Add(prefab))
+                        Puts($"[AnimalHS] no head bone on {prefab} — kill not counted as headshot");
+                }
+                return false;
+            }
+
+            float radius = GetAnimalHeadRadius(entity.ShortPrefabName);
+            var extents = entity.bounds.extents;
+            if (extents.y > 0.2f)
+                radius = Mathf.Max(radius, Mathf.Clamp(extents.y * 0.55f, 0.2f, 0.85f));
+            float distSqr = (hit - head.position).sqrMagnitude;
+            float horizontal = Vector2.Distance(new Vector2(hit.x, hit.z), new Vector2(head.position.x, head.position.z));
+            bool aboveNeck = hit.y >= head.position.y - 0.2f && hit.y <= head.position.y + radius;
+            bool headshot = distSqr <= radius * radius || (aboveNeck && horizontal <= radius);
+            if (config != null && config.DebugMode)
+                Puts($"[AnimalHS] {entity.ShortPrefabName} dist={Mathf.Sqrt(distSqr):F2} horiz={horizontal:F2} radius={radius:F2} hitY={hit.y:F2} headY={head.position.y:F2} headshot={headshot}");
+            return headshot;
+        }
+
+        private static Transform FindAnimalHeadBone(BaseEntity entity)
+        {
+            if (entity == null) return null;
+            var model = entity.model;
+            if (model != null)
+            {
+                if (model.headBone != null) return model.headBone;
+                var found = MatchHeadBone(model.boneTransforms);
+                if (found != null) return found;
+            }
+
+            var children = entity.GetComponentsInChildren<Transform>(true);
+            return MatchHeadBone(children);
+        }
+
+        private static Transform MatchHeadBone(Transform[] bones)
+        {
+            if (bones == null) return null;
+            Transform fallback = null;
+            for (int i = 0; i < bones.Length; i++)
+            {
+                var t = bones[i];
+                if (t == null) continue;
+                string n = t.name;
+                if (string.IsNullOrEmpty(n)) continue;
+                if (n.Equals("head", StringComparison.OrdinalIgnoreCase))
+                    return t;
+                if (fallback == null && n.IndexOf("head", StringComparison.OrdinalIgnoreCase) >= 0
+                    && n.IndexOf("headshot", StringComparison.OrdinalIgnoreCase) < 0
+                    && n.IndexOf("light", StringComparison.OrdinalIgnoreCase) < 0)
+                    fallback = t;
+            }
+            return fallback;
+        }
+
+        private float GetAnimalHeadRadius(string shortPrefab)
+        {
+            var radii = config?.AnimalHeadshotRadii;
+            if (radii == null || radii.Count == 0) return 0.25f;
+
+            string name = shortPrefab ?? "";
+            string bestKey = null;
+            int bestLen = -1;
+            foreach (var kvp in radii)
+            {
+                if (string.IsNullOrEmpty(kvp.Key) || kvp.Key.Equals("default", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (name.IndexOf(kvp.Key, StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+                if (kvp.Key.Length > bestLen)
+                {
+                    bestLen = kvp.Key.Length;
+                    bestKey = kvp.Key;
+                }
+            }
+            if (bestKey != null && radii.TryGetValue(bestKey, out float matched) && matched > 0f)
+                return matched;
+            if (radii.TryGetValue("default", out float fallback) && fallback > 0f)
+                return fallback;
+            return 0.25f;
+        }
+
         private bool IsValidAnimal(BaseEntity entity)
         {
             if (entity == null) return false;
@@ -3035,6 +3277,9 @@ private string GetKillerName(BaseEntity entity)
                     kills = stats.kills,
                     deaths = stats.deaths,
                     headshots = stats.headshots,
+                    playerHeadshots = stats.playerHeadshots,
+                    npcHeadshots = stats.npcHeadshots,
+                    animalHeadshots = stats.animalHeadshots,
                     animalsKilled = stats.animalsKilled,
                     npcsKilled = stats.npcsKilled,
                     currentKillStreak = stats.currentKillStreak,
@@ -3237,7 +3482,7 @@ void CmdMyStats(BasePlayer player, string command, string[] args)
 
     player.ChatMessage(lang.GetMessage("YourStatsHeader", this, player.UserIDString));
     player.ChatMessage($"{lang.GetMessage("TotalKills", this, player.UserIDString)} {stats.kills}  |  {lang.GetMessage("TotalDeaths", this, player.UserIDString)} {stats.deaths}  |  {lang.GetMessage("KD", this, player.UserIDString)} {kd:F2}");
-    player.ChatMessage(string.Format(lang.GetMessage("HeadshotsBreakdown", this, player.UserIDString), stats.headshots, stats.playerHeadshots, stats.npcHeadshots));
+    player.ChatMessage(string.Format(lang.GetMessage("HeadshotsBreakdown", this, player.UserIDString), stats.headshots, stats.playerHeadshots, stats.npcHeadshots, stats.animalHeadshots));
     player.ChatMessage(string.Format(lang.GetMessage("KillsBreakdown", this, player.UserIDString), stats.playersKilled, stats.npcsKilled, stats.animalsKilled));
     player.ChatMessage(string.Format(lang.GetMessage("DeathsBreakdown", this, player.UserIDString), stats.deathsByPlayer, stats.deathsByNPC, stats.deathsByAnimal));
 
@@ -3414,6 +3659,7 @@ void CmdMyStats(BasePlayer player, string command, string[] args)
             lastPlayerAttacker.Clear();
             lastPlayerAttackerId.Clear();
             lastAnimalAttacker.Clear();
+            lastAnimalHeadshot.Clear();
             processedDeaths.Clear();
             processedNpcKills.Clear();
             SeedNpcTypes();
