@@ -10,7 +10,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStats", "FiREST0N3D", "1.9.821")]
+    [Info("LiveStats", "FiREST0N3D", "1.9.825")]
     [Description("Comprehensive player/NPC/animal stats, killfeed + optional idle kick. Dual wipe detection. Kill streak tracking (players/NPCs/animals) + isPlayerDead. Optional LiveStatsWorld extension for time/weather. CONFLICTS: none by default; idle kick is opt-in. Pair with LiveStatsWorld/LiveStatsEvents as a suite.")]
     class LiveStats : RustPlugin
     {
@@ -36,7 +36,11 @@ namespace Oxide.Plugins
         private readonly Dictionary<ulong, DamageTrackEntry> lastAnimalAttacker = new Dictionary<ulong, DamageTrackEntry>();
         // Last player hit on an animal. Death HitInfo usually has no impact point, so the kill shot is read from here.
         private readonly Dictionary<ulong, AnimalHeadshotTrack> lastAnimalHeadshot = new Dictionary<ulong, AnimalHeadshotTrack>(64);
+        private readonly Dictionary<ulong, float> lastAnimalHeadshotSound = new Dictionary<ulong, float>(32);
         private const float AnimalHeadshotFreshSeconds = 4f;
+        private const float AnimalHeadshotSoundCooldown = 0.12f;
+        private const string AnimalHeadshot2DEffect = "assets/bundled/prefabs/fx/headshot_2d.prefab";
+        private const string AnimalHeadshot3DEffect = "assets/bundled/prefabs/fx/headshot.prefab";
 
         // Idle / AFK tracking
         private readonly Dictionary<string, float> lastActivity = new Dictionary<string, float>(256);
@@ -111,7 +115,7 @@ namespace Oxide.Plugins
             public int animalsKilled = 0;
             public int playerHeadshots = 0;
             public int npcHeadshots = 0;
-            // Animals have no conventional headshot hitboxes — field kept for data compatibility only
+            // Kill-shot only. Animals have no real head hitbox; counted from the last player hit near the head bone.
             public int animalHeadshots = 0;
             public int deathsByPlayer = 0;
             public int deathsByNPC = 0;
@@ -133,13 +137,15 @@ namespace Oxide.Plugins
             // True only while the player is dead and has not yet respawned
             public bool isPlayerDead = false;
 
-            // Per-animal tracking for hunters (K/D vs specific animals)
+            // Per-animal tracking for hunters (K/D vs specific animals, plus kill-shot headshots)
             public Dictionary<string, int> animalsKilledByType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             public Dictionary<string, int> deathsByAnimalType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            public Dictionary<string, int> animalHeadshotsByType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
             // Per-NPC tracking (K/D vs specific NPC types, e.g. Heavy Scientist, Tunnel Dweller)
             public Dictionary<string, int> npcsKilledByType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             public Dictionary<string, int> deathsByNpcType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            public Dictionary<string, int> npcHeadshotsByType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
             // Personal PvP kill feed (who this player killed / who killed them)
             public List<PvpEntry> recentPvpKills = new List<PvpEntry>();
@@ -194,13 +200,15 @@ namespace Oxide.Plugins
             [JsonProperty("EnableAnimalStats")] public bool EnableAnimalStats { get; set; } = true;
             // Kill-shot only, same rule as NPC headshots. Position vs head bone — animals have no head collider.
             [JsonProperty("EnableAnimalHeadshots")] public bool EnableAnimalHeadshots { get; set; } = true;
+            // Same ding the shooter hears on a player or NPC headshot. Plays on the hit, not only the kill.
+            [JsonProperty("PlayAnimalHeadshotSound")] public bool PlayAnimalHeadshotSound { get; set; } = true;
             // Prefab fragment -> metres. Longest matching key wins. "default" is the fallback.
             [JsonProperty("AnimalHeadshotRadii")] public Dictionary<string, float> AnimalHeadshotRadii { get; set; } = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase)
             {
                 { "polarbear", 0.45f },
                 { "bear", 0.42f },
                 { "wolf", 0.22f },
-                { "boar", 0.24f },
+                { "boar", 0.42f },
                 { "stag", 0.30f },
                 { "horse", 0.34f },
                 { "foal", 0.22f },
@@ -389,7 +397,7 @@ namespace Oxide.Plugins
             LoadDefaultMessages();
             LogLanguagePackInventory();
 
-            Puts("LiveStats v1.9.821 loaded (animal kill-shot headshots from last hit; stats clock +4s)");
+            Puts("LiveStats v1.9.825 loaded (animal headshot sound + body-scaled headshots; stats clock +4s)");
             LoadWipeIdentity();
             LoadStats();
             LoadNpcStats();
@@ -677,10 +685,14 @@ namespace Oxide.Plugins
                         s.animalsKilledByType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
                     if (s.deathsByAnimalType == null)
                         s.deathsByAnimalType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    if (s.animalHeadshotsByType == null)
+                        s.animalHeadshotsByType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
                     if (s.npcsKilledByType == null)
                         s.npcsKilledByType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
                     if (s.deathsByNpcType == null)
                         s.deathsByNpcType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    if (s.npcHeadshotsByType == null)
+                        s.npcHeadshotsByType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
                     if (s.recentPvpKills == null)
                         s.recentPvpKills = new List<PvpEntry>();
                     if (s.recentPvpDeaths == null)
@@ -1478,12 +1490,15 @@ namespace Oxide.Plugins
                 && info.InitiatorPlayer != null && info.InitiatorPlayer.userID.IsSteamId()
                 && !IsSamePlayer(entity, info.InitiatorPlayer))
             {
+                bool headshot = IsAnimalKillHeadshot(entity, info);
                 lastAnimalHeadshot[netId] = new AnimalHeadshotTrack
                 {
                     Prefab = victimPrefab,
                     Time = Time.realtimeSinceStartup,
-                    Headshot = IsAnimalKillHeadshot(entity, info)
+                    Headshot = headshot
                 };
+                if (headshot && config.PlayAnimalHeadshotSound)
+                    PlayAnimalHeadshotSound(info.InitiatorPlayer, ResolveHitPoint(info, entity));
             }
 
             // Soft size cap — full prune runs on a timer
@@ -2065,8 +2080,26 @@ namespace Oxide.Plugins
                 if (details.IsHeadshot)
                 {
                     kStats.headshots++;
-                    if (classification.IsNpcEntity) kStats.npcHeadshots++;
-                    else if (classification.IsAnimal) kStats.animalHeadshots++;
+                    if (classification.IsNpcEntity)
+                    {
+                        kStats.npcHeadshots++;
+                        string npcHsType = details.NpcTypeKey ?? "Unknown";
+                        if (kStats.npcHeadshotsByType == null)
+                            kStats.npcHeadshotsByType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                        if (!kStats.npcHeadshotsByType.ContainsKey(npcHsType))
+                            kStats.npcHeadshotsByType[npcHsType] = 0;
+                        kStats.npcHeadshotsByType[npcHsType]++;
+                    }
+                    else if (classification.IsAnimal)
+                    {
+                        kStats.animalHeadshots++;
+                        string animalHsType = details.AnimalVictim ?? "Unknown";
+                        if (kStats.animalHeadshotsByType == null)
+                            kStats.animalHeadshotsByType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                        if (!kStats.animalHeadshotsByType.ContainsKey(animalHsType))
+                            kStats.animalHeadshotsByType[animalHsType] = 0;
+                        kStats.animalHeadshotsByType[animalHsType]++;
+                    }
                     else if (classification.IsRealPlayer) kStats.playerHeadshots++;
                 }
 
@@ -2555,6 +2588,14 @@ namespace Oxide.Plugins
                 list.RemoveAt(list.Count - 1);
         }
 
+        private static string FormatTypeWithHeadshots(string typeName, int kills, Dictionary<string, int> headshotsByType)
+        {
+            int hs = 0;
+            if (headshotsByType != null)
+                headshotsByType.TryGetValue(typeName, out hs);
+            return hs > 0 ? $"{typeName}: {kills} ({hs} HS)" : $"{typeName}: {kills}";
+        }
+
 private void LoadDefaultMessages()
 {
     lang.RegisterMessages(new Dictionary<string, string>
@@ -2607,10 +2648,10 @@ private void LoadDefaultMessages()
         ["TotalDeaths"] = "<color=#ff4444>Total Deaths:</color>",
         ["KD"] = "<color=#ffff44>K/D:</color>",
         ["HeadshotsBreakdown"] = "Headshots: {0} (PvP: {1} | NPC: {2} | Animals: {3})",
-        ["AnimalKD"] = "<color=#44ff44>Animal K/D:</color> {0} (Kills: {1} | Deaths: {2})",
+        ["AnimalKD"] = "<color=#44ff44>Animal K/D:</color> {0} (Kills: {1} | Deaths: {2} | Headshots: {3})",
         ["AnimalsKilledList"] = "Animals killed: {0}",
         ["KilledByAnimalsList"] = "Killed by animals: {0}",
-        ["NpcKD"] = "<color=#44ff44>NPC K/D:</color> {0} (Kills: {1} | Deaths: {2})",
+        ["NpcKD"] = "<color=#44ff44>NPC K/D:</color> {0} (Kills: {1} | Deaths: {2} | Headshots: {3})",
         ["NpcsKilledList"] = "NPCs killed: {0}",
         ["KilledByNpcsList"] = "Killed by NPCs: {0}",
         ["KillsBreakdown"] = "Kills -> Players: {0} | NPCs: {1} | Animals: {2}",
@@ -2872,7 +2913,7 @@ private void LoadDefaultMessages()
                 { "polarbear", 0.45f },
                 { "bear", 0.42f },
                 { "wolf", 0.22f },
-                { "boar", 0.24f },
+                { "boar", 0.42f },
                 { "stag", 0.30f },
                 { "horse", 0.34f },
                 { "foal", 0.22f },
@@ -2941,38 +2982,214 @@ private void LoadDefaultMessages()
             return Vector3.zero;
         }
 
+        /// <summary>
+        /// Shooter hears the same 2D headshot ding as a player/NPC headshot. Nearby players hear
+        /// the 3D crack at the animal, matching a vanilla headshot.
+        /// </summary>
+        private void PlayAnimalHeadshotSound(BasePlayer attacker, Vector3 at)
+        {
+            if (attacker == null || attacker.net?.connection == null) return;
+
+            float now = Time.realtimeSinceStartup;
+            if (lastAnimalHeadshotSound.TryGetValue(attacker.userID, out float last)
+                && now - last < AnimalHeadshotSoundCooldown)
+                return;
+            lastAnimalHeadshotSound[attacker.userID] = now;
+
+            // 2D ding, shooter only — this is the sound a player/NPC headshot plays for you.
+            Effect.server.Run(AnimalHeadshot2DEffect, attacker.transform.position, Vector3.zero, attacker.net.connection);
+            // World crack at the animal so it is not silent for everyone else.
+            if (at.sqrMagnitude > 0.01f)
+                Effect.server.Run(AnimalHeadshot3DEffect, at, Vector3.zero);
+        }
+
         private bool IsAnimalKillHeadshot(BaseCombatEntity entity, HitInfo info)
         {
             if (entity == null || info == null) return false;
             if (config != null && !config.EnableAnimalHeadshots) return false;
 
-            Vector3 hit = ResolveHitPoint(info, entity);
-            if (hit.sqrMagnitude < 0.01f)
-                return false;
+            string boneName = info.boneName;
+            if (!string.IsNullOrEmpty(boneName)
+                && boneName.IndexOf("head", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
 
             Transform head = FindAnimalHeadBone(entity);
-            if (head == null)
-            {
-                if (config != null && config.DebugMode)
-                {
-                    string prefab = entity.ShortPrefabName ?? "";
-                    if (_loggedMissingAnimalHead.Add(prefab))
-                        Puts($"[AnimalHS] no head bone on {prefab} — kill not counted as headshot");
-                }
-                return false;
-            }
+            bool hasBounds = TryGetAnimalWorldBounds(entity, out Bounds world);
+            Vector3 headPos = ResolveAnimalHeadPosition(entity, head, hasBounds, world);
+            float radius = ScaledAnimalHeadRadius(entity, headPos, hasBounds, world);
 
-            float radius = GetAnimalHeadRadius(entity.ShortPrefabName);
-            var extents = entity.bounds.extents;
-            if (extents.y > 0.2f)
-                radius = Mathf.Max(radius, Mathf.Clamp(extents.y * 0.55f, 0.2f, 0.85f));
-            float distSqr = (hit - head.position).sqrMagnitude;
-            float horizontal = Vector2.Distance(new Vector2(hit.x, hit.z), new Vector2(head.position.x, head.position.z));
-            bool aboveNeck = hit.y >= head.position.y - 0.2f && hit.y <= head.position.y + radius;
-            bool headshot = distSqr <= radius * radius || (aboveNeck && horizontal <= radius);
+            Vector3 hit = ResolveHitPoint(info, entity);
+            bool hasHit = hit.sqrMagnitude > 0.01f;
+            float dist = hasHit ? Vector3.Distance(hit, headPos) : 999f;
+            float aimDist = 999f;
+            bool aimed = ShotPassesHead(info, entity, headPos, radius, out aimDist);
+            // Capsule impact sits on the chest. Count it when it is still in the head sphere
+            // or on the front cap of the body (true for every quadruped, not just tall livestock).
+            bool nearImpact = hasHit && dist <= radius * 1.5f;
+            bool frontCap = hasHit && hasBounds && HitOnFrontCap(entity, hit, world);
+            bool headshot = aimed || nearImpact || frontCap;
+
             if (config != null && config.DebugMode)
-                Puts($"[AnimalHS] {entity.ShortPrefabName} dist={Mathf.Sqrt(distSqr):F2} horiz={horizontal:F2} radius={radius:F2} hitY={hit.y:F2} headY={head.position.y:F2} headshot={headshot}");
+                Puts($"[AnimalHS] {entity.ShortPrefabName} impact={dist:F2} aim={aimDist:F2} radius={radius:F2} bone={(head != null)} front={frontCap} headshot={headshot}");
             return headshot;
+        }
+
+        private float ScaledAnimalHeadRadius(BaseEntity entity, Vector3 headPos, bool hasBounds, Bounds world)
+        {
+            float radius = GetAnimalHeadRadius(entity.ShortPrefabName);
+            if (!hasBounds) return radius;
+
+            float width = Mathf.Min(world.extents.x, world.extents.z) * 2f;
+            float length = Mathf.Max(world.extents.x, world.extents.z) * 2f;
+            float height = world.size.y;
+            // Head is a fraction of the body on every species. Width covers snouts; length covers
+            // the gap between the skull bone and the body-capsule impact.
+            float scaled = Mathf.Max(width * 0.55f, length * 0.22f, height * 0.38f);
+            return Mathf.Clamp(Mathf.Max(radius, scaled), 0.2f, 0.95f);
+        }
+
+        private static Vector3 ResolveAnimalHeadPosition(BaseEntity entity, Transform head, bool hasBounds, Bounds world)
+        {
+            Vector3 forward = entity.transform.forward;
+            forward.y = 0f;
+            if (forward.sqrMagnitude < 0.01f) forward = entity.transform.forward;
+            forward.Normalize();
+
+            if (head != null)
+            {
+                // Skull bone sits behind the snout. Nudge toward the nose so a capsule hit counts.
+                float nudge = hasBounds ? Mathf.Clamp(world.extents.z * 0.35f, 0.12f, 0.45f) : 0.2f;
+                return head.position + forward * nudge;
+            }
+            if (hasBounds)
+            {
+                float lift = world.size.y * 0.2f;
+                return world.center + forward * (Mathf.Max(world.extents.x, world.extents.z) * 0.75f) + Vector3.up * lift;
+            }
+            return EstimateAnimalHead(entity);
+        }
+
+        private static bool HitOnFrontCap(BaseEntity entity, Vector3 hit, Bounds world)
+        {
+            Vector3 forward = entity.transform.forward;
+            forward.y = 0f;
+            if (forward.sqrMagnitude < 0.01f) return false;
+            forward.Normalize();
+
+            float half = Mathf.Max(world.extents.x, world.extents.z);
+            if (half < 0.15f) return false;
+            float along = Vector3.Dot(hit - world.center, forward);
+            // Front quarter of the body. Side and rear shots stay body shots.
+            if (along < half * 0.28f) return false;
+
+            float height = world.size.y;
+            if (height < 0.15f) return true;
+            // Snakes and sharks are low; chickens and deer are high. Very-front hits skip the height gate.
+            if (along >= half * 0.55f) return true;
+            return hit.y >= world.min.y + height * 0.32f;
+        }
+
+        private static bool TryGetAnimalWorldBounds(BaseEntity entity, out Bounds bounds)
+        {
+            bounds = default;
+            if (entity == null) return false;
+            var cols = entity.GetComponentsInChildren<Collider>();
+            bool any = false;
+            if (cols != null)
+            {
+                for (int i = 0; i < cols.Length; i++)
+                {
+                    var col = cols[i];
+                    if (col == null || !col.enabled || col.isTrigger) continue;
+                    if (!any)
+                    {
+                        bounds = col.bounds;
+                        any = true;
+                    }
+                    else bounds.Encapsulate(col.bounds);
+                }
+            }
+            if (any && bounds.extents.sqrMagnitude > 0.01f) return true;
+
+            var ext = entity.bounds.extents;
+            if (ext.sqrMagnitude < 0.01f || entity.transform == null) return false;
+            bounds = new Bounds(entity.transform.TransformPoint(entity.bounds.center), ext * 2f);
+            return true;
+        }
+
+        /// <summary>
+        /// True when the bullet or eye ray passes within radius of the head. Animals only have a
+        /// body capsule, so HitPositionWorld is usually the chest even on a visual headshot.
+        /// </summary>
+        private static bool ShotPassesHead(HitInfo info, BaseEntity entity, Vector3 headPos, float radius, out float aimDist)
+        {
+            aimDist = 999f;
+            if (info == null) return false;
+
+            bool any = false;
+            if (TryEyeRay(info, entity, out Vector3 eyeOrigin, out Vector3 eyeDir, out float eyeLen)
+                && SegmentNearHead(eyeOrigin, eyeDir, eyeLen, headPos, radius, ref aimDist))
+                any = true;
+            if (TryProjectileSegment(info, out Vector3 origin, out Vector3 dir, out float length)
+                && SegmentNearHead(origin, dir, length, headPos, radius, ref aimDist))
+                any = true;
+            return any;
+        }
+
+        private static bool SegmentNearHead(Vector3 origin, Vector3 dir, float length, Vector3 headPos, float radius, ref float aimDist)
+        {
+            float along = Vector3.Dot(headPos - origin, dir);
+            if (along < -0.35f || along > length + 0.85f) return false;
+            Vector3 closest = origin + dir * Mathf.Clamp(along, 0f, length);
+            float dist = Vector3.Distance(closest, headPos);
+            if (dist < aimDist) aimDist = dist;
+            return dist <= radius;
+        }
+
+        private static bool TryEyeRay(HitInfo info, BaseEntity entity, out Vector3 origin, out Vector3 dir, out float length)
+        {
+            origin = Vector3.zero;
+            dir = Vector3.forward;
+            length = 0f;
+            var attacker = info.InitiatorPlayer;
+            if (attacker == null || attacker.eyes == null) return false;
+            origin = attacker.eyes.position;
+            dir = attacker.eyes.HeadForward();
+            if (dir.sqrMagnitude < 0.01f) return false;
+            dir.Normalize();
+            Vector3 end = info.PointEnd.sqrMagnitude > 0.01f ? info.PointEnd : info.HitPositionWorld;
+            if (end.sqrMagnitude < 0.01f && entity != null && entity.transform != null)
+                end = entity.transform.position;
+            length = Mathf.Max(1.5f, Vector3.Distance(origin, end) + 1.5f);
+            return true;
+        }
+
+        private static bool TryProjectileSegment(HitInfo info, out Vector3 origin, out Vector3 dir, out float length)
+        {
+            origin = Vector3.zero;
+            dir = Vector3.forward;
+            length = 0f;
+            Vector3 start = info.PointStart;
+            Vector3 pointEnd = info.PointEnd;
+            if (start.sqrMagnitude < 0.01f || pointEnd.sqrMagnitude < 0.01f) return false;
+            Vector3 delta = pointEnd - start;
+            length = delta.magnitude;
+            if (length < 0.05f) return false;
+            origin = start;
+            dir = delta / length;
+            length += 0.85f;
+            return true;
+        }
+
+        private static Vector3 EstimateAnimalHead(BaseEntity entity)
+        {
+            var t = entity.transform;
+            Vector3 forward = t.forward;
+            Vector3 up = Vector3.up;
+            var ext = entity.bounds.extents;
+            float ahead = ext.z > 0.08f ? ext.z * 0.9f : 0.55f;
+            float lift = ext.y > 0.08f ? ext.y * 0.65f : 0.4f;
+            return t.position + forward * ahead + up * lift;
         }
 
         private static Transform FindAnimalHeadBone(BaseEntity entity)
@@ -3002,7 +3219,9 @@ private void LoadDefaultMessages()
                 if (string.IsNullOrEmpty(n)) continue;
                 if (n.Equals("head", StringComparison.OrdinalIgnoreCase))
                     return t;
-                if (fallback == null && n.IndexOf("head", StringComparison.OrdinalIgnoreCase) >= 0
+                if (fallback == null && (n.IndexOf("head", StringComparison.OrdinalIgnoreCase) >= 0
+                    || n.Equals("jaw", StringComparison.OrdinalIgnoreCase)
+                    || n.IndexOf("skull", StringComparison.OrdinalIgnoreCase) >= 0)
                     && n.IndexOf("headshot", StringComparison.OrdinalIgnoreCase) < 0
                     && n.IndexOf("light", StringComparison.OrdinalIgnoreCase) < 0)
                     fallback = t;
@@ -3013,7 +3232,7 @@ private void LoadDefaultMessages()
         private float GetAnimalHeadRadius(string shortPrefab)
         {
             var radii = config?.AnimalHeadshotRadii;
-            if (radii == null || radii.Count == 0) return 0.25f;
+            if (radii == null || radii.Count == 0) return AnimalHeadRadiusFloor(shortPrefab);
 
             string name = shortPrefab ?? "";
             string bestKey = null;
@@ -3031,10 +3250,29 @@ private void LoadDefaultMessages()
                 }
             }
             if (bestKey != null && radii.TryGetValue(bestKey, out float matched) && matched > 0f)
-                return matched;
+                return Mathf.Max(matched, AnimalHeadRadiusFloor(name));
             if (radii.TryGetValue("default", out float fallback) && fallback > 0f)
-                return fallback;
-            return 0.25f;
+                return Mathf.Max(fallback, AnimalHeadRadiusFloor(name));
+            return AnimalHeadRadiusFloor(name);
+        }
+
+        /// <summary>
+        /// Saved configs keep the old tight radii. The floor is what a head-on capsule hit needs.
+        /// </summary>
+        private static float AnimalHeadRadiusFloor(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return 0.36f;
+            if (name.IndexOf("polarbear", StringComparison.OrdinalIgnoreCase) >= 0) return 0.55f;
+            if (name.IndexOf("bear", StringComparison.OrdinalIgnoreCase) >= 0) return 0.50f;
+            if (name.IndexOf("boar", StringComparison.OrdinalIgnoreCase) >= 0) return 0.42f;
+            if (name.IndexOf("stag", StringComparison.OrdinalIgnoreCase) >= 0) return 0.40f;
+            if (name.IndexOf("horse", StringComparison.OrdinalIgnoreCase) >= 0) return 0.42f;
+            if (name.IndexOf("wolf", StringComparison.OrdinalIgnoreCase) >= 0) return 0.34f;
+            if (name.IndexOf("crocodile", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("croc", StringComparison.OrdinalIgnoreCase) >= 0) return 0.40f;
+            if (name.IndexOf("shark", StringComparison.OrdinalIgnoreCase) >= 0) return 0.48f;
+            if (name.IndexOf("chicken", StringComparison.OrdinalIgnoreCase) >= 0) return 0.18f;
+            return 0.36f;
         }
 
         private bool IsValidAnimal(BaseEntity entity)
@@ -3280,6 +3518,8 @@ private string GetKillerName(BaseEntity entity)
                     playerHeadshots = stats.playerHeadshots,
                     npcHeadshots = stats.npcHeadshots,
                     animalHeadshots = stats.animalHeadshots,
+                    animalHeadshotsByType = stats.animalHeadshotsByType,
+                    npcHeadshotsByType = stats.npcHeadshotsByType,
                     animalsKilled = stats.animalsKilled,
                     npcsKilled = stats.npcsKilled,
                     currentKillStreak = stats.currentKillStreak,
@@ -3505,12 +3745,12 @@ void CmdMyStats(BasePlayer player, string command, string[] args)
         float npcKd = stats.deathsByNPC > 0 ? (float)stats.npcsKilled / stats.deathsByNPC : stats.npcsKilled;
         player.ChatMessage(string.Format(
             lang.GetMessage("NpcKD", this, player.UserIDString),
-            npcKd.ToString("F2"), stats.npcsKilled, stats.deathsByNPC));
+            npcKd.ToString("F2"), stats.npcsKilled, stats.deathsByNPC, stats.npcHeadshots));
 
         if (stats.npcsKilledByType != null && stats.npcsKilledByType.Count > 0)
         {
             var topKills = stats.npcsKilledByType.OrderByDescending(x => x.Value).Take(5)
-                .Select(x => $"{x.Key}: {x.Value}");
+                .Select(x => FormatTypeWithHeadshots(x.Key, x.Value, stats.npcHeadshotsByType));
             player.ChatMessage(string.Format(
                 lang.GetMessage("NpcsKilledList", this, player.UserIDString),
                 string.Join(", ", topKills)));
@@ -3531,12 +3771,12 @@ void CmdMyStats(BasePlayer player, string command, string[] args)
         float animalKd = stats.deathsByAnimal > 0 ? (float)stats.animalsKilled / stats.deathsByAnimal : stats.animalsKilled;
         player.ChatMessage(string.Format(
             lang.GetMessage("AnimalKD", this, player.UserIDString),
-            animalKd.ToString("F2"), stats.animalsKilled, stats.deathsByAnimal));
+            animalKd.ToString("F2"), stats.animalsKilled, stats.deathsByAnimal, stats.animalHeadshots));
 
         if (stats.animalsKilledByType != null && stats.animalsKilledByType.Count > 0)
         {
             var topKills = stats.animalsKilledByType.OrderByDescending(x => x.Value).Take(5)
-                .Select(x => $"{x.Key}: {x.Value}");
+                .Select(x => FormatTypeWithHeadshots(x.Key, x.Value, stats.animalHeadshotsByType));
             player.ChatMessage(string.Format(
                 lang.GetMessage("AnimalsKilledList", this, player.UserIDString),
                 string.Join(", ", topKills)));
