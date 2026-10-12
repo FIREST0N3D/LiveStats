@@ -9,8 +9,8 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.55")]
-    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.54: tide knob slews between samples. Cyclone passage stays opt-in.")]
+    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.61")]
+    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.61: ceiling ignores the first-sample instability spike and logs why it refused Fog.")]
     class LiveStatsWorld : RustPlugin
     {
         private enum CloudSwapPhase
@@ -321,7 +321,7 @@ namespace Oxide.Plugins
         {
             permission.RegisterPermission(AdminPermission, this);
             LoadDefaultMessages();
-            Puts("LiveStatsWorld v1.1.55 loaded (shared 1s slew/blend clock, world stats +7s)");
+            Puts("LiveStatsWorld v1.1.61 loaded (ceiling reason on the targets line)");
         }
 
         private void OnPlayerConnected(BasePlayer player)
@@ -2434,7 +2434,9 @@ namespace Oxide.Plugins
                 string wantAsset = DesiredCloudConfig(profile, rainValue);
                 string haveAsset = string.IsNullOrEmpty(wx.currentCloudConfig) ? "?" : wx.currentCloudConfig;
                 string deck = (config != null && config.UseDeckMixer) ? "deck" : "wmo";
-                Puts($"[Weather] Targets -> {forecastName} | {deck} loaded:{haveAsset} want:{wantAsset} | code={weatherCode} cape={cape:F0} Rain:{wx.targetRain:F2} Clouds:{wx.targetClouds:F2} L/M/H:{cloudLow:F2}/{cloudMid:F2}/{cloudHigh:F2} | CCN:{wx.currentCcn:F2} instab:{wx.currentInstability:F2} | blend~{wx._dynamicBlendSeconds:F0}s");
+                string why = CeilingReject();
+                string ceilingNote = why == null ? " ceiling=yes" : $" ceiling=no:{why}";
+                Puts($"[Weather] Targets -> {forecastName} | {deck} loaded:{haveAsset} want:{wantAsset} | code={weatherCode} cape={cape:F0} Rain:{wx.targetRain:F2} Clouds:{wx.targetClouds:F2} L/M/H:{cloudLow:F2}/{cloudMid:F2}/{cloudHigh:F2} storedL={wx.lastCloudLow:F2} codeStored={wx.lastWeatherCode} | CCN:{wx.currentCcn:F2} instab:{wx.currentInstability:F2}/{wx.targetInstability:F2} vis={wx.lastOmVisibility:F0} rh={wx.lastOmHumidity:F0}{ceilingNote} | blend~{wx._dynamicBlendSeconds:F0}s");
             }
         }
 
@@ -2489,10 +2491,46 @@ namespace Oxide.Plugins
         {
             float minLow = config != null && config.LowDeckCloudMin > 0f ? config.LowDeckCloudMin : 0.50f;
             if (wx.lastCloudLow < minLow) return false;
-            // Low must be the main layer, not just present under a thick mid/high stack.
-            if (wx.lastCloudLow + 0.08f < wx.lastCloudMid) return false;
-            if (wx.lastCloudLow + 0.05f < wx.lastCloudHigh) return false;
-            return wx.lastCloudMid < 0.62f;
+            // Classic ceiling: low is the deck, mid/high are thin.
+            bool lowDominates = wx.lastCloudLow + 0.08f >= wx.lastCloudMid
+                && wx.lastCloudLow + 0.05f >= wx.lastCloudHigh
+                && wx.lastCloudMid < 0.62f;
+            if (lowDominates) return true;
+            // Full stack still has a ceiling if the rain is stratiform.
+            // Ground only sees the low base. Mid/high being full does not lift it.
+            return IsStratiformCeiling();
+        }
+
+        /// <summary>
+        /// Solid low base, light rain, no convection. Uses weather code, rain rate,
+        /// CAPE, humidity and visibility — not a hardcoded hour.
+        /// </summary>
+        private bool IsStratiformCeiling()
+        {
+            return CeilingReject() == null;
+        }
+
+        /// <summary>Null means Fog. Otherwise a short reason for the targets log.</summary>
+        private string CeilingReject()
+        {
+            if (wx.lastCloudLow < 0.85f) return "low";
+            if (wx.targetRain > 0.50f) return "rain";
+            if (wx.lastOmCape > 400f) return "cape";
+            // Do not use targetInstability. First sample can spike it while current is still ~0.06.
+
+            int code = wx.lastWeatherCode;
+            bool drizzle = code >= 51 && code <= 57;
+            bool fogCode = code == 45 || code == 48;
+            bool lightRain = code >= 61 && code <= 63;
+            bool murk = wx.lastOmVisibility > 0f && wx.lastOmVisibility < 8000f;
+            bool saturated = wx.lastOmHumidity >= 85f;
+            bool lightRate = wx.targetRain < 0.40f;
+
+            if (fogCode) return null;
+            if (drizzle && lightRate) return null;
+            if (lightRain && lightRate && (murk || saturated || wx.lastCloudLow >= 0.95f)) return null;
+            if (wx.lastCloudLow >= 0.95f && lightRate && (murk || saturated)) return null;
+            return "nocue";
         }
 
         private bool ThunderBlocksClearSky()
@@ -2527,7 +2565,10 @@ namespace Oxide.Plugins
             float mid = wx.lastCloudMid;
             float high = wx.lastCloudHigh;
             float stack = low + mid + high;
-            bool lowDeck = (config == null || config.UseFogCloudsForLowDeck) && IsLowAltitudeCloudDeck();
+            bool fogOn = config == null || config.UseFogCloudsForLowDeck;
+            bool lowDeck = fogOn && IsLowAltitudeCloudDeck();
+            // Stratiform ceiling is its own data rule. Do not hide it behind the old flag.
+            bool ceiling = IsStratiformCeiling();
             bool highOnly = high > 0.40f && (low + mid) < 0.22f;
             bool cirrus = highOnly || (high > 0.45f && (low + mid) < 0.35f);
             bool midThick = mid >= 0.72f && mid >= low - 0.02f;
@@ -2537,7 +2578,7 @@ namespace Oxide.Plugins
                 return "Storm_VClouds";
             if (profile == "rain" && rainIntensity > 0.55f)
                 return "RainHeavy_VClouds";
-            if (profile == "fog" || lowDeck)
+            if (profile == "fog" || lowDeck || ceiling)
                 return "Fog_VClouds";
             if (profile == "dust")
                 return "Overcast_VClouds";
@@ -2603,19 +2644,37 @@ namespace Oxide.Plugins
 
             cloudDensity = Mathf.Clamp01(Mathf.Lerp(0.04f, 0.98f, thick));
             cloudOpacity = Mathf.Clamp01(Mathf.Lerp(0.10f, 0.98f, thick) + humidityFactor * 0.08f + fog01 * 0.12f);
-            cloudSize = Mathf.Clamp(Mathf.Lerp(0.70f, 1.50f, mid01 * 0.55f + low01 * 0.35f + rain01 * 0.25f), 0.40f, 2.50f);
+            // Base size from thickness, then altitude bias: high deck zooms out (smaller cells = farther),
+            // low deck zooms in (larger cells = closer). Mesh plane does not move; this is the illusion.
+            float baseSize = Mathf.Lerp(0.70f, 1.40f, mid01 * 0.45f + low01 * 0.40f + rain01 * 0.20f);
+            float heightScore = high01 - low01 * 0.90f; // >0 higher, <0 lower
+            float altitudeSize = 1.0f;
+            if (heightScore > 0f)
+                altitudeSize = Mathf.Lerp(1.0f, 0.52f, Mathf.Clamp01(heightScore));
+            else
+                altitudeSize = Mathf.Lerp(1.0f, 1.62f, Mathf.Clamp01(-heightScore));
+            cloudSize = Mathf.Clamp(Mathf.Lerp(baseSize, altitudeSize, 0.80f), 0.40f, 2.50f);
             cloudSharpness = Mathf.Clamp01(Mathf.Lerp(0.62f, 0.06f, thick * 0.75f + rain01 * 0.25f));
+            // High decks stay sharper; low decks stay softer.
+            if (heightScore > 0.15f)
+                cloudSharpness = Mathf.Max(cloudSharpness, Mathf.Lerp(0.35f, 0.55f, heightScore));
+            else if (heightScore < -0.15f)
+                cloudSharpness = Mathf.Min(cloudSharpness, Mathf.Lerp(0.40f, 0.18f, -heightScore));
             cloudScattering = Mathf.Clamp(Mathf.Lerp(0.70f, 2.10f, low01 * 0.55f + fog01 * 0.35f + rain01 * 0.35f), 0.30f, 2.50f);
-            cloudColoring = Mathf.Clamp01(Mathf.Lerp(1.00f, 0.28f, thick * 0.65f + rain01 * 0.40f));
-            cloudSaturation = Mathf.Clamp01(Mathf.Lerp(1.00f, 0.55f, thick * 0.55f + rain01 * 0.30f));
-            cloudBrightness = Mathf.Clamp(Mathf.Lerp(1.18f, 0.60f, thick * 0.50f + rain01 * 0.35f + cape01 * 0.15f + pressureFactor * 0.15f), 0.30f, 1.50f);
-            cloudAttenuation = Mathf.Clamp(cloudAttenuation + low01 * 0.35f + rain01 * 0.40f + cape01 * 0.15f, 0.20f, 2.00f);
+            // Harder rain darkens the cloud base, not the sky. Light rain barely moves it.
+            // Curve is soft at low rain and steep past ~0.45 so a drizzle does not look like a storm.
+            float rainDark = Mathf.Clamp01((rain01 - 0.12f) / 0.78f);
+            rainDark = rainDark * rainDark;
+            cloudColoring = Mathf.Clamp01(Mathf.Lerp(1.00f, 0.22f, thick * 0.55f + rainDark * 0.55f));
+            cloudSaturation = Mathf.Clamp01(Mathf.Lerp(1.00f, 0.50f, thick * 0.50f + rainDark * 0.35f));
+            cloudBrightness = Mathf.Clamp(Mathf.Lerp(1.18f, 0.42f, thick * 0.40f + rainDark * 0.55f + cape01 * 0.10f + pressureFactor * 0.10f), 0.30f, 1.50f);
+            cloudAttenuation = Mathf.Clamp(cloudAttenuation + low01 * 0.30f + rainDark * 0.55f + cape01 * 0.12f, 0.20f, 2.00f);
 
             if (profile == "storm")
             {
                 cloudDensity = Mathf.Max(cloudDensity, 0.90f);
                 cloudOpacity = 1f;
-                cloudBrightness = Mathf.Min(cloudBrightness, 0.58f);
+                cloudBrightness = Mathf.Min(cloudBrightness, 0.40f);
                 cloudSharpness = Mathf.Min(cloudSharpness, 0.08f);
                 cloudScattering = Mathf.Max(cloudScattering, 1.70f);
                 cloudSize = Mathf.Max(cloudSize, 1.45f);
@@ -2655,14 +2714,21 @@ namespace Oxide.Plugins
                 cloudBrightness = Mathf.Max(cloudBrightness, 1.14f);
             }
 
-            // High-only deck: thin the sliders so RainMild does not read as a mid overcast slab.
+            // High-only deck: thin the sliders and zoom out so RainMild does not read as a mid overcast slab.
             if (high01 > 0.40f && low01 + mid01 < 0.22f && rain01 < 0.08f)
             {
                 cloudDensity = Mathf.Min(cloudDensity, Mathf.Lerp(0.16f, 0.46f, high01));
                 cloudOpacity = Mathf.Min(cloudOpacity, Mathf.Lerp(0.20f, 0.52f, high01));
-                cloudSize = Mathf.Min(cloudSize, 1.05f);
-                cloudSharpness = Mathf.Max(cloudSharpness, 0.38f);
+                cloudSize = Mathf.Min(cloudSize, Mathf.Lerp(0.70f, 0.52f, high01));
+                cloudSharpness = Mathf.Max(cloudSharpness, 0.42f);
                 cloudAttenuation = Mathf.Min(cloudAttenuation, 0.70f);
+            }
+            // Low-dominant deck: zoom in so the same mesh reads closer / lower.
+            else if (low01 > 0.45f && low01 > high01 + 0.10f && rain01 < 0.35f)
+            {
+                cloudSize = Mathf.Max(cloudSize, Mathf.Lerp(1.20f, 1.70f, low01));
+                cloudSharpness = Mathf.Min(cloudSharpness, 0.28f);
+                cloudOpacity = Mathf.Max(cloudOpacity, Mathf.Lerp(0.40f, 0.75f, low01));
             }
         }
 
@@ -2800,12 +2866,13 @@ namespace Oxide.Plugins
             _cloudSwapSavedVMoon = wx.currentVCloudMoon;
 
             int hopsThisChain = Mathf.Max(1, _cloudSwapHopsTotal);
-            float chain = Mathf.Clamp(config.CloudSwapDissolveSeconds, 2.5f, 12f);
+            // Floor at 5s so a short config cannot produce the 1.2/0.3/1.6 flash hop.
+            float chain = Mathf.Clamp(config.CloudSwapDissolveSeconds, 5f, 16f);
             float hop = chain / hopsThisChain;
             bool multi = hopsThisChain > 1;
-            _cloudSwapOutDuration = Mathf.Max(multi ? 0.70f : 1.2f, hop * 0.38f);
-            _cloudSwapHoldDuration = Mathf.Clamp(hop * 0.12f, multi ? 0.18f : 0.25f, multi ? 0.40f : 0.60f);
-            _cloudSwapInDuration = Mathf.Max(multi ? 0.90f : 1.6f, hop * 0.50f);
+            _cloudSwapOutDuration = Mathf.Max(multi ? 0.90f : 1.6f, hop * 0.28f);
+            _cloudSwapHoldDuration = Mathf.Clamp(hop * 0.10f, multi ? 0.22f : 0.40f, multi ? 0.45f : 0.80f);
+            _cloudSwapInDuration = Mathf.Max(multi ? 1.40f : 3.2f, hop * 0.58f);
 
             _cloudSwapPhase = CloudSwapPhase.FadeOut;
             _cloudSwapPhaseStart = Time.realtimeSinceStartup;
@@ -2894,7 +2961,10 @@ namespace Oxide.Plugins
                 return;
             }
 
-            float s = SmootherStep(fadeIn01);
+            // Coverage can come up first. Lighting stays on the pre-swap (darker) values
+            // until the new mesh is partly opaque, so the hop does not flash bright.
+            float lightT = Mathf.Clamp01((fadeIn01 - 0.35f) / 0.65f);
+            float s = SmootherStep(lightT);
             wx.currentAttenuation = Mathf.Lerp(_cloudSwapSavedAtten, wx.targetAttenuation, s);
             wx.currentMie = Mathf.Lerp(_cloudSwapSavedMie, wx.targetMie, s);
             wx.currentCloudScattering = Mathf.Lerp(_cloudSwapSavedScatter, wx.targetCloudScattering, s);
@@ -2977,7 +3047,8 @@ namespace Oxide.Plugins
             else if (_cloudSwapPhase == CloudSwapPhase.FadeIn)
             {
                 float t = Mathf.Clamp01(elapsed / Mathf.Max(0.5f, _cloudSwapInDuration));
-                float s = SmootherStep(t);
+                // Ease-in bias: stay thin longer, then fill. Avoids the mid-fade pop.
+                float s = SmootherStep(Mathf.Clamp01(t * t * 1.15f));
                 // Mid-hops (Clear→RainMild on the way to Overcast) only walk partway
                 // toward the live target so RainMild is actually visible as a step.
                 bool moreHops = _cloudSwapQueue.Count > 0;
@@ -4495,7 +4566,7 @@ namespace Oxide.Plugins
             /// <summary>When true, pick the stock VCloud asset and slider vector from Open-Meteo low/mid/high + CAPE instead of WMO profile alone.</summary>
             [JsonProperty("UseDeckMixer")] public bool UseDeckMixer { get; set; } = true;
             /// <summary>Total seconds for cloud-asset crossfade (fade-out + short hold + fade-in). 5–8 recommended. Driven at 10 Hz so coverage/opacity ease instead of snapping on the weather-blend timer.</summary>
-            [JsonProperty("CloudSwapDissolveSeconds")] public float CloudSwapDissolveSeconds { get; set; } = 6.0f;
+            [JsonProperty("CloudSwapDissolveSeconds")] public float CloudSwapDissolveSeconds { get; set; } = 8.0f;
 
             [JsonProperty("EnableDust")] public bool EnableDust { get; set; } = true;
             [JsonProperty("DustHumidityMax")] public float DustHumidityMax { get; set; } = 35f;
@@ -4881,7 +4952,7 @@ namespace Oxide.Plugins
             config.MaxMinutelyAnchors = Mathf.Clamp(config.MaxMinutelyAnchors, 24, 192);
             config.LookAheadMaxBias = Mathf.Clamp(config.LookAheadMaxBias, 0f, 0.35f);
             config.AnticipatoryBias = Mathf.Clamp(config.AnticipatoryBias, 0f, 0.4f);
-            config.CloudSwapDissolveSeconds = Mathf.Clamp(config.CloudSwapDissolveSeconds, 2f, 20f);
+            config.CloudSwapDissolveSeconds = Mathf.Clamp(config.CloudSwapDissolveSeconds, 5f, 20f);
             config.LowDeckCloudMin = Mathf.Clamp01(config.LowDeckCloudMin);
             config.LightningMinInterval = Mathf.Max(1f, config.LightningMinInterval);
             config.LightningMaxInterval = Mathf.Max(config.LightningMinInterval + 1f, config.LightningMaxInterval);
