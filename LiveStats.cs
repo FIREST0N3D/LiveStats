@@ -10,7 +10,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStats", "FiREST0N3D", "1.9.825")]
+    [Info("LiveStats", "FiREST0N3D", "1.9.828")]
     [Description("Comprehensive player/NPC/animal stats, killfeed + optional idle kick. Dual wipe detection. Kill streak tracking (players/NPCs/animals) + isPlayerDead. Optional LiveStatsWorld extension for time/weather. CONFLICTS: none by default; idle kick is opt-in. Pair with LiveStatsWorld/LiveStatsEvents as a suite.")]
     class LiveStats : RustPlugin
     {
@@ -117,6 +117,8 @@ namespace Oxide.Plugins
             public int npcHeadshots = 0;
             // Kill-shot only. Animals have no real head hitbox; counted from the last player hit near the head bone.
             public int animalHeadshots = 0;
+            public int bulletsFired = 0;
+            public int bulletsHit = 0;
             public int deathsByPlayer = 0;
             public int deathsByNPC = 0;
             public int deathsByAnimal = 0;
@@ -397,7 +399,7 @@ namespace Oxide.Plugins
             LoadDefaultMessages();
             LogLanguagePackInventory();
 
-            Puts("LiveStats v1.9.825 loaded (animal headshot sound + body-scaled headshots; stats clock +4s)");
+            Puts("LiveStats v1.9.828 loaded (tighter animal headshot sphere)");
             LoadWipeIdentity();
             LoadStats();
             LoadNpcStats();
@@ -1501,6 +1503,20 @@ namespace Oxide.Plugins
                     PlayAnimalHeadshotSound(info.InitiatorPlayer, ResolveHitPoint(info, entity));
             }
 
+            // Projectile hit on a player, NPC, or animal. Wall and miss shots never reach here.
+            if (info.IsProjectile()
+                && info.InitiatorPlayer != null && info.InitiatorPlayer.userID.IsSteamId()
+                && !IsSamePlayer(entity, info.InitiatorPlayer))
+            {
+                string attackerId = info.InitiatorPlayer.UserIDString;
+                if (!playerStats.TryGetValue(attackerId, out var shotStats))
+                    shotStats = playerStats[attackerId] = new PlayerStats();
+                shotStats.bulletsHit++;
+                if (string.IsNullOrEmpty(shotStats.lastName))
+                    shotStats.lastName = info.InitiatorPlayer.displayName;
+                SaveStats();
+            }
+
             // Soft size cap — full prune runs on a timer
             if (lastEnvironmentalCause.Count > MaxDamageTrackEntries ||
                 lastNpcAttacker.Count > MaxDamageTrackEntries ||
@@ -1511,6 +1527,34 @@ namespace Oxide.Plugins
                 PruneDamageTracking();
             }
             return null;
+        }
+
+        /// <summary>
+        /// One call per trigger pull. Shotguns report every pellet in the shoot packet.
+        /// Signature matches current Oxide: ProtoBuf.ProjectileShoot.
+        /// </summary>
+        void OnWeaponFired(BaseProjectile weapon, BasePlayer player, ItemModProjectile ammo, ProtoBuf.ProjectileShoot projectileShoot)
+        {
+            try
+            {
+                if (player == null || !player.userID.IsSteamId()) return;
+
+                int count = 1;
+                if (projectileShoot?.projectiles != null && projectileShoot.projectiles.Count > 0)
+                    count = projectileShoot.projectiles.Count;
+
+                if (!playerStats.TryGetValue(player.UserIDString, out var stats))
+                    stats = playerStats[player.UserIDString] = new PlayerStats();
+                stats.bulletsFired += count;
+                if (!string.IsNullOrEmpty(player.displayName))
+                    stats.lastName = player.displayName;
+                SaveStats();
+            }
+            catch (Exception ex)
+            {
+                if (config != null && config.DebugMode)
+                    Puts($"OnWeaponFired error: {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -2588,6 +2632,12 @@ namespace Oxide.Plugins
                 list.RemoveAt(list.Count - 1);
         }
 
+        private static float ShotAccuracy(int fired, int hit)
+        {
+            if (fired <= 0) return 0f;
+            return (float)hit / fired * 100f;
+        }
+
         private static string FormatTypeWithHeadshots(string typeName, int kills, Dictionary<string, int> headshotsByType)
         {
             int hs = 0;
@@ -2648,6 +2698,7 @@ private void LoadDefaultMessages()
         ["TotalDeaths"] = "<color=#ff4444>Total Deaths:</color>",
         ["KD"] = "<color=#ffff44>K/D:</color>",
         ["HeadshotsBreakdown"] = "Headshots: {0} (PvP: {1} | NPC: {2} | Animals: {3})",
+        ["AccuracyBreakdown"] = "Accuracy: {3}% ({0} fired | {1} hit | {2} missed)",
         ["AnimalKD"] = "<color=#44ff44>Animal K/D:</color> {0} (Kills: {1} | Deaths: {2} | Headshots: {3})",
         ["AnimalsKilledList"] = "Animals killed: {0}",
         ["KilledByAnimalsList"] = "Killed by animals: {0}",
@@ -3023,11 +3074,11 @@ private void LoadDefaultMessages()
             float dist = hasHit ? Vector3.Distance(hit, headPos) : 999f;
             float aimDist = 999f;
             bool aimed = ShotPassesHead(info, entity, headPos, radius, out aimDist);
-            // Capsule impact sits on the chest. Count it when it is still in the head sphere
-            // or on the front cap of the body (true for every quadruped, not just tall livestock).
-            bool nearImpact = hasHit && dist <= radius * 1.5f;
+            // Capsule impact sits on the chest, but aim alone is not a headshot: a body shot
+            // still threads the head ray. Impact has to be in the head sphere.
+            bool closeImpact = hasHit && dist <= radius * 1.05f;
             bool frontCap = hasHit && hasBounds && HitOnFrontCap(entity, hit, world);
-            bool headshot = aimed || nearImpact || frontCap;
+            bool headshot = closeImpact && (aimed || frontCap || dist <= radius * 0.7f);
 
             if (config != null && config.DebugMode)
                 Puts($"[AnimalHS] {entity.ShortPrefabName} impact={dist:F2} aim={aimDist:F2} radius={radius:F2} bone={(head != null)} front={frontCap} headshot={headshot}");
@@ -3042,10 +3093,9 @@ private void LoadDefaultMessages()
             float width = Mathf.Min(world.extents.x, world.extents.z) * 2f;
             float length = Mathf.Max(world.extents.x, world.extents.z) * 2f;
             float height = world.size.y;
-            // Head is a fraction of the body on every species. Width covers snouts; length covers
-            // the gap between the skull bone and the body-capsule impact.
-            float scaled = Mathf.Max(width * 0.55f, length * 0.22f, height * 0.38f);
-            return Mathf.Clamp(Mathf.Max(radius, scaled), 0.2f, 0.95f);
+            // Head is a fraction of the body. Keep the sphere on the skull, not the torso.
+            float scaled = Mathf.Max(width * 0.32f, length * 0.12f, height * 0.22f);
+            return Mathf.Clamp(Mathf.Max(radius, scaled), 0.18f, 0.55f);
         }
 
         private static Vector3 ResolveAnimalHeadPosition(BaseEntity entity, Transform head, bool hasBounds, Bounds world)
@@ -3139,7 +3189,7 @@ private void LoadDefaultMessages()
         private static bool SegmentNearHead(Vector3 origin, Vector3 dir, float length, Vector3 headPos, float radius, ref float aimDist)
         {
             float along = Vector3.Dot(headPos - origin, dir);
-            if (along < -0.35f || along > length + 0.85f) return false;
+            if (along < -0.15f || along > length + 0.15f) return false;
             Vector3 closest = origin + dir * Mathf.Clamp(along, 0f, length);
             float dist = Vector3.Distance(closest, headPos);
             if (dist < aimDist) aimDist = dist;
@@ -3160,7 +3210,7 @@ private void LoadDefaultMessages()
             Vector3 end = info.PointEnd.sqrMagnitude > 0.01f ? info.PointEnd : info.HitPositionWorld;
             if (end.sqrMagnitude < 0.01f && entity != null && entity.transform != null)
                 end = entity.transform.position;
-            length = Mathf.Max(1.5f, Vector3.Distance(origin, end) + 1.5f);
+            length = Mathf.Max(0.5f, Vector3.Distance(origin, end));
             return true;
         }
 
@@ -3520,6 +3570,9 @@ private string GetKillerName(BaseEntity entity)
                     animalHeadshots = stats.animalHeadshots,
                     animalHeadshotsByType = stats.animalHeadshotsByType,
                     npcHeadshotsByType = stats.npcHeadshotsByType,
+                    bulletsFired = stats.bulletsFired,
+                    bulletsHit = stats.bulletsHit,
+                    accuracy = ShotAccuracy(stats.bulletsFired, stats.bulletsHit),
                     animalsKilled = stats.animalsKilled,
                     npcsKilled = stats.npcsKilled,
                     currentKillStreak = stats.currentKillStreak,
@@ -3723,6 +3776,10 @@ void CmdMyStats(BasePlayer player, string command, string[] args)
     player.ChatMessage(lang.GetMessage("YourStatsHeader", this, player.UserIDString));
     player.ChatMessage($"{lang.GetMessage("TotalKills", this, player.UserIDString)} {stats.kills}  |  {lang.GetMessage("TotalDeaths", this, player.UserIDString)} {stats.deaths}  |  {lang.GetMessage("KD", this, player.UserIDString)} {kd:F2}");
     player.ChatMessage(string.Format(lang.GetMessage("HeadshotsBreakdown", this, player.UserIDString), stats.headshots, stats.playerHeadshots, stats.npcHeadshots, stats.animalHeadshots));
+    int missed = Math.Max(0, stats.bulletsFired - stats.bulletsHit);
+    player.ChatMessage(string.Format(
+        lang.GetMessage("AccuracyBreakdown", this, player.UserIDString),
+        stats.bulletsFired, stats.bulletsHit, missed, ShotAccuracy(stats.bulletsFired, stats.bulletsHit).ToString("F1")));
     player.ChatMessage(string.Format(lang.GetMessage("KillsBreakdown", this, player.UserIDString), stats.playersKilled, stats.npcsKilled, stats.animalsKilled));
     player.ChatMessage(string.Format(lang.GetMessage("DeathsBreakdown", this, player.UserIDString), stats.deathsByPlayer, stats.deathsByNPC, stats.deathsByAnimal));
 
