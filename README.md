@@ -128,11 +128,6 @@ Current build: LiveStatsEvents 1.13.188 — airfield Chinook event overhauled, w
 4. Copy `LiveStatsEvents.cs`. Console should print `LiveStatsEvents v1.13.188` and an `Enabled events (N): …` line.
 5. Edit configs under `oxide/config/` before turning weather, time, or `DisableVanillaEvents` on. Set `Tide.Enabled` false if another plugin owns ocean level.
 
-Command-line (recommended when Events owns the map):
-
-```text
-+server.events false
-+cargoship.event_enabled false
 First World boot writes defaults in the .cs. Current source defaults latitude/longitude to 39.95, -75.16 (Philadelphia). Change those to your server before UseLocalWeather true.
 
 Permissions
