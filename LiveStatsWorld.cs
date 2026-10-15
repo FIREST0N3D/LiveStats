@@ -9,8 +9,8 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.61")]
-    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.61: ceiling ignores the first-sample instability spike and logs why it refused Fog.")]
+    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.62")]
+    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.62: tides ease from the live oceanlevel (SmoothDamp, no snap) and hold baseline while cargo is docking.")]
     class LiveStatsWorld : RustPlugin
     {
         private enum CloudSwapPhase
@@ -199,6 +199,9 @@ namespace Oxide.Plugins
         private float _appliedOceanLevel = float.NaN;
         private float _tideTargetLevel = float.NaN;
         private float _tideSlewStamp = 0f;
+        private float _tideSmoothVel = 0f;
+        private bool _cargoDockHold = false;
+        private Timer _cargoDockReleaseTimer;
         private float _cycloneSurge = 0f;
         private float _cycloneStartedAt = 0f;
         private string _cyclonePhase = "idle";
@@ -544,6 +547,7 @@ namespace Oxide.Plugins
             StopTimer(ref _weatherRetryTimer);
             StopTimer(ref _tideTimer);
             StopTimer(ref _tideSlewTimer);
+            StopTimer(ref _cargoDockReleaseTimer);
             StopTimer(ref _cycloneTimer);
             StopCloudSwapTicker();
         }
@@ -666,11 +670,25 @@ namespace Oxide.Plugins
         private void StartTideSystem()
         {
             if (config?.Tide == null || !config.Tide.Enabled) return;
+            SeedOceanLevelFromServer();
             float interval = Mathf.Clamp(config.Tide.UpdateIntervalSeconds, 5f, 120f);
             RestartEvery(ref _tideTimer, interval, ApplyLunarTide);
             // Slew is owned by the shared 1s clock so it does not stack with the weather blend timer.
             timer.Once(8f, ApplyLunarTide);
-            Puts($"[Tide] Lunar tides on (target every {interval:F0}s, knob slew {config.Tide.SlewPerSecond:F3}/s on the shared 1s clock). oceanlevel = base {config.Tide.BaseOceanLevel:F2} ± spring {config.Tide.SpringAmplitude:F2} / neap {config.Tide.SpringAmplitude * Mathf.Clamp01(config.Tide.NeapScale):F2}. Conflicts with other oceanlevel plugins.");
+            Puts($"[Tide] Lunar tides on (target every {interval:F0}s, ease {config.Tide.SlewPerSecond:F3}/s from live { _appliedOceanLevel:F3}). oceanlevel = base {config.Tide.BaseOceanLevel:F2} ± spring {config.Tide.SpringAmplitude:F2} / neap {config.Tide.SpringAmplitude * Mathf.Clamp01(config.Tide.NeapScale):F2}. Holds baseline while cargo is docking. Conflicts with other oceanlevel plugins.");
+        }
+
+        private void SeedOceanLevelFromServer()
+        {
+            float live = float.NaN;
+            try { live = ConVar.Env.oceanlevel; } catch { }
+            if (float.IsNaN(live) || float.IsInfinity(live))
+                live = config?.Tide != null ? config.Tide.BaseOceanLevel : 0f;
+            _appliedOceanLevel = Mathf.Round(live * 1000f) / 1000f;
+            _tideTargetLevel = _appliedOceanLevel;
+            _tideSmoothVel = 0f;
+            _tideSlewStamp = Time.realtimeSinceStartup;
+            lastTideLevel = _appliedOceanLevel;
         }
 
         private void RestoreTideOceanLevel()
@@ -745,14 +763,16 @@ namespace Oxide.Plugins
                     state = deriv >= 0f ? "Rising" : "Falling";
                 }
 
-                lastTideLevel = level;
                 lastTideAmplitude = amp;
-                lastTideState = state;
-                _tideTargetLevel = level;
+                lastTideState = _cargoDockHold ? "Hold" : state;
+                if (_cargoDockHold)
+                    _tideTargetLevel = config.Tide.BaseOceanLevel;
+                else
+                    _tideTargetLevel = level;
                 RollOceanLevel();
 
                 if (config.DebugMode)
-                    Puts($"[Tide] {state} oceanlevel={level:F3} amp={amp:F3} phase={phase:F3} ({GetMoonPhaseName(phase)})");
+                    Puts($"[Tide] {lastTideState} target={_tideTargetLevel:F3} applied={_appliedOceanLevel:F3} amp={amp:F3} phase={phase:F3} ({GetMoonPhaseName(phase)})");
             }
             catch (Exception ex)
             {
@@ -776,6 +796,7 @@ namespace Oxide.Plugins
             ConsoleSystem.Run(opt, $"oceanlevel {q.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)}");
             _appliedOceanLevel = q;
             _tideTargetLevel = q;
+            _tideSmoothVel = 0f;
         }
 
         private void RollOceanLevel()
@@ -786,10 +807,12 @@ namespace Oxide.Plugins
             _tideSlewStamp = now;
 
             if (float.IsNaN(_appliedOceanLevel))
-                _appliedOceanLevel = config?.Tide != null ? config.Tide.BaseOceanLevel : 0f;
+                SeedOceanLevelFromServer();
 
-            float slew = config?.Tide != null ? Mathf.Max(0.001f, config.Tide.SlewPerSecond) : 0.008f;
-            float next = Mathf.MoveTowards(_appliedOceanLevel, _tideTargetLevel, slew * dt);
+            float maxSpeed = config?.Tide != null ? Mathf.Max(0.001f, config.Tide.SlewPerSecond) : 0.008f;
+            // SmoothDamp eases in and out; maxSpeed keeps a large target from jumping in one tick.
+            float smoothTime = Mathf.Clamp(0.35f / maxSpeed, 4f, 40f);
+            float next = Mathf.SmoothDamp(_appliedOceanLevel, _tideTargetLevel, ref _tideSmoothVel, smoothTime, maxSpeed, dt);
             next = Mathf.Round(next * 1000f) / 1000f;
             if (Mathf.Abs(next - _appliedOceanLevel) < 0.001f)
                 return;
@@ -800,6 +823,43 @@ namespace Oxide.Plugins
             ConsoleSystem.Run(opt, $"oceanlevel {next.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)}");
             _appliedOceanLevel = next;
             lastTideLevel = next;
+        }
+
+        private void BeginCargoDockHold()
+        {
+            if (config?.Tide == null || !config.Tide.Enabled) return;
+            StopTimer(ref _cargoDockReleaseTimer);
+            if (!_cargoDockHold)
+                Puts("[Tide] Cargo docking — easing oceanlevel to baseline so harbor cranes stay aligned.");
+            _cargoDockHold = true;
+            _tideTargetLevel = config.Tide.BaseOceanLevel;
+        }
+
+        private void EndCargoDockHold()
+        {
+            if (!_cargoDockHold) return;
+            _cargoDockHold = false;
+            _cargoDockReleaseTimer = null;
+            Puts("[Tide] Cargo clear — resuming lunar tide.");
+            ApplyLunarTide();
+        }
+
+        private object OnCargoShipHarborApproach(CargoShip ship, CargoNotifier cn)
+        {
+            BeginCargoDockHold();
+            return null;
+        }
+
+        private void OnCargoShipHarborArrived(CargoShip ship)
+        {
+            BeginCargoDockHold();
+        }
+
+        private void OnCargoShipHarborLeave(CargoShip ship)
+        {
+            if (config?.Tide == null || !config.Tide.Enabled) return;
+            StopTimer(ref _cargoDockReleaseTimer);
+            _cargoDockReleaseTimer = timer.Once(30f, EndCargoDockHold);
         }
 
         private struct ClimateGate
