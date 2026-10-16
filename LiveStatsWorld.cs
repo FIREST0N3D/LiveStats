@@ -9,8 +9,8 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.62")]
-    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.62: tides ease from the live oceanlevel (SmoothDamp, no snap) and hold baseline while cargo is docking.")]
+    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.67")]
+    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.67: cargo egress returns to lunar tide in tiny steps so the water rebuild does not hitch.")]
     class LiveStatsWorld : RustPlugin
     {
         private enum CloudSwapPhase
@@ -201,6 +201,7 @@ namespace Oxide.Plugins
         private float _tideSlewStamp = 0f;
         private float _tideSmoothVel = 0f;
         private bool _cargoDockHold = false;
+        private bool _cargoEgress = false;
         private Timer _cargoDockReleaseTimer;
         private float _cycloneSurge = 0f;
         private float _cycloneStartedAt = 0f;
@@ -675,7 +676,7 @@ namespace Oxide.Plugins
             RestartEvery(ref _tideTimer, interval, ApplyLunarTide);
             // Slew is owned by the shared 1s clock so it does not stack with the weather blend timer.
             timer.Once(8f, ApplyLunarTide);
-            Puts($"[Tide] Lunar tides on (target every {interval:F0}s, ease {config.Tide.SlewPerSecond:F3}/s from live { _appliedOceanLevel:F3}). oceanlevel = base {config.Tide.BaseOceanLevel:F2} ± spring {config.Tide.SpringAmplitude:F2} / neap {config.Tide.SpringAmplitude * Mathf.Clamp01(config.Tide.NeapScale):F2}. Holds baseline while cargo is docking. Conflicts with other oceanlevel plugins.");
+            Puts($"[Tide] Lunar tides on (target every {interval:F0}s, ease {config.Tide.SlewPerSecond:F3}/s from live {_appliedOceanLevel:F3}). oceanlevel = base {config.Tide.BaseOceanLevel:F2} ± spring {config.Tide.SpringAmplitude:F2} / neap {config.Tide.SpringAmplitude * Mathf.Clamp01(config.Tide.NeapScale):F2}. Harbor approach eases to 0 at {config.Tide.HarborEasePerSecond:F3}/s, egress eases back. Conflicts with other oceanlevel plugins.");
         }
 
         private void SeedOceanLevelFromServer()
@@ -764,12 +765,12 @@ namespace Oxide.Plugins
                 }
 
                 lastTideAmplitude = amp;
-                lastTideState = _cargoDockHold ? "Hold" : state;
-                if (_cargoDockHold)
-                    _tideTargetLevel = config.Tide.BaseOceanLevel;
-                else
-                    _tideTargetLevel = level;
+                lastTideState = _cargoDockHold ? "Harbor" : _cargoEgress ? "Egress" : state;
+                _tideTargetLevel = _cargoDockHold ? 0f : level;
                 RollOceanLevel();
+
+                if (_cargoEgress && Mathf.Abs(_appliedOceanLevel - _tideTargetLevel) < 0.004f)
+                    _cargoEgress = false;
 
                 if (config.DebugMode)
                     Puts($"[Tide] {lastTideState} target={_tideTargetLevel:F3} applied={_appliedOceanLevel:F3} amp={amp:F3} phase={phase:F3} ({GetMoonPhaseName(phase)})");
@@ -810,11 +811,21 @@ namespace Oxide.Plugins
                 SeedOceanLevelFromServer();
 
             float maxSpeed = config?.Tide != null ? Mathf.Max(0.001f, config.Tide.SlewPerSecond) : 0.008f;
-            // SmoothDamp eases in and out; maxSpeed keeps a large target from jumping in one tick.
-            float smoothTime = Mathf.Clamp(0.35f / maxSpeed, 4f, 40f);
+            if (_cargoDockHold)
+                maxSpeed = config?.Tide != null ? Mathf.Max(maxSpeed, config.Tide.HarborEasePerSecond) : 0.012f;
+            if (_cargoEgress)
+                maxSpeed = Mathf.Min(maxSpeed, 0.003f);
+
+            float smoothTime = Mathf.Clamp(0.6f / Mathf.Max(0.001f, maxSpeed), 8f, 90f);
             float next = Mathf.SmoothDamp(_appliedOceanLevel, _tideTargetLevel, ref _tideSmoothVel, smoothTime, maxSpeed, dt);
+            float stepCap = _cargoEgress ? 0.002f : 0.008f;
+            next = Mathf.MoveTowards(_appliedOceanLevel, next, stepCap * dt);
             next = Mathf.Round(next * 1000f) / 1000f;
             if (Mathf.Abs(next - _appliedOceanLevel) < 0.001f)
+                return;
+
+            // Water mesh rebuilds on every oceanlevel write. Skip writes during egress until a full step is ready.
+            if (_cargoEgress && Mathf.Abs(next - _appliedOceanLevel) < 0.002f)
                 return;
 
             var opt = ConsoleSystem.Option.Server;
@@ -830,23 +841,122 @@ namespace Oxide.Plugins
             if (config?.Tide == null || !config.Tide.Enabled) return;
             StopTimer(ref _cargoDockReleaseTimer);
             if (!_cargoDockHold)
-                Puts("[Tide] Cargo docking — easing oceanlevel to baseline so harbor cranes stay aligned.");
+                Puts("[Tide] Cargo arrived — easing oceanlevel to 0.");
             _cargoDockHold = true;
-            _tideTargetLevel = config.Tide.BaseOceanLevel;
+            _tideTargetLevel = 0f;
         }
 
         private void EndCargoDockHold()
         {
-            if (!_cargoDockHold) return;
+            if (!_cargoDockHold && !_cargoEgress) return;
             _cargoDockHold = false;
+            _cargoEgress = true;
+            _tideSmoothVel = 0f;
             _cargoDockReleaseTimer = null;
-            Puts("[Tide] Cargo clear — resuming lunar tide.");
+            Puts("[Tide] Cargo clear — returning oceanlevel to the lunar tide in small steps.");
             ApplyLunarTide();
+        }
+
+        private bool IsFloatingHarborContainer(BaseEntity ent, List<MonumentInfo> monuments)
+        {
+            if (ent == null || ent.IsDestroyed) return false;
+            if (ent.GetParentEntity() is CargoShip) return false;
+            if (!NearHarbor(ent.transform.position, monuments)) return false;
+
+            string prefab = ent.ShortPrefabName ?? string.Empty;
+            string full = ent.PrefabName ?? string.Empty;
+            var parentEnt = ent.GetParentEntity();
+            string parent = parentEnt?.ShortPrefabName ?? string.Empty;
+            string blob = prefab + " " + full + " " + parent;
+
+            // Live harbor containers and their doors. Killing these stutters the ship.
+            if (parent.IndexOf("harbor_dynamic", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+            if (parent.IndexOf("dynamic_container", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+            if (prefab.StartsWith("door.", StringComparison.OrdinalIgnoreCase)) return false;
+            if (blob.IndexOf("loot", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+            if (blob.IndexOf("crate", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+            if (blob.IndexOf("barrel", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+            if (blob.IndexOf("hackable", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+
+            // Only true orphans: no parent, or stuck on a crane with no dynamic container.
+            if (parentEnt != null && parent.IndexOf("crane", StringComparison.OrdinalIgnoreCase) < 0) return false;
+
+            float y = ent.transform.position.y;
+            bool floating = y >= 5f;
+            bool submerged = y <= 1.2f;
+            if (!floating && !submerged) return false;
+
+            return blob.IndexOf("container", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private int SweepFloatingHarborContainers()
+        {
+            int killed = 0;
+            try
+            {
+                var monuments = TerrainMeta.Path?.Monuments;
+                var doomed = new List<BaseEntity>();
+                foreach (var net in BaseNetworkable.serverEntities)
+                {
+                    var ent = net as BaseEntity;
+                    if (!IsFloatingHarborContainer(ent, monuments)) continue;
+                    doomed.Add(ent);
+                }
+                for (int i = 0; i < doomed.Count; i++)
+                {
+                    var ent = doomed[i];
+                    if (ent == null || ent.IsDestroyed) continue;
+                    Puts($"[Tide] Killing {(ent.transform.position.y <= 1.2f ? "submerged" : "floating")} {ent.ShortPrefabName} parent={ent.GetParentEntity()?.ShortPrefabName ?? "-"} y={ent.transform.position.y:F1}");
+                    ent.Kill();
+                    killed++;
+                }
+            }
+            catch (Exception ex)
+            {
+                Puts($"[Tide] Container sweep failed: {ex.Message}");
+            }
+            return killed;
+        }
+
+        private string ScanFloatingNear(BasePlayer player)
+        {
+            var monuments = TerrainMeta.Path?.Monuments;
+            var lines = new List<string>();
+            Vector3 origin = player != null ? player.transform.position : Vector3.zero;
+            foreach (var net in BaseNetworkable.serverEntities)
+            {
+                var ent = net as BaseEntity;
+                if (ent == null || ent.IsDestroyed) continue;
+                if (player != null && Vector3.Distance(origin, ent.transform.position) > 250f) continue;
+                if (player == null && !NearHarbor(ent.transform.position, monuments)) continue;
+                string prefab = ent.ShortPrefabName ?? string.Empty;
+                if (prefab.IndexOf("container", StringComparison.OrdinalIgnoreCase) < 0
+                    && (ent.GetParentEntity()?.ShortPrefabName ?? string.Empty).IndexOf("crane", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+                string band = ent.transform.position.y <= 1.2f ? "water" : ent.transform.position.y >= 5f ? "air" : "dock";
+                lines.Add($"{prefab} parent={ent.GetParentEntity()?.ShortPrefabName ?? "-"} y={ent.transform.position.y:F1} {band} d={Vector3.Distance(origin, ent.transform.position):F0}");
+                if (lines.Count >= 12) break;
+            }
+            if (lines.Count == 0) return "[Tide] No container-like entities in range.";
+            return "[Tide] Containers:\n" + string.Join("\n", lines);
+        }
+
+        private static bool NearHarbor(Vector3 pos, List<MonumentInfo> monuments)
+        {
+            if (monuments == null) return pos.y > 6f;
+            for (int i = 0; i < monuments.Count; i++)
+            {
+                var m = monuments[i];
+                if (m == null) continue;
+                string name = m.name ?? string.Empty;
+                if (name.IndexOf("harbor", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (Vector3.Distance(m.transform.position, pos) < 350f) return true;
+            }
+            return false;
         }
 
         private object OnCargoShipHarborApproach(CargoShip ship, CargoNotifier cn)
         {
-            BeginCargoDockHold();
             return null;
         }
 
@@ -859,7 +969,13 @@ namespace Oxide.Plugins
         {
             if (config?.Tide == null || !config.Tide.Enabled) return;
             StopTimer(ref _cargoDockReleaseTimer);
-            _cargoDockReleaseTimer = timer.Once(30f, EndCargoDockHold);
+            _cargoDockReleaseTimer = timer.Once(90f, () =>
+            {
+                EndCargoDockHold();
+                int swept = SweepFloatingHarborContainers();
+                if (swept > 0)
+                    Puts($"[Tide] Swept {swept} orphaned harbor container{(swept == 1 ? "" : "s")} after cargo cleared.");
+            });
         }
 
         private struct ClimateGate
@@ -4516,6 +4632,24 @@ namespace Oxide.Plugins
         }
 
 
+        [ChatCommand("worldcontainers")]
+        private void CmdWorldContainers(BasePlayer player, string command, string[] args)
+        {
+            if (player != null && !HasAdmin(player)) { SendMessage(player, lang.GetMessage("WeatherNeedAdmin", this, player.UserIDString)); return; }
+            string sub = args != null && args.Length > 0 ? args[0].ToLowerInvariant() : "sweep";
+            if (sub == "scan")
+            {
+                string scan = ScanFloatingNear(player);
+                Puts(scan);
+                SendMessage(player, scan);
+                return;
+            }
+            int swept = SweepFloatingHarborContainers();
+            string msg = $"[Tide] Swept {swept} floating harbor container{(swept == 1 ? "" : "s")}. /worldcontainers scan to list leftovers.";
+            Puts(msg);
+            SendMessage(player, msg);
+        }
+
         [ChatCommand("worldcyclone")]
         private void CmdWorldCyclone(BasePlayer player, string command, string[] args)
         {
@@ -4780,6 +4914,8 @@ namespace Oxide.Plugins
             [JsonProperty("UpdateIntervalSeconds")] public float UpdateIntervalSeconds { get; set; } = 20f;
             /// <summary>Max oceanlevel change per second. The knob rolls toward the lunar target instead of stepping.</summary>
             [JsonProperty("SlewPerSecond")] public float SlewPerSecond { get; set; } = 0.008f;
+            /// <summary>Faster ease used only while cargo is docked. Still gradual. Default is close to normal slew so the ship does not stutter.</summary>
+            [JsonProperty("HarborEasePerSecond")] public float HarborEasePerSecond { get; set; } = 0.012f;
             /// <summary>When true, phase comes from the real calendar even if MoonMode is ForceFull/ForceNew.</summary>
             [JsonProperty("UseRealMoon")] public bool UseRealMoon { get; set; } = true;
             /// <summary>Add a small solar semi-diurnal so the two daily highs are not identical.</summary>
@@ -5076,6 +5212,7 @@ namespace Oxide.Plugins
             config.Tide.BaseOceanLevel = Mathf.Clamp(config.Tide.BaseOceanLevel, -5f, 5f);
             config.Tide.UpdateIntervalSeconds = Mathf.Clamp(config.Tide.UpdateIntervalSeconds, 5f, 120f);
             config.Tide.SlewPerSecond = Mathf.Clamp(config.Tide.SlewPerSecond, 0.001f, 0.05f);
+            config.Tide.HarborEasePerSecond = Mathf.Clamp(config.Tide.HarborEasePerSecond, 0.004f, 0.05f);
             if (config.Extreme == null)
                 config.Extreme = new ExtremeWeatherConfig();
             config.Extreme.CycloneChance = Mathf.Clamp01(config.Extreme.CycloneChance);
