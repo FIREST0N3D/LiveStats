@@ -10,7 +10,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStats", "FiREST0N3D", "1.9.828")]
+    [Info("LiveStats", "FiREST0N3D", "1.9.832")]
     [Description("Comprehensive player/NPC/animal stats, killfeed + optional idle kick. Dual wipe detection. Kill streak tracking (players/NPCs/animals) + isPlayerDead. Optional LiveStatsWorld extension for time/weather. CONFLICTS: none by default; idle kick is opt-in. Pair with LiveStatsWorld/LiveStatsEvents as a suite.")]
     class LiveStats : RustPlugin
     {
@@ -48,8 +48,10 @@ namespace Oxide.Plugins
 
         // Cap + prune for damage-tracking dicts (written on every hit; removed mainly on death)
         private const int MaxDamageTrackEntries = 512;
-        // Long enough for bleed-out / croc-drag deaths; prefab mismatch still rejects recycled netIds.
+        // Long enough for player bleed-out. Animals and NPCs use the short window so a
+        // tag-and-walk does not steal a kill when the real killer has no initiator.
         private const float DamageTrackFreshnessSeconds = 120f;
+        private const float NonPlayerTrackFreshnessSeconds = 12f;
         private readonly List<ulong> _damageTrackPruneBuffer = new List<ulong>(64);
         private float _lastDamageTrackPrune = -999f;
 
@@ -256,6 +258,10 @@ namespace Oxide.Plugins
             [JsonProperty("EnableKillStreaks")] public bool EnableKillStreaks { get; set; } = true;
             [JsonProperty("KillStreakStart")] public int KillStreakStart { get; set; } = 5;
             [JsonProperty("AnnounceKillStreaks")] public bool AnnounceKillStreaks { get; set; } = true;
+            // Same-team kill: no PvP credit. Penalty is extra deaths and/or a broken streak.
+            [JsonProperty("TeamkillPenaltyEnabled")] public bool TeamkillPenaltyEnabled { get; set; } = true;
+            [JsonProperty("TeamkillPenaltyDeaths")] public int TeamkillPenaltyDeaths { get; set; } = 1;
+            [JsonProperty("TeamkillEndsStreak")] public bool TeamkillEndsStreak { get; set; } = true;
             [JsonProperty("MyStatsCommandEnabled")] public bool MyStatsCommandEnabled { get; set; } = true;
             [JsonProperty("TopCommandEnabled")] public bool TopCommandEnabled { get; set; } = true;
             [JsonProperty("NpcStatsCommandEnabled")] public bool NpcStatsCommandEnabled { get; set; } = true;
@@ -399,7 +405,7 @@ namespace Oxide.Plugins
             LoadDefaultMessages();
             LogLanguagePackInventory();
 
-            Puts("LiveStats v1.9.828 loaded (tighter animal headshot sphere)");
+            Puts("LiveStats v1.9.832 loaded (teamkill penalty)");
             LoadWipeIdentity();
             LoadStats();
             LoadNpcStats();
@@ -1458,13 +1464,20 @@ namespace Oxide.Plugins
             // animal, and player attribution stay consistent (true last-hit wins).
             // Never record the victim as their own PvP attacker — env ticks and self-shots
             // often set InitiatorPlayer to the victim, which previously became a fake PvP kill.
+            // Turrets and traps set InitiatorPlayer to the owner. That is not a held-weapon kill.
             if (info.InitiatorPlayer != null && info.InitiatorPlayer.userID.IsSteamId()
-                && !IsSamePlayer(entity, info.InitiatorPlayer))
+                && !IsSamePlayer(entity, info.InitiatorPlayer)
+                && !IsAutomatedWeapon(info.Initiator))
             {
                 SetDamageTrack(lastPlayerAttacker, netId, info.InitiatorPlayer.displayName, victimPrefab);
                 SetDamageTrack(lastPlayerAttackerId, netId, info.InitiatorPlayer.UserIDString, victimPrefab);
                 lastNpcAttacker.Remove(netId);
                 lastAnimalAttacker.Remove(netId);
+            }
+            else if (IsAutomatedWeapon(info.Initiator))
+            {
+                lastPlayerAttacker.Remove(netId);
+                lastPlayerAttackerId.Remove(netId);
             }
             else if (info.Initiator != null)
             {
@@ -1490,7 +1503,8 @@ namespace Oxide.Plugins
             // so remember the last player hit (the kill shot) while the position is still valid.
             if (config.EnableAnimalHeadshots && IsValidAnimal(entity)
                 && info.InitiatorPlayer != null && info.InitiatorPlayer.userID.IsSteamId()
-                && !IsSamePlayer(entity, info.InitiatorPlayer))
+                && !IsSamePlayer(entity, info.InitiatorPlayer)
+                && !IsAutomatedWeapon(info.Initiator))
             {
                 bool headshot = IsAnimalKillHeadshot(entity, info);
                 lastAnimalHeadshot[netId] = new AnimalHeadshotTrack
@@ -1504,9 +1518,11 @@ namespace Oxide.Plugins
             }
 
             // Projectile hit on a player, NPC, or animal. Wall and miss shots never reach here.
+            // Skip turret and trap hits so an unattended gun cannot pad accuracy.
             if (info.IsProjectile()
                 && info.InitiatorPlayer != null && info.InitiatorPlayer.userID.IsSteamId()
-                && !IsSamePlayer(entity, info.InitiatorPlayer))
+                && !IsSamePlayer(entity, info.InitiatorPlayer)
+                && !IsAutomatedWeapon(info.Initiator))
             {
                 string attackerId = info.InitiatorPlayer.UserIDString;
                 if (!playerStats.TryGetValue(attackerId, out var shotStats))
@@ -1592,11 +1608,16 @@ namespace Oxide.Plugins
         /// </summary>
         private bool TryGetFreshTrack(Dictionary<ulong, DamageTrackEntry> dict, ulong netId, string victimPrefab, out string value)
         {
+            return TryGetFreshTrack(dict, netId, victimPrefab, DamageTrackFreshnessSeconds, out value);
+        }
+
+        private bool TryGetFreshTrack(Dictionary<ulong, DamageTrackEntry> dict, ulong netId, string victimPrefab, float maxAge, out string value)
+        {
             value = null;
             if (dict == null) return false;
             if (!dict.TryGetValue(netId, out var entry) || string.IsNullOrEmpty(entry.Value))
                 return false;
-            if (Time.realtimeSinceStartup - entry.Time > DamageTrackFreshnessSeconds)
+            if (Time.realtimeSinceStartup - entry.Time > maxAge)
             {
                 dict.Remove(netId);
                 return false;
@@ -1609,6 +1630,33 @@ namespace Oxide.Plugins
             }
             value = entry.Value;
             return true;
+        }
+
+        /// <summary>Auto turret, shotgun trap, flame turret, SAM. Owner is not a held-weapon kill.</summary>
+        private static bool IsAutomatedWeapon(BaseEntity initiator)
+        {
+            if (initiator == null) return false;
+            if (initiator is AutoTurret || initiator is GunTrap || initiator is FlameTurret || initiator is SamSite)
+                return true;
+            string name = initiator.ShortPrefabName;
+            if (string.IsNullOrEmpty(name)) return false;
+            return name.IndexOf("turret", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("trap", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("samsite", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool AreTeammates(BasePlayer a, BasePlayer b)
+        {
+            if (a == null || b == null || a.userID == b.userID) return false;
+            var team = RelationshipManager.ServerInstance?.FindPlayersTeam(a.userID);
+            return team != null && team.members != null && team.members.Contains(b.userID);
+        }
+
+        private static bool AreTeammates(ulong a, ulong b)
+        {
+            if (a == 0 || b == 0 || a == b) return false;
+            var team = RelationshipManager.ServerInstance?.FindPlayersTeam(a);
+            return team != null && team.members != null && team.members.Contains(b);
         }
 
         private bool IsDuplicateDeath(Dictionary<ulong, DeathDedupeRecord> store, ulong netId, string prefab)
@@ -1910,11 +1958,15 @@ namespace Oxide.Plugins
             // Skip the victim themselves — bleed/fall/drown ticks often set InitiatorPlayer = victim
             // even after another player was the last real attacker.
             if (classification.KillerPlayer != null && classification.KillerPlayer.userID.IsSteamId()
-                && !IsSamePlayer(entity, classification.KillerPlayer))
+                && !IsSamePlayer(entity, classification.KillerPlayer)
+                && !IsAutomatedWeapon(initiator))
             {
                 killerPlayerId = classification.KillerPlayer.UserIDString;
             }
-            else if (TryGetFreshTrack(lastPlayerAttackerId, netId, shortName, out var lastPid) && !string.IsNullOrEmpty(lastPid)
+            else if (TryGetFreshTrack(lastPlayerAttackerId, netId, shortName,
+                         classification.IsRealPlayer ? DamageTrackFreshnessSeconds : NonPlayerTrackFreshnessSeconds,
+                         out var lastPid)
+                     && !string.IsNullOrEmpty(lastPid)
                      && !IsSamePlayerId(victimSteamIdEarly, lastPid))
             {
                 killerPlayerId = lastPid;
@@ -2066,6 +2118,37 @@ namespace Oxide.Plugins
             };
         }
 
+        private void ApplyTeamkillPenalty(string killerId, BasePlayer killer)
+        {
+            if (config == null || !config.TeamkillPenaltyEnabled || string.IsNullOrEmpty(killerId)) return;
+            if (!playerStats.TryGetValue(killerId, out var stats))
+                stats = playerStats[killerId] = new PlayerStats();
+
+            int deaths = Mathf.Max(0, config.TeamkillPenaltyDeaths);
+            if (deaths > 0)
+                stats.deaths += deaths;
+
+            bool ended = false;
+            if (config.TeamkillEndsStreak && config.EnableKillStreaks
+                && (stats.currentKillStreak > 0 || stats.isOnKillStreak))
+            {
+                stats.currentKillStreak = 0;
+                stats.isOnKillStreak = false;
+                ended = true;
+            }
+
+            SaveStats();
+            if (killer != null && killer.IsConnected)
+            {
+                string msg = deaths > 0
+                    ? $"Team kill. +{deaths} death{(deaths == 1 ? "" : "s")}" + (ended ? ", streak ended." : ".")
+                    : (ended ? "Team kill. Streak ended." : "Team kill. No credit.");
+                killer.ChatMessage(msg);
+            }
+            if (config.DebugMode)
+                Puts($"[Teamkill] {killerId} penalty deaths={deaths} streakEnded={ended}");
+        }
+
         private void TrackDeathStats(DeathClassification classification, DeathDetails details, string victimName, ulong netId, string grid = "")
         {
             // Player kill credit: prefer live InitiatorPlayer, else lastPlayerAttackerId fallback
@@ -2081,8 +2164,16 @@ namespace Oxide.Plugins
                 ? classification.VictimPlayer.UserIDString
                 : null;
             bool selfKill = details.IsSuicide || IsSamePlayerId(victimSteamId, killerPlayerId);
-            if (selfKill)
+            bool teamKill = !selfKill && !string.IsNullOrEmpty(killerPlayerId) && !string.IsNullOrEmpty(victimSteamId)
+                && ulong.TryParse(victimSteamId, out ulong victimId)
+                && ulong.TryParse(killerPlayerId, out ulong killerId)
+                && AreTeammates(killerId, victimId);
+            if (selfKill || teamKill)
+            {
+                if (teamKill)
+                    ApplyTeamkillPenalty(killerPlayerId, classification.KillerPlayer);
                 killerPlayerId = null;
+            }
 
             // If the "animal killer" is the victim itself, it is not a real animal-on-animal kill.
             bool animalSelfInitiator = classification.IsAnimal
@@ -3072,13 +3163,21 @@ private void LoadDefaultMessages()
             Vector3 hit = ResolveHitPoint(info, entity);
             bool hasHit = hit.sqrMagnitude > 0.01f;
             float dist = hasHit ? Vector3.Distance(hit, headPos) : 999f;
+            bool livestock = IsLivestock(entity.ShortPrefabName);
+            float aimRadius = livestock ? Mathf.Max(radius, 1.20f) : radius;
             float aimDist = 999f;
-            bool aimed = ShotPassesHead(info, entity, headPos, radius, out aimDist);
-            // Capsule impact sits on the chest, but aim alone is not a headshot: a body shot
-            // still threads the head ray. Impact has to be in the head sphere.
-            bool closeImpact = hasHit && dist <= radius * 1.05f;
+            bool aimed = ShotPassesHead(info, entity, headPos, aimRadius, out aimDist);
+            // Capsule impact sits on the chest. Small animals need the impact in the head
+            // sphere. Large animals (bear, horse) land farther down the capsule, so a front
+            // hit only counts when the shot also threads the head.
+            bool large = IsLargeHeadAnimal(entity.ShortPrefabName);
+            bool closeImpact = hasHit && dist <= radius * (large ? 1.35f : 1.05f);
             bool frontCap = hasHit && hasBounds && HitOnFrontCap(entity, hit, world);
-            bool headshot = closeImpact && (aimed || frontCap || dist <= radius * 0.7f);
+            // Livestock skull bone sits on the neck. A scoped snout hit lands farther
+            // forward, so a front shot counts when the ray also threads the head.
+            float chestMul = livestock ? 2.4f : 1.8f;
+            bool chestHead = large && frontCap && aimed && hasHit && dist <= radius * chestMul;
+            bool headshot = chestHead || (closeImpact && (aimed || frontCap || dist <= radius * 0.7f));
 
             if (config != null && config.DebugMode)
                 Puts($"[AnimalHS] {entity.ShortPrefabName} impact={dist:F2} aim={aimDist:F2} radius={radius:F2} bone={(head != null)} front={frontCap} headshot={headshot}");
@@ -3094,8 +3193,27 @@ private void LoadDefaultMessages()
             float length = Mathf.Max(world.extents.x, world.extents.z) * 2f;
             float height = world.size.y;
             // Head is a fraction of the body. Keep the sphere on the skull, not the torso.
+            // Large animals get a bigger cap so the chest-capsule offset still reaches.
+            bool large = IsLargeHeadAnimal(entity.ShortPrefabName);
             float scaled = Mathf.Max(width * 0.32f, length * 0.12f, height * 0.22f);
-            return Mathf.Clamp(Mathf.Max(radius, scaled), 0.18f, 0.55f);
+            float cap = large ? 0.90f : 0.55f;
+            return Mathf.Clamp(Mathf.Max(radius, scaled), 0.18f, cap);
+        }
+
+        private static bool IsLargeHeadAnimal(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            return name.IndexOf("bear", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("horse", StringComparison.OrdinalIgnoreCase) >= 0
+                || IsLivestock(name);
+        }
+
+        private static bool IsLivestock(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            return name.IndexOf("cow", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("bull", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("stag", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static Vector3 ResolveAnimalHeadPosition(BaseEntity entity, Transform head, bool hasBounds, Bounds world)
@@ -3107,9 +3225,14 @@ private void LoadDefaultMessages()
 
             if (head != null)
             {
-                // Skull bone sits behind the snout. Nudge toward the nose so a capsule hit counts.
-                float nudge = hasBounds ? Mathf.Clamp(world.extents.z * 0.35f, 0.12f, 0.45f) : 0.2f;
-                return head.position + forward * nudge;
+                // Skull bone sits behind the snout. Livestock necks are long, so the
+                // nudge has to reach the forehead or a scoped headshot lands short.
+                bool livestock = IsLivestock(entity.ShortPrefabName);
+                float frac = livestock ? 0.7f : 0.35f;
+                float cap = livestock ? 1.05f : 0.45f;
+                float nudge = hasBounds ? Mathf.Clamp(world.extents.z * frac, 0.12f, cap) : 0.2f;
+                float lift = livestock ? 0.15f : 0f;
+                return head.position + forward * nudge + Vector3.up * lift;
             }
             if (hasBounds)
             {
@@ -3312,11 +3435,13 @@ private void LoadDefaultMessages()
         private static float AnimalHeadRadiusFloor(string name)
         {
             if (string.IsNullOrEmpty(name)) return 0.36f;
-            if (name.IndexOf("polarbear", StringComparison.OrdinalIgnoreCase) >= 0) return 0.55f;
-            if (name.IndexOf("bear", StringComparison.OrdinalIgnoreCase) >= 0) return 0.50f;
+            if (name.IndexOf("polarbear", StringComparison.OrdinalIgnoreCase) >= 0) return 0.62f;
+            if (name.IndexOf("bear", StringComparison.OrdinalIgnoreCase) >= 0) return 0.58f;
             if (name.IndexOf("boar", StringComparison.OrdinalIgnoreCase) >= 0) return 0.42f;
-            if (name.IndexOf("stag", StringComparison.OrdinalIgnoreCase) >= 0) return 0.40f;
-            if (name.IndexOf("horse", StringComparison.OrdinalIgnoreCase) >= 0) return 0.42f;
+            if (name.IndexOf("cow", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("bull", StringComparison.OrdinalIgnoreCase) >= 0) return 0.70f;
+            if (name.IndexOf("stag", StringComparison.OrdinalIgnoreCase) >= 0) return 0.50f;
+            if (name.IndexOf("horse", StringComparison.OrdinalIgnoreCase) >= 0) return 0.50f;
             if (name.IndexOf("wolf", StringComparison.OrdinalIgnoreCase) >= 0) return 0.34f;
             if (name.IndexOf("crocodile", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("croc", StringComparison.OrdinalIgnoreCase) >= 0) return 0.40f;
