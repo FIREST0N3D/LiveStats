@@ -11,7 +11,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.188")]
+    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.199")]
     [Description("Core event scheduler + classic world events (Cargo, Airdrop, Heli, Chinook, Bradley, F-15, Hackable). Requires LiveStatsWorld. NPC events require LiveStatsEventsNPC. Vehicle events+despawn require LiveStatsEventsVehicles. Configs: core owns schedule + classic events; LiveStatsEventsNPC owns NPC behavior; LiveStatsEventsVehicles owns vehicle limits/despawn.")]
     class LiveStatsEvents : RustPlugin
     {
@@ -11225,8 +11225,8 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
         }
 
         // Monument origin is the hangar row (south taxiway local z ~ -50).
-        // The runway is the long paved strip north of that. Sample the same
-        // paved cells the Bradley scan uses and park on the flattest one.
+        // Monument center is the middle of the runway. The paved scan was
+        // landing on the western apron (J5); the strip itself is the center.
         private bool TryFindAirfieldRunway(out Vector3 pos, out Quaternion rot)
         {
             pos = Vector3.zero;
@@ -11244,47 +11244,13 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                         n.IndexOf("airport", StringComparison.Ordinal) < 0)
                         continue;
                     Transform t = mon.transform;
-                    Vector3 best = Vector3.zero;
-                    float bestScore = -1f;
-                    // North of the hangar row. Runway is a long east-west strip.
-                    for (float lz = 30f; lz <= 150f; lz += 10f)
-                    {
-                        for (float lx = -60f; lx <= 60f; lx += 20f)
-                        {
-                            Vector3 w = t.TransformPoint(new Vector3(lx, 0f, lz));
-                            float gy = 0f;
-                            try { gy = TerrainMeta.HeightMap.GetHeight(w); } catch { }
-                            w.y = gy;
-                            if (!CellPaved(w)) continue;
-                            float slope = 0f;
-                            try
-                            {
-                                float h1 = TerrainMeta.HeightMap.GetHeight(w + t.right * 12f);
-                                float h2 = TerrainMeta.HeightMap.GetHeight(w - t.right * 12f);
-                                slope = Mathf.Abs(h1 - h2);
-                            }
-                            catch { }
-                            // Prefer flat paved ground, and prefer the strip further from the hangars.
-                            float score = 4f - slope * 2f + lz * 0.01f;
-                            if (score > bestScore)
-                            {
-                                bestScore = score;
-                                best = w;
-                            }
-                        }
-                    }
-                    if (bestScore < 0f)
-                    {
-                        // No paved cell found. Fall back to a known runway offset.
-                        best = t.TransformPoint(new Vector3(0f, 0f, 90f));
-                        try { best.y = TerrainMeta.HeightMap.GetHeight(best); } catch { }
-                    }
-                    pos = best;
-                    Vector3 along = t.TransformDirection(Vector3.right);
+                    pos = t.position;
+                    // Face along the runway (monument local forward).
+                    Vector3 along = t.forward;
                     along.y = 0f;
                     if (along.sqrMagnitude < 0.01f) along = Vector3.forward;
                     rot = Quaternion.LookRotation(along.normalized, Vector3.up);
-                    Puts($"[Events] AirfieldChinook runway at {PositionToGrid(pos)} (paved scan)");
+                    Puts($"[Events] AirfieldChinook runway at {PositionToGrid(pos)} (center)");
                     return true;
                 }
             }
@@ -11359,17 +11325,14 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 return false;
             }
 
-            // Fly the claimable hull in from the map edge, then land on the runway.
-            Vector3 approach = GetMapEdgeApproach(fieldPos, 140f);
-            Vector3 flat = fieldPos - approach;
-            flat.y = 0f;
-            Quaternion face = flat.sqrMagnitude > 1f
-                ? Quaternion.LookRotation(flat.normalized, Vector3.up)
-                : fieldRot;
+            // Park the claimable hull on the central runway, lifted clear of the buildings.
+            float gy = fieldPos.y;
+            try { gy = TerrainMeta.HeightMap.GetHeight(fieldPos); } catch { }
+            Vector3 spawn = new Vector3(fieldPos.x, gy + 0.2f, fieldPos.z);
 
             const string prefab = "assets/prefabs/npc/ch47/ch47.entity.prefab";
             BaseEntity heli = null;
-            try { heli = GameManager.server.CreateEntity(prefab, approach, face, true); }
+            try { heli = GameManager.server.CreateEntity(prefab, spawn, fieldRot, true); }
             catch (Exception ex)
             {
                 Puts($"[Events] AirfieldChinook CreateEntity: {ex.Message}");
@@ -11377,7 +11340,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             }
             if (heli == null)
             {
-                Puts("[Events] AirfieldChinook CreateEntity returned null (ch47.entity)");
+                Puts("[Events] AirfieldChinook CreateEntity returned null");
                 return false;
             }
             try { heli.Spawn(); }
@@ -11405,60 +11368,45 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             }
             catch { }
 
-            string grid = PositionToGrid(fieldPos);
-            Puts($"[Events] AirfieldChinook inbound from {PositionToGrid(approach)} -> {grid} life={life:F0}m net={hid}");
+            int guards = Mathf.Clamp(cfg.GuardCount, 0, 8);
+            Vector3 guardPos = spawn;
+            if (guards > 0)
+            {
+                timer.Once(1f, () =>
+                {
+                    try
+                    {
+                        const string heavy = "assets/rust.ai/agents/npcplayer/humannpc/scientist/scientistnpc_heavy.prefab";
+                        const string patrol = "assets/rust.ai/agents/npcplayer/humannpc/scientist/scientistnpc_patrol.prefab";
+                        int spawned = 0;
+                        for (int i = 0; i < guards; i++)
+                        {
+                            float ang = (Mathf.PI * 2f) * i / guards;
+                            Vector3 off = guardPos + new Vector3(Mathf.Cos(ang) * 6f, 0f, Mathf.Sin(ang) * 6f);
+                            float gy2 = off.y;
+                            try { gy2 = TerrainMeta.HeightMap.GetHeight(off); } catch { }
+                            off.y = gy2;
+                            Vector3 face = guardPos - off;
+                            face.y = 0f;
+                            Quaternion rot = face.sqrMagnitude > 0.01f
+                                ? Quaternion.LookRotation(face.normalized, Vector3.up)
+                                : Quaternion.identity;
+                            string prefab = (i % 2 == 0) ? heavy : patrol;
+                            BaseEntity sci = null;
+                            try { sci = GameManager.server.CreateEntity(prefab, off, rot, true); } catch { }
+                            if (sci == null) continue;
+                            try { sci.Spawn(); spawned++; } catch { try { sci.Kill(); } catch { } }
+                        }
+                        Puts($"[Events] AirfieldChinook guards spawned {spawned}/{guards} at {PositionToGrid(guardPos)}");
+                    }
+                    catch (Exception ex) { Puts($"[Events] AirfieldChinook guards: {ex.Message}"); }
+                });
+            }
+
+            string grid = PositionToGrid(spawn);
+            Puts($"[Events] AirfieldChinook parked at {grid} life={life:F0}m net={hid}");
             _lastModuleSpawnGrid = grid;
             NotifyEventFeed("airfieldchinook", "spawn", grid);
-
-            var bird = heli;
-            Vector3 runway = fieldPos;
-            Quaternion landRot = fieldRot;
-            int guardCount = Mathf.Clamp(cfg.GuardCount, 0, 8);
-            bool landed = false;
-            float started = Time.realtimeSinceStartup;
-            timer.Every(1.5f, () =>
-            {
-                if (landed) return;
-                try
-                {
-                    if (bird == null || bird.IsDestroyed)
-                    {
-                        landed = true;
-                        return;
-                    }
-                    Vector3 now = bird.transform.position;
-                    Vector3 to = runway - now;
-                    to.y = 0f;
-                    float dist = to.magnitude;
-                    // Descend as it closes. Cruise ~140, touch down at ~1.5 above ground.
-                    float gy = runway.y;
-                    try { gy = TerrainMeta.HeightMap.GetHeight(runway); } catch { }
-                    float alt = Mathf.Lerp(gy + 1.5f, gy + 140f, Mathf.Clamp01(dist / 900f));
-                    Vector3 step = dist > 1f ? to.normalized * Mathf.Min(55f, dist) : Vector3.zero;
-                    Vector3 next = now + step;
-                    next.y = alt;
-                    if (to.sqrMagnitude > 1f)
-                        bird.transform.rotation = Quaternion.LookRotation(to.normalized, Vector3.up);
-                    bird.transform.position = next;
-                    try { bird.TransformChanged(); } catch { }
-                    if (dist < 18f || Time.realtimeSinceStartup - started > 90f)
-                    {
-                        landed = true;
-                        Vector3 touch = new Vector3(runway.x, gy + 1.5f, runway.z);
-                        bird.transform.position = touch;
-                        bird.transform.rotation = landRot;
-                        try { bird.TransformChanged(); } catch { }
-                        Puts($"[Events] AirfieldChinook landed at {PositionToGrid(touch)}");
-                        NotifyEventFeed("airfieldchinook", "landed", PositionToGrid(touch));
-                        if (guardCount > 0 && LiveStatsEventsNPC != null)
-                        {
-                            try { LiveStatsEventsNPC.Call("API_SpawnGuardsAt", touch, guardCount); }
-                            catch (Exception ex) { DebugLog($"AirfieldChinook guards: {ex.Message}"); }
-                        }
-                    }
-                }
-                catch { landed = true; }
-            });
 
             Vector3 fieldCapture = fieldPos;
             timer.Once(life * 60f, () =>
