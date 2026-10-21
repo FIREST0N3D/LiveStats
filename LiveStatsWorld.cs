@@ -9,8 +9,8 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.67")]
-    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.67: cargo egress returns to lunar tide in tiny steps so the water rebuild does not hitch.")]
+    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.70")]
+    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.70: ocean eases to 0 over 3m when cargo enters the grid, holds for the whole event, eases back over 3m when it leaves.")]
     class LiveStatsWorld : RustPlugin
     {
         private enum CloudSwapPhase
@@ -197,11 +197,16 @@ namespace Oxide.Plugins
         private float lastTideAmplitude = 0f;
         private string lastTideState = "Unknown";
         private float _appliedOceanLevel = float.NaN;
+        private float _lastWrittenOceanLevel = float.NaN;
         private float _tideTargetLevel = float.NaN;
         private float _tideSlewStamp = 0f;
         private float _tideSmoothVel = 0f;
         private bool _cargoDockHold = false;
         private bool _cargoEgress = false;
+        private int _cargoActive = 0;
+        private float _cargoEaseSpeed = 0.004f;
+        private const float CargoEaseSeconds = 180f;
+        private bool _weatherDirty = true;
         private Timer _cargoDockReleaseTimer;
         private float _cycloneSurge = 0f;
         private float _cycloneStartedAt = 0f;
@@ -399,7 +404,7 @@ namespace Oxide.Plugins
 
             if (config.CollectWorldStats)
             {
-                float interval = Mathf.Max(5f, config.WorldStatsUpdateInterval);
+                float interval = Mathf.Max(30f, config.WorldStatsUpdateInterval);
                 // +7s so world_stats.json does not share a frame with the pin file or live_stats.
                 timer.Once(7f, () =>
                 {
@@ -413,6 +418,7 @@ namespace Oxide.Plugins
 
             if (config.Tide != null && config.Tide.Enabled)
                 StartTideSystem();
+            ScanExistingCargo();
 
             if (config.UseLocalWeather || (config.Tide != null && config.Tide.Enabled))
                 StartSharedWorldClock();
@@ -423,11 +429,7 @@ namespace Oxide.Plugins
 
         private void ApplyCatchUpSpawnSubscription()
         {
-            bool want = config?.TimeSystem != null && config.TimeSystem.SuppressCatchUpEvents;
-            if (want)
-                Subscribe(nameof(OnEntitySpawned));
-            else
-                Unsubscribe(nameof(OnEntitySpawned));
+            Subscribe(nameof(OnEntitySpawned));
         }
 
         void OnPluginLoaded(Plugin plugin)
@@ -478,6 +480,9 @@ namespace Oxide.Plugins
         void OnEntitySpawned(BaseNetworkable entity)
         {
             if (entity == null) return;
+            if (entity is CargoShip cargo)
+                NoteCargoSpawned(cargo);
+
             // Opt-in only — default off so other event plugins are not disrupted
             if (config?.TimeSystem == null || !config.TimeSystem.SuppressCatchUpEvents) return;
             if (Time.realtimeSinceStartup > _eventSuppressUntil) return;
@@ -508,6 +513,13 @@ namespace Oxide.Plugins
                         entity.Kill();
                 });
             }
+        }
+
+        private object OnEntityKill(BaseNetworkable entity)
+        {
+            if (entity is CargoShip cargo)
+                NoteCargoGone(cargo);
+            return null;
         }
 
         private void BeginEventSuppress()
@@ -676,7 +688,7 @@ namespace Oxide.Plugins
             RestartEvery(ref _tideTimer, interval, ApplyLunarTide);
             // Slew is owned by the shared 1s clock so it does not stack with the weather blend timer.
             timer.Once(8f, ApplyLunarTide);
-            Puts($"[Tide] Lunar tides on (target every {interval:F0}s, ease {config.Tide.SlewPerSecond:F3}/s from live {_appliedOceanLevel:F3}). oceanlevel = base {config.Tide.BaseOceanLevel:F2} ± spring {config.Tide.SpringAmplitude:F2} / neap {config.Tide.SpringAmplitude * Mathf.Clamp01(config.Tide.NeapScale):F2}. Harbor approach eases to 0 at {config.Tide.HarborEasePerSecond:F3}/s, egress eases back. Conflicts with other oceanlevel plugins.");
+            Puts($"[Tide] Lunar tides on (target every {interval:F0}s, ease {config.Tide.SlewPerSecond:F3}/s from live {_appliedOceanLevel:F3}). oceanlevel = base {config.Tide.BaseOceanLevel:F2} ± spring {config.Tide.SpringAmplitude:F2} / neap {config.Tide.SpringAmplitude * Mathf.Clamp01(config.Tide.NeapScale):F2}. Cargo event eases to 0 over {CargoEaseSeconds:F0}s, holds, eases back over {CargoEaseSeconds:F0}s. Conflicts with other oceanlevel plugins.");
         }
 
         private void SeedOceanLevelFromServer()
@@ -794,10 +806,11 @@ namespace Oxide.Plugins
             var opt = ConsoleSystem.Option.Server;
             if (config != null && config.QuietWeatherConvars)
                 opt = opt.Quiet();
-            ConsoleSystem.Run(opt, $"oceanlevel {q.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)}");
+            ConsoleSystem.Run(opt, "oceanlevel", q.ToString("F3", System.Globalization.CultureInfo.InvariantCulture));
             _appliedOceanLevel = q;
             _tideTargetLevel = q;
             _tideSmoothVel = 0f;
+            _lastWrittenOceanLevel = q;
         }
 
         private void RollOceanLevel()
@@ -811,50 +824,89 @@ namespace Oxide.Plugins
                 SeedOceanLevelFromServer();
 
             float maxSpeed = config?.Tide != null ? Mathf.Max(0.001f, config.Tide.SlewPerSecond) : 0.008f;
-            if (_cargoDockHold)
-                maxSpeed = config?.Tide != null ? Mathf.Max(maxSpeed, config.Tide.HarborEasePerSecond) : 0.012f;
-            if (_cargoEgress)
-                maxSpeed = Mathf.Min(maxSpeed, 0.003f);
+            if (_cargoDockHold || _cargoEgress)
+                maxSpeed = Mathf.Max(maxSpeed, _cargoEaseSpeed);
 
             float smoothTime = Mathf.Clamp(0.6f / Mathf.Max(0.001f, maxSpeed), 8f, 90f);
             float next = Mathf.SmoothDamp(_appliedOceanLevel, _tideTargetLevel, ref _tideSmoothVel, smoothTime, maxSpeed, dt);
-            float stepCap = _cargoEgress ? 0.002f : 0.008f;
+            float stepCap = (_cargoDockHold || _cargoEgress) ? 0.004f : 0.006f;
             next = Mathf.MoveTowards(_appliedOceanLevel, next, stepCap * dt);
             next = Mathf.Round(next * 1000f) / 1000f;
-            if (Mathf.Abs(next - _appliedOceanLevel) < 0.001f)
-                return;
 
-            // Water mesh rebuilds on every oceanlevel write. Skip writes during egress until a full step is ready.
-            if (_cargoEgress && Mathf.Abs(next - _appliedOceanLevel) < 0.002f)
+            // Only write when the quantized value actually moves. Avoids a string + convar per second.
+            if (Mathf.Abs(next - _lastWrittenOceanLevel) < 0.002f)
+            {
+                _appliedOceanLevel = next;
                 return;
+            }
 
             var opt = ConsoleSystem.Option.Server;
             if (config != null && config.QuietWeatherConvars)
                 opt = opt.Quiet();
-            ConsoleSystem.Run(opt, $"oceanlevel {next.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)}");
+            ConsoleSystem.Run(opt, "oceanlevel", next.ToString("F3", System.Globalization.CultureInfo.InvariantCulture));
             _appliedOceanLevel = next;
+            _lastWrittenOceanLevel = next;
             lastTideLevel = next;
         }
 
-        private void BeginCargoDockHold()
+        private void BeginCargoEventHold()
         {
             if (config?.Tide == null || !config.Tide.Enabled) return;
             StopTimer(ref _cargoDockReleaseTimer);
+            _cargoEgress = false;
             if (!_cargoDockHold)
-                Puts("[Tide] Cargo arrived — easing oceanlevel to 0.");
+            {
+                float from = float.IsNaN(_appliedOceanLevel) ? 0f : _appliedOceanLevel;
+                _cargoEaseSpeed = Mathf.Max(0.001f, Mathf.Abs(from) / CargoEaseSeconds);
+                Puts($"[Tide] Cargo entered grid — easing oceanlevel to 0 over {CargoEaseSeconds:F0}s ({_cargoEaseSpeed:F4}/s).");
+            }
             _cargoDockHold = true;
             _tideTargetLevel = 0f;
         }
 
-        private void EndCargoDockHold()
+        private void EndCargoEventHold()
         {
             if (!_cargoDockHold && !_cargoEgress) return;
             _cargoDockHold = false;
             _cargoEgress = true;
             _tideSmoothVel = 0f;
-            _cargoDockReleaseTimer = null;
-            Puts("[Tide] Cargo clear — returning oceanlevel to the lunar tide in small steps.");
+            float from = float.IsNaN(_appliedOceanLevel) ? 0f : _appliedOceanLevel;
+            float to = float.IsNaN(_tideTargetLevel) ? 0f : _tideTargetLevel;
+            _cargoEaseSpeed = Mathf.Max(0.001f, Mathf.Abs(to - from) / CargoEaseSeconds);
+            Puts($"[Tide] Cargo left grid — returning oceanlevel to the lunar tide over {CargoEaseSeconds:F0}s ({_cargoEaseSpeed:F4}/s).");
             ApplyLunarTide();
+        }
+
+        private void NoteCargoSpawned(CargoShip ship)
+        {
+            if (ship == null) return;
+            _cargoActive++;
+            BeginCargoEventHold();
+        }
+
+        private void NoteCargoGone(CargoShip ship)
+        {
+            if (ship == null) return;
+            _cargoActive = Mathf.Max(0, _cargoActive - 1);
+            if (_cargoActive > 0) return;
+            int swept = SweepFloatingHarborContainers();
+            if (swept > 0)
+                Puts($"[Tide] Swept {swept} orphaned harbor container{(swept == 1 ? "" : "s")} after cargo left the grid.");
+            EndCargoEventHold();
+        }
+
+        private void ScanExistingCargo()
+        {
+            _cargoActive = 0;
+            foreach (var net in BaseNetworkable.serverEntities)
+            {
+                if (net is CargoShip) _cargoActive++;
+            }
+            if (_cargoActive > 0)
+            {
+                Puts($"[Tide] {_cargoActive} cargo ship(s) already on the grid — holding ocean at 0.");
+                BeginCargoEventHold();
+            }
         }
 
         private bool IsFloatingHarborContainer(BaseEntity ent, List<MonumentInfo> monuments)
@@ -962,20 +1014,10 @@ namespace Oxide.Plugins
 
         private void OnCargoShipHarborArrived(CargoShip ship)
         {
-            BeginCargoDockHold();
         }
 
         private void OnCargoShipHarborLeave(CargoShip ship)
         {
-            if (config?.Tide == null || !config.Tide.Enabled) return;
-            StopTimer(ref _cargoDockReleaseTimer);
-            _cargoDockReleaseTimer = timer.Once(90f, () =>
-            {
-                EndCargoDockHold();
-                int swept = SweepFloatingHarborContainers();
-                if (swept > 0)
-                    Puts($"[Tide] Swept {swept} orphaned harbor container{(swept == 1 ? "" : "s")} after cargo cleared.");
-            });
         }
 
         private struct ClimateGate
@@ -2158,6 +2200,7 @@ namespace Oxide.Plugins
                 windSustained, windGust, windDir, visibilityM, isDay, forceLog);
 
             ApplyMultiDayLookAhead(forceLog);
+            _weatherDirty = true;
         }
 
         private void ComputeTargetsFromRaw(int weatherCode, float cloudPercent, float cloudLow, float cloudMid, float cloudHigh,
@@ -3368,7 +3411,9 @@ namespace Oxide.Plugins
 
             TickCloudAssetDissolve();
             UpdateLightningFlash();
-            ApplyWeatherToClimate();
+            if (_weatherDirty || _cloudSwapPhase != CloudSwapPhase.Idle)
+                ApplyWeatherToClimate();
+            _weatherDirty = false;
 
             bool lightningOn = config.EnableLightningStrikes || config.EnableRealLightning;
             if (lightningOn && wx.currentThunder >= config.LightningThunderThreshold && SkyAllowsLightning())
@@ -4709,7 +4754,7 @@ namespace Oxide.Plugins
         class ConfigData
         {
             [JsonProperty("CollectWorldStats")] public bool CollectWorldStats { get; set; } = true;
-            [JsonProperty("WorldStatsUpdateInterval")] public float WorldStatsUpdateInterval { get; set; } = 10f;
+            [JsonProperty("WorldStatsUpdateInterval")] public float WorldStatsUpdateInterval { get; set; } = 30f;
             [JsonProperty("WorldStatsCommandEnabled")] public bool WorldStatsCommandEnabled { get; set; } = true;
 
             /// <summary>OFF by default. When true, drives in-game weather from Open-Meteo. Conflicts with other weather plugins.</summary>
@@ -5138,7 +5183,7 @@ namespace Oxide.Plugins
         {
             if (config == null) return;
 
-            config.WorldStatsUpdateInterval = Mathf.Clamp(config.WorldStatsUpdateInterval, 5f, 300f);
+            config.WorldStatsUpdateInterval = Mathf.Clamp(config.WorldStatsUpdateInterval, 15f, 300f);
             config.LocalWeatherUpdateIntervalMinutes = Mathf.Clamp(config.LocalWeatherUpdateIntervalMinutes, 5, 180);
             config.WeatherBlendSeconds = Mathf.Clamp(config.WeatherBlendSeconds, 25f, 180f);
             config.WeatherBlendInterval = Mathf.Clamp(config.WeatherBlendInterval, 0.5f, 5f);
