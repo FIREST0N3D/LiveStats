@@ -10,7 +10,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStats", "FiREST0N3D", "1.9.832")]
+    [Info("LiveStats", "FiREST0N3D", "1.9.840")]
     [Description("Comprehensive player/NPC/animal stats, killfeed + optional idle kick. Dual wipe detection. Kill streak tracking (players/NPCs/animals) + isPlayerDead. Optional LiveStatsWorld extension for time/weather. CONFLICTS: none by default; idle kick is opt-in. Pair with LiveStatsWorld/LiveStatsEvents as a suite.")]
     class LiveStats : RustPlugin
     {
@@ -405,7 +405,7 @@ namespace Oxide.Plugins
             LoadDefaultMessages();
             LogLanguagePackInventory();
 
-            Puts("LiveStats v1.9.832 loaded (teamkill penalty)");
+            Puts("LiveStats v1.9.840 loaded (rear shots are not headshots)");
             LoadWipeIdentity();
             LoadStats();
             LoadNpcStats();
@@ -3155,6 +3155,11 @@ private void LoadDefaultMessages()
                 && boneName.IndexOf("head", StringComparison.OrdinalIgnoreCase) >= 0)
                 return true;
 
+            // Prefer the live skeleton. The capsule runs neck -> head -> jaw, so it follows
+            // the skull and the snout instead of a guessed sphere on the body.
+            if (TrySkeletonHeadshot(entity, info))
+                return true;
+
             Transform head = FindAnimalHeadBone(entity);
             bool hasBounds = TryGetAnimalWorldBounds(entity, out Bounds world);
             Vector3 headPos = ResolveAnimalHeadPosition(entity, head, hasBounds, world);
@@ -3164,24 +3169,235 @@ private void LoadDefaultMessages()
             bool hasHit = hit.sqrMagnitude > 0.01f;
             float dist = hasHit ? Vector3.Distance(hit, headPos) : 999f;
             bool livestock = IsLivestock(entity.ShortPrefabName);
-            float aimRadius = livestock ? Mathf.Max(radius, 1.20f) : radius;
+            bool horse = IsHorse(entity.ShortPrefabName);
+            bool snout = IsSnoutAnimal(entity.ShortPrefabName);
+            // Horses have a ride skeleton. The head bone is already on the visual head.
+            // Livestock get a wide aim test. Snout animals (boar) get a modest one so a
+            // face shot threads the head without a chest shot doing the same.
+            float aimRadius = horse ? radius
+                : (livestock ? Mathf.Max(radius, 1.20f)
+                : (snout ? Mathf.Max(radius, 0.70f) : radius));
             float aimDist = 999f;
             bool aimed = ShotPassesHead(info, entity, headPos, aimRadius, out aimDist);
             // Capsule impact sits on the chest. Small animals need the impact in the head
             // sphere. Large animals (bear, horse) land farther down the capsule, so a front
             // hit only counts when the shot also threads the head.
-            bool large = IsLargeHeadAnimal(entity.ShortPrefabName);
+            bool large = IsLargeHeadAnimal(entity.ShortPrefabName) && !horse;
             bool closeImpact = hasHit && dist <= radius * (large ? 1.35f : 1.05f);
             bool frontCap = hasHit && hasBounds && HitOnFrontCap(entity, hit, world);
-            // Livestock skull bone sits on the neck. A scoped snout hit lands farther
+            // Livestock skull bones sit on the neck. A scoped snout hit lands farther
             // forward, so a front shot counts when the ray also threads the head.
-            float chestMul = livestock ? 2.4f : 1.8f;
+            // Horses are excluded: their head bone is the real head.
+            // Boars: the capsule hit sits behind the snout. A front hit counts only
+            // when the ray also threads the head, and only within a short slack.
+            float chestMul = livestock ? 2.2f : 1.8f;
             bool chestHead = large && frontCap && aimed && hasHit && dist <= radius * chestMul;
-            bool headshot = chestHead || (closeImpact && (aimed || frontCap || dist <= radius * 0.7f));
+            bool snoutHead = snout && frontCap && aimed && hasHit && dist <= radius * 1.55f;
+            bool headshot = horse
+                ? (hasHit && dist <= radius && (aimed || dist <= radius * 0.75f))
+                : (chestHead || snoutHead || (closeImpact && (aimed || frontCap || dist <= radius * 0.7f)));
 
             if (config != null && config.DebugMode)
                 Puts($"[AnimalHS] {entity.ShortPrefabName} impact={dist:F2} aim={aimDist:F2} radius={radius:F2} bone={(head != null)} front={frontCap} headshot={headshot}");
             return headshot;
+        }
+
+        /// <summary>
+        /// Head volume from the animal's own skeleton. Neck is the back of the skull, jaw is
+        /// the snout. A hit or a ray that threads that capsule is a headshot.
+        /// </summary>
+        private bool TrySkeletonHeadshot(BaseCombatEntity entity, HitInfo info)
+        {
+            Model model = ResolveAnimalModel(entity, info, out string source);
+            if (model == null || model.boneTransforms == null) return false;
+
+            Transform head = model.headBone != null ? model.headBone : MatchHeadBone(model.boneTransforms);
+            Transform jaw = FindNamedBone(model.boneTransforms, "jaw");
+            Transform neck = FindNamedBone(model.boneTransforms, "neck");
+            if (head == null && jaw == null) return false;
+
+            Vector3 back = neck != null ? neck.position : (head != null ? head.position : jaw.position);
+            Vector3 front = jaw != null ? jaw.position : head.position;
+            if (head != null && jaw == null)
+            {
+                Vector3 fwd = entity.transform.forward;
+                fwd.y = 0f;
+                if (fwd.sqrMagnitude < 0.01f) fwd = entity.transform.forward;
+                fwd.Normalize();
+                front = head.position + fwd * 0.18f;
+            }
+            if ((front - back).sqrMagnitude < 0.0004f)
+                front = back + entity.transform.forward * 0.2f;
+
+            float length = Vector3.Distance(back, front);
+            // Boar is the calibration. A face shot sat 0.69 off the bone line and a body
+            // shot sat 0.86, so core 0.42 / skin 0.74. Other animals scale from that.
+            SkeletonHeadSize(entity.ShortPrefabName, length, out float core, out float skin);
+
+            Vector3 hit = ResolveHitPoint(info, entity);
+            bool hasHit = hit.sqrMagnitude > 0.01f;
+            float impact = hasHit ? DistanceToSegment(hit, back, front) : 999f;
+            float aim = 999f;
+            // Stop the ray at the bullet. A shot from behind into the butt must not
+            // keep traveling through the body and thread the head.
+            RayNearSegment(info, entity, back, front, skin, hit, out aim);
+            // A hit behind the neck is the body or the butt, even if the ray points at the head.
+            Vector3 skull = front - back;
+            bool behind = hasHit && skull.sqrMagnitude > 0.0004f && Vector3.Dot(hit - back, skull) < 0f;
+            bool onSkull = hasHit && !behind && impact <= core;
+            bool onFace = hasHit && !behind && impact <= skin && aim <= skin;
+            bool headshot = onSkull || onFace;
+
+            if (config != null && config.DebugMode)
+                Puts($"[AnimalHS] {entity.ShortPrefabName} skeleton from={source} neck={(neck != null)} head={(head != null)} jaw={(jaw != null)} impact={impact:F2} aim={aim:F2} core={core:F2} skin={skin:F2} headshot={headshot}");
+            return headshot;
+        }
+
+        /// <summary>
+        /// Core is the skull. Skin is the face, and requires the shot to also be aimed there.
+        /// Scaled from the boar calibration (face 0.69 counts, body 0.86 does not).
+        /// </summary>
+        private static void SkeletonHeadSize(string name, float boneLength, out float core, out float skin)
+        {
+            float scale = 1f;
+            if (!string.IsNullOrEmpty(name))
+            {
+                if (name.IndexOf("polarbear", StringComparison.OrdinalIgnoreCase) >= 0) scale = 1.55f;
+                else if (name.IndexOf("bear", StringComparison.OrdinalIgnoreCase) >= 0) scale = 1.45f;
+                else if (name.IndexOf("cow", StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.IndexOf("bull", StringComparison.OrdinalIgnoreCase) >= 0) scale = 1.50f;
+                else if (name.IndexOf("horse", StringComparison.OrdinalIgnoreCase) >= 0) scale = 1.05f;
+                else if (name.IndexOf("stag", StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.IndexOf("deer", StringComparison.OrdinalIgnoreCase) >= 0) scale = 1.10f;
+                else if (name.IndexOf("wolf", StringComparison.OrdinalIgnoreCase) >= 0) scale = 0.85f;
+                else if (name.IndexOf("tiger", StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.IndexOf("panther", StringComparison.OrdinalIgnoreCase) >= 0) scale = 1.15f;
+                else if (name.IndexOf("crocodile", StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.IndexOf("croc", StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.IndexOf("shark", StringComparison.OrdinalIgnoreCase) >= 0) scale = 1.20f;
+                else if (name.IndexOf("boar", StringComparison.OrdinalIgnoreCase) >= 0) scale = 1f;
+                else if (name.IndexOf("chicken", StringComparison.OrdinalIgnoreCase) >= 0) scale = 0.40f;
+                else if (name.IndexOf("rabbit", StringComparison.OrdinalIgnoreCase) >= 0) scale = 0.35f;
+                else scale = Mathf.Clamp(boneLength / 0.38f, 0.7f, 1.4f);
+            }
+            core = 0.42f * scale;
+            skin = 0.74f * scale;
+        }
+
+        /// <summary>
+        /// The combat entity is often a capsule. The skeleton can be a child model, or the
+        /// entity the bullet actually hit. Prefer a model that has bones.
+        /// </summary>
+        private static Model ResolveAnimalModel(BaseEntity entity, HitInfo info, out string source)
+        {
+            source = "none";
+            Model best = null;
+            int bestBones = -1;
+
+            ConsiderModel(entity != null ? entity.model : null, "root", ref best, ref bestBones, ref source);
+            ConsiderModel(info != null && info.HitEntity != null ? info.HitEntity.model : null, "hit", ref best, ref bestBones, ref source);
+
+            if (entity != null)
+            {
+                var models = entity.GetComponentsInChildren<Model>(true);
+                if (models != null)
+                {
+                    for (int i = 0; i < models.Length; i++)
+                        ConsiderModel(models[i], "child", ref best, ref bestBones, ref source);
+                }
+            }
+            if (info != null && info.HitEntity != null && info.HitEntity != entity)
+            {
+                var models = info.HitEntity.GetComponentsInChildren<Model>(true);
+                if (models != null)
+                {
+                    for (int i = 0; i < models.Length; i++)
+                        ConsiderModel(models[i], "hit-child", ref best, ref bestBones, ref source);
+                }
+                var parent = info.HitEntity.GetParentEntity();
+                if (parent != null && parent != entity)
+                    ConsiderModel(parent.model, "hit-parent", ref best, ref bestBones, ref source);
+            }
+            return best;
+        }
+
+        private static void ConsiderModel(Model model, string label, ref Model best, ref int bestBones, ref string source)
+        {
+            if (model == null || model.boneTransforms == null) return;
+            int n = model.boneTransforms.Length;
+            if (n > bestBones)
+            {
+                best = model;
+                bestBones = n;
+                source = label + ":" + n;
+            }
+        }
+
+        private static Transform FindNamedBone(Transform[] bones, string token)
+        {
+            if (bones == null || string.IsNullOrEmpty(token)) return null;
+            for (int i = 0; i < bones.Length; i++)
+            {
+                var t = bones[i];
+                if (t == null || string.IsNullOrEmpty(t.name)) continue;
+                if (t.name.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0
+                    && t.name.IndexOf("headshot", StringComparison.OrdinalIgnoreCase) < 0)
+                    return t;
+            }
+            return null;
+        }
+
+        private static float DistanceToSegment(Vector3 point, Vector3 a, Vector3 b)
+        {
+            Vector3 ab = b - a;
+            float len2 = ab.sqrMagnitude;
+            if (len2 < 0.0001f) return Vector3.Distance(point, a);
+            float t = Mathf.Clamp01(Vector3.Dot(point - a, ab) / len2);
+            return Vector3.Distance(point, a + ab * t);
+        }
+
+        private static bool RayNearSegment(HitInfo info, BaseEntity entity, Vector3 a, Vector3 b, float radius, Vector3 stopAt, out float aimDist)
+        {
+            aimDist = 999f;
+            if (info == null) return false;
+            Vector3 origin = info.PointStart;
+            Vector3 end = info.PointEnd;
+            if (origin.sqrMagnitude < 0.01f && info.InitiatorPlayer != null && info.InitiatorPlayer.eyes != null)
+                origin = info.InitiatorPlayer.eyes.position;
+            if (end.sqrMagnitude < 0.01f)
+                end = stopAt.sqrMagnitude > 0.01f ? stopAt : ResolveHitPoint(info, entity);
+            // The projectile path runs past the animal. Cut it at the bullet so a rear
+            // shot cannot travel through the body and graze the head.
+            if (stopAt.sqrMagnitude > 0.01f && origin.sqrMagnitude > 0.01f)
+            {
+                float toEnd = Vector3.Distance(origin, end);
+                float toHit = Vector3.Distance(origin, stopAt);
+                if (toHit > 0.05f && toHit < toEnd)
+                    end = stopAt;
+            }
+            if (origin.sqrMagnitude < 0.01f || end.sqrMagnitude < 0.01f) return false;
+
+            Vector3 ray = end - origin;
+            float rayLen2 = ray.sqrMagnitude;
+            Vector3 seg = b - a;
+            float segLen2 = seg.sqrMagnitude;
+            if (rayLen2 < 0.0001f || segLen2 < 0.0001f) return false;
+
+            // Closest approach between the shot segment and the neck-jaw segment.
+            Vector3 w0 = origin - a;
+            float aa = rayLen2;
+            float bb = segLen2;
+            float cc = Vector3.Dot(ray, seg);
+            float dd = Vector3.Dot(ray, w0);
+            float ee = Vector3.Dot(seg, w0);
+            float denom = aa * bb - cc * cc;
+            float s = denom > 0.0001f ? Mathf.Clamp01((cc * ee - bb * dd) / denom) : 0f;
+            float t = Mathf.Clamp01((cc * s + ee) / bb);
+            s = Mathf.Clamp01((cc * t - dd) / aa);
+            Vector3 onRay = origin + ray * s;
+            Vector3 onSeg = a + seg * t;
+            aimDist = Vector3.Distance(onRay, onSeg);
+            return aimDist <= radius;
         }
 
         private float ScaledAnimalHeadRadius(BaseEntity entity, Vector3 headPos, bool hasBounds, Bounds world)
@@ -3194,7 +3410,7 @@ private void LoadDefaultMessages()
             float height = world.size.y;
             // Head is a fraction of the body. Keep the sphere on the skull, not the torso.
             // Large animals get a bigger cap so the chest-capsule offset still reaches.
-            bool large = IsLargeHeadAnimal(entity.ShortPrefabName);
+            bool large = IsLargeHeadAnimal(entity.ShortPrefabName) && !IsHorse(entity.ShortPrefabName);
             float scaled = Mathf.Max(width * 0.32f, length * 0.12f, height * 0.22f);
             float cap = large ? 0.90f : 0.55f;
             return Mathf.Clamp(Mathf.Max(radius, scaled), 0.18f, cap);
@@ -3216,6 +3432,18 @@ private void LoadDefaultMessages()
                 || name.IndexOf("stag", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
+        private static bool IsHorse(string name)
+        {
+            return !string.IsNullOrEmpty(name)
+                && name.IndexOf("horse", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool IsSnoutAnimal(string name)
+        {
+            return !string.IsNullOrEmpty(name)
+                && name.IndexOf("boar", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
         private static Vector3 ResolveAnimalHeadPosition(BaseEntity entity, Transform head, bool hasBounds, Bounds world)
         {
             Vector3 forward = entity.transform.forward;
@@ -3225,13 +3453,19 @@ private void LoadDefaultMessages()
 
             if (head != null)
             {
-                // Skull bone sits behind the snout. Livestock necks are long, so the
-                // nudge has to reach the forehead or a scoped headshot lands short.
+                // Horses: the ride skeleton already puts this bone on the visual head.
+                // Nudging it forward is what made a chest shot count and a head shot miss.
+                if (IsHorse(entity.ShortPrefabName))
+                    return head.position;
+
+                // Other skull bones sit on the neck. Livestock need a snout nudge.
+                // Boars need a smaller one so the point sits on the face, not the shoulders.
                 bool livestock = IsLivestock(entity.ShortPrefabName);
-                float frac = livestock ? 0.7f : 0.35f;
-                float cap = livestock ? 1.05f : 0.45f;
+                bool snout = IsSnoutAnimal(entity.ShortPrefabName);
+                float frac = livestock ? 0.7f : (snout ? 0.5f : 0.35f);
+                float cap = livestock ? 1.05f : (snout ? 0.55f : 0.45f);
                 float nudge = hasBounds ? Mathf.Clamp(world.extents.z * frac, 0.12f, cap) : 0.2f;
-                float lift = livestock ? 0.15f : 0f;
+                float lift = livestock ? 0.15f : (snout ? 0.08f : 0f);
                 return head.position + forward * nudge + Vector3.up * lift;
             }
             if (hasBounds)
@@ -3437,11 +3671,11 @@ private void LoadDefaultMessages()
             if (string.IsNullOrEmpty(name)) return 0.36f;
             if (name.IndexOf("polarbear", StringComparison.OrdinalIgnoreCase) >= 0) return 0.62f;
             if (name.IndexOf("bear", StringComparison.OrdinalIgnoreCase) >= 0) return 0.58f;
-            if (name.IndexOf("boar", StringComparison.OrdinalIgnoreCase) >= 0) return 0.42f;
+            if (name.IndexOf("boar", StringComparison.OrdinalIgnoreCase) >= 0) return 0.48f;
             if (name.IndexOf("cow", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("bull", StringComparison.OrdinalIgnoreCase) >= 0) return 0.70f;
             if (name.IndexOf("stag", StringComparison.OrdinalIgnoreCase) >= 0) return 0.50f;
-            if (name.IndexOf("horse", StringComparison.OrdinalIgnoreCase) >= 0) return 0.50f;
+            if (name.IndexOf("horse", StringComparison.OrdinalIgnoreCase) >= 0) return 0.42f;
             if (name.IndexOf("wolf", StringComparison.OrdinalIgnoreCase) >= 0) return 0.34f;
             if (name.IndexOf("crocodile", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("croc", StringComparison.OrdinalIgnoreCase) >= 0) return 0.40f;
