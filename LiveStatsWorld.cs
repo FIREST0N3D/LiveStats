@@ -9,8 +9,8 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.70")]
-    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.70: ocean eases to 0 over 3m when cargo enters the grid, holds for the whole event, eases back over 3m when it leaves.")]
+    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.72")]
+    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.72: cargo pins oceanlevel to 0 immediately and logs the pre-hold level.")]
     class LiveStatsWorld : RustPlugin
     {
         private enum CloudSwapPhase
@@ -854,14 +854,17 @@ namespace Oxide.Plugins
             if (config?.Tide == null || !config.Tide.Enabled) return;
             StopTimer(ref _cargoDockReleaseTimer);
             _cargoEgress = false;
+            float from = float.IsNaN(_appliedOceanLevel) ? 0f : _appliedOceanLevel;
             if (!_cargoDockHold)
             {
-                float from = float.IsNaN(_appliedOceanLevel) ? 0f : _appliedOceanLevel;
                 _cargoEaseSpeed = Mathf.Max(0.001f, Mathf.Abs(from) / CargoEaseSeconds);
-                Puts($"[Tide] Cargo entered grid — easing oceanlevel to 0 over {CargoEaseSeconds:F0}s ({_cargoEaseSpeed:F4}/s).");
+                Puts($"[Tide] Cargo owns oceanlevel. Was {from:F3}, easing to 0 over {CargoEaseSeconds:F0}s ({_cargoEaseSpeed:F4}/s). Lunar tide paused.");
             }
             _cargoDockHold = true;
             _tideTargetLevel = 0f;
+            _tideSmoothVel = 0f;
+            if (Mathf.Abs(from) < 0.01f)
+                SetOceanLevel(0f, true);
         }
 
         private void EndCargoEventHold()
@@ -1739,9 +1742,10 @@ namespace Oxide.Plugins
                 bool looksJson = !string.IsNullOrEmpty(response) && (response[0] == '{' || response[0] == '[');
                 if (httpCode != 200 || !looksJson)
                 {
-                    string body = string.IsNullOrEmpty(response) ? "empty body" : response.Substring(0, Math.Min(180, response.Length));
+                    bool gateway = httpCode == 502 || httpCode == 503 || httpCode == 504;
+                    string body = gateway ? "gateway down" : string.IsNullOrEmpty(response) ? "empty body" : response.Substring(0, Math.Min(180, response.Length));
                     Puts($"[Weather] Open-Meteo HTTP {httpCode} ({(wasRich ? "rich" : "minimal")}) -- {body}");
-                    if (wasRich)
+                    if (wasRich && !gateway)
                     {
                         Puts("[Weather] Retrying with minimal variable set...");
                         EnqueueOpenMeteo(urlMin, (c2, r2) => HandleResponse(c2, r2, false));
@@ -1751,7 +1755,7 @@ namespace Oxide.Plugins
                     float age = wx._lastWeatherSuccessTime > 0f ? Time.realtimeSinceStartup - wx._lastWeatherSuccessTime : -1f;
                     Puts($"[Weather] Poll failed (x{wx._consecutiveWeatherFails}); continuing with {_weatherAnchors.Count} stale anchors" +
                          (age >= 0 ? $" (last success {age:F0}s ago)" : ""));
-                    ScheduleWeatherRetry();
+                    ScheduleWeatherRetry(gateway);
                     return;
                 }
 
@@ -2042,11 +2046,13 @@ namespace Oxide.Plugins
             webrequest.Enqueue(url, null, callback, this, Oxide.Core.Libraries.RequestMethod.GET, OpenMeteoHeaders, OpenMeteoTimeoutSeconds);
         }
 
-        private void ScheduleWeatherRetry()
+        private void ScheduleWeatherRetry(bool gateway = false)
         {
-            if (wx._consecutiveWeatherFails > 3) return;
+            if (wx._consecutiveWeatherFails > 6) return;
             if (_weatherRetryTimer != null && !_weatherRetryTimer.Destroyed) return;
-            float delay = wx._consecutiveWeatherFails <= 1 ? 20f : 45f;
+            float delay = gateway
+                ? Mathf.Min(300f, 60f * wx._consecutiveWeatherFails)
+                : (wx._consecutiveWeatherFails <= 1 ? 20f : 45f);
             Log(LogArea.Weather, $"Retrying poll in {delay:F0}s");
             StopTimer(ref _weatherRetryTimer);
             _weatherRetryTimer = timer.Once(delay, () =>
