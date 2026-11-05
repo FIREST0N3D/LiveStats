@@ -1451,10 +1451,10 @@ namespace Oxide.Plugins
             ulong netId = entity.net.ID.Value;
             string victimPrefab = entity.ShortPrefabName ?? "";
 
-            if (info.damageTypes.Has(Rust.DamageType.Hunger)) SetDamageTrack(lastEnvironmentalCause, netId, "Starvation", victimPrefab);
+            if (info.damageTypes.Has(Rust.DamageType.Radiation)) SetDamageTrack(lastEnvironmentalCause, netId, "Radiation Poisoning", victimPrefab);
+            else if (info.damageTypes.Has(Rust.DamageType.Hunger)) SetDamageTrack(lastEnvironmentalCause, netId, "Starvation", victimPrefab);
             else if (info.damageTypes.Has(Rust.DamageType.Thirst)) SetDamageTrack(lastEnvironmentalCause, netId, "Dehydration", victimPrefab);
             else if (info.damageTypes.Has(Rust.DamageType.Cold)) SetDamageTrack(lastEnvironmentalCause, netId, "Freezing", victimPrefab);
-            else if (info.damageTypes.Has(Rust.DamageType.Radiation)) SetDamageTrack(lastEnvironmentalCause, netId, "Radiation Poisoning", victimPrefab);
             else if (info.damageTypes.Has(Rust.DamageType.Heat)) SetDamageTrack(lastEnvironmentalCause, netId, "Heat", victimPrefab);
             else if (info.damageTypes.Has(Rust.DamageType.Drowned)) SetDamageTrack(lastEnvironmentalCause, netId, "Drowning", victimPrefab);
             else if (info.damageTypes.Has(Rust.DamageType.Poison)) SetDamageTrack(lastEnvironmentalCause, netId, "Poison", victimPrefab);
@@ -2322,7 +2322,7 @@ namespace Oxide.Plugins
                         vStats.deathsByAnimalType[animalType] = 0;
                     vStats.deathsByAnimalType[animalType]++;
                 }
-                else if (details.Cause == "Radiation Poisoning")
+                else if (details.Cause != null && details.Cause.IndexOf("Radiation", StringComparison.OrdinalIgnoreCase) >= 0)
                     vStats.deathsByRadiationPoisoning++;
                 else
                 {
@@ -2332,9 +2332,14 @@ namespace Oxide.Plugins
                         killerRaw == "Burning" || killerRaw == "Freezing" || killerRaw == "Drowning" ||
                         killerRaw == "Drowned" ||
                         killerRaw == "Starvation" || killerRaw == "Dehydration" || killerRaw == "Poison" ||
-                        killerRaw == "FallDamage" || killerRaw == "Fall Damage")
+                        killerRaw == "FallDamage" || killerRaw == "Fall Damage" ||
+                        killerRaw.IndexOf("Radiation", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
-                        vStats.deathsByEnvironment++;
+                        // Catch radiation that fell through (e.g. killer name is "Radiation")
+                        if (killerRaw.IndexOf("Radiation", StringComparison.OrdinalIgnoreCase) >= 0)
+                            vStats.deathsByRadiationPoisoning++;
+                        else
+                            vStats.deathsByEnvironment++;
                     }
                 }
 
@@ -2449,7 +2454,9 @@ namespace Oxide.Plugins
                                          details.KillerNameRaw == "Freezing" || details.KillerNameRaw == "Drowning" ||
                                          details.KillerNameRaw == "Starvation" || details.KillerNameRaw == "Dehydration" ||
                                          details.KillerNameRaw == "Poison" || details.KillerNameRaw == "FallDamage" ||
-                                         details.KillerNameRaw == "Fall Damage";
+                                         details.KillerNameRaw == "Fall Damage" ||
+                                         (details.KillerNameRaw != null && details.KillerNameRaw.IndexOf("Radiation", StringComparison.OrdinalIgnoreCase) >= 0) ||
+                                         (details.Cause != null && details.Cause.IndexOf("Radiation", StringComparison.OrdinalIgnoreCase) >= 0);
 
             if (isEnvironmentalKiller && !details.IsSuicide)
             {
