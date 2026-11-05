@@ -11,7 +11,7 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.199")]
+    [Info("LiveStatsEvents", "FiREST0N3D", "1.13.228")]
     [Description("Core event scheduler + classic world events (Cargo, Airdrop, Heli, Chinook, Bradley, F-15, Hackable). Requires LiveStatsWorld. NPC events require LiveStatsEventsNPC. Vehicle events+despawn require LiveStatsEventsVehicles. Configs: core owns schedule + classic events; LiveStatsEventsNPC owns NPC behavior; LiveStatsEventsVehicles owns vehicle limits/despawn.")]
     class LiveStatsEvents : RustPlugin
     {
@@ -307,7 +307,7 @@ namespace Oxide.Plugins
             permission.RegisterPermission(AdminPermission, this);
             // Do NOT register livestats.admin / livestatsworld.admin – those belong to other plugins.
             LoadDefaultMessages();
-            Puts("LiveStatsEvents v1.13.183 — announce/cargo/lights/index share a 5s clock");
+            Puts("LiveStatsEvents v1.13.228 — ShorePatrol removed");
             // Earliest possible vanilla gate — EventSchedule may queue before OnServerInitialized
             EarlyVanillaSuppress();
         }
@@ -505,6 +505,10 @@ namespace Oxide.Plugins
             {
                 DisableVanillaEventSystems();
             }
+
+            // Combat / deploy convars are independent of vanilla schedule ownership
+            ApplyBradleyCombatConvars();
+            ApplyPatrolHeliCombatConvars();
 
             // Cold boot: reserve first event as Cargo after 8–18 min.
             // Soft reload (recent persisted times, or a cargo already on the map): do not
@@ -11311,6 +11315,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             catch { }
         }
 
+
         private bool SpawnAirfieldChinook()
         {
             var cfg = config?.AirfieldChinook ?? new AirfieldChinookConfig();
@@ -12054,6 +12059,79 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 ConsoleSystem.Run(ConsoleSystem.Option.Server, "cargoship.event_enabled false");
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Push bradleyapc.* combat/deploy convars from config. Safe to call on every restart.
+        /// </summary>
+        private void ApplyBradleyCombatConvars()
+        {
+            var bc = config?.BradleyCombat;
+            if (bc == null || !bc.ApplyOnStartup) return;
+
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            string[] cmds =
+            {
+                string.Format(inv, "bradleyapc.deployattackdistancemax {0}", bc.DeployAttackDistanceMax),
+                string.Format(inv, "bradleyapc.deployhealthrangemax {0}", bc.DeployHealthRangeMax),
+                string.Format(inv, "bradleyapc.deployhealthrangemin {0}", bc.DeployHealthRangeMin),
+                string.Format(inv, "bradleyapc.deployinterval {0}", bc.DeployInterval),
+                string.Format(inv, "bradleyapc.deployondamagecheckinterval {0}", bc.DeployOnDamageCheckInterval),
+                "bradleyapc.killscientistsonbradleydeath " + (bc.KillScientistsOnBradleyDeath ? "true" : "false"),
+                string.Format(inv, "bradleyapc.mountafternotattackedduration {0}", bc.MountAfterNotAttackedDuration),
+                string.Format(inv, "bradleyapc.mountafternotfiredduration {0}", bc.MountAfterNotFiredDuration),
+                string.Format(inv, "bradleyapc.mountafternottargetsduration {0}", bc.MountAfterNotTargetsDuration),
+                string.Format(inv, "bradleyapc.scientistredeploymentmininterval {0}", bc.ScientistRedeploymentMinInterval),
+                "bradleyapc.usesmokegrenades " + (bc.UseSmokeGrenades ? "true" : "false"),
+            };
+
+            int applied = 0;
+            foreach (var cmd in cmds)
+            {
+                try
+                {
+                    ConsoleSystem.Run(ConsoleSystem.Option.Server, cmd);
+                    applied++;
+                }
+                catch (Exception ex)
+                {
+                    DebugLog($"Bradley combat convar failed: {cmd} ({ex.Message})");
+                }
+            }
+            Puts($"[Events] Applied {applied}/{cmds.Length} bradleyapc combat convars");
+        }
+
+        /// <summary>
+        /// Push patrol helicopter combat / AI convars from config.
+        /// </summary>
+        private void ApplyPatrolHeliCombatConvars()
+        {
+            var hc = config?.PatrolHeliCombat;
+            if (hc == null || !hc.ApplyOnStartup) return;
+
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            string[] cmds =
+            {
+                string.Format(inv, "heli.bulletaccuracy {0}", hc.BulletAccuracy),
+                string.Format(inv, "heli.bulletdamagescale {0}", hc.BulletDamageScale),
+                string.Format(inv, "heli.guns {0}", hc.Guns),
+                string.Format(inv, "patrolhelicopterai.flee_damage_percentage {0}", hc.FleeDamagePercentage),
+            };
+
+            int applied = 0;
+            foreach (var cmd in cmds)
+            {
+                try
+                {
+                    ConsoleSystem.Run(ConsoleSystem.Option.Server, cmd);
+                    applied++;
+                }
+                catch (Exception ex)
+                {
+                    DebugLog($"Patrol heli combat convar failed: {cmd} ({ex.Message})");
+                }
+            }
+            Puts($"[Events] Applied {applied}/{cmds.Length} patrol heli combat convars");
         }
 
         private void DisableVanillaEventSystems()
@@ -13130,6 +13208,14 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             [JsonProperty("BradleyPatrol")]
             public BradleyPatrolConfig BradleyPatrol { get; set; } = new BradleyPatrolConfig();
 
+            /// <summary>Facepunch bradleyapc.* combat / deploy convars. Applied on startup and config reload.</summary>
+            [JsonProperty("BradleyCombat")]
+            public BradleyCombatConfig BradleyCombat { get; set; } = new BradleyCombatConfig();
+
+            /// <summary>Patrol helicopter combat / AI convars. Applied on startup and config reload.</summary>
+            [JsonProperty("PatrolHeliCombat")]
+            public PatrolHeliCombatConfig PatrolHeliCombat { get; set; } = new PatrolHeliCombatConfig();
+
             [JsonProperty("AttackHeliSpawn")]
             public AttackHeliSpawnConfig AttackHeliSpawn { get; set; } = new AttackHeliSpawnConfig();
 
@@ -13296,6 +13382,43 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             /// <summary>How long a plugin Bradley stays before despawn (minutes).</summary>
             [JsonProperty("PatrolLifetimeMinutes")] public float PatrolLifetimeMinutes { get; set; } = 25f;
             [JsonProperty("Waypoints")] public List<HeliWaypoint> Waypoints { get; set; } = new List<HeliWaypoint>();
+        }
+
+        /// <summary>
+        /// Server convars that control Bradley combat / scientist deploy behavior.
+        /// Values are pushed via ConsoleSystem.Run on startup and config reload.
+        /// </summary>
+        public class BradleyCombatConfig
+        {
+            [JsonProperty("ApplyOnStartup")] public bool ApplyOnStartup { get; set; } = true;
+            [JsonProperty("DeployAttackDistanceMax")] public float DeployAttackDistanceMax { get; set; } = 50f;
+            [JsonProperty("DeployHealthRangeMax")] public float DeployHealthRangeMax { get; set; } = 0.5f;
+            [JsonProperty("DeployHealthRangeMin")] public float DeployHealthRangeMin { get; set; } = 0.4f;
+            [JsonProperty("DeployInterval")] public float DeployInterval { get; set; } = 1f;
+            [JsonProperty("DeployOnDamageCheckInterval")] public float DeployOnDamageCheckInterval { get; set; } = 1f;
+            [JsonProperty("KillScientistsOnBradleyDeath")] public bool KillScientistsOnBradleyDeath { get; set; } = false;
+            [JsonProperty("MountAfterNotAttackedDuration")] public float MountAfterNotAttackedDuration { get; set; } = 180f;
+            [JsonProperty("MountAfterNotFiredDuration")] public float MountAfterNotFiredDuration { get; set; } = 60f;
+            [JsonProperty("MountAfterNotTargetsDuration")] public float MountAfterNotTargetsDuration { get; set; } = 60f;
+            [JsonProperty("ScientistRedeploymentMinInterval")] public float ScientistRedeploymentMinInterval { get; set; } = 60f;
+            [JsonProperty("UseSmokeGrenades")] public bool UseSmokeGrenades { get; set; } = true;
+        }
+
+        /// <summary>
+        /// Patrol helicopter combat and AI convars.
+        /// Applied on startup and config reload.
+        /// </summary>
+        public class PatrolHeliCombatConfig
+        {
+            [JsonProperty("ApplyOnStartup")] public bool ApplyOnStartup { get; set; } = true;
+            /// <summary>Gun spread cone in degrees. Higher = less accurate. Default 2.</summary>
+            [JsonProperty("BulletAccuracy")] public float BulletAccuracy { get; set; } = 2f;
+            /// <summary>Damage multiplier for heli bullets. 1 = normal.</summary>
+            [JsonProperty("BulletDamageScale")] public float BulletDamageScale { get; set; } = 1f;
+            /// <summary>Number of active gun hardpoints. 0 disables guns.</summary>
+            [JsonProperty("Guns")] public int Guns { get; set; } = 1;
+            /// <summary>Fraction of max health at which the heli flees. Default 0.35.</summary>
+            [JsonProperty("FleeDamagePercentage")] public float FleeDamagePercentage { get; set; } = 0.35f;
         }
 
         public class AttackHeliSpawnConfig
@@ -13506,7 +13629,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                     MaxIntervalMinutes = 540,
                     Weight = 0.55f,
                     AnnounceMinutesBefore = 4
-                }
+                },
             };
         }
 
@@ -13707,6 +13830,26 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                     changed = true;
                     Puts("[Events] Soft-added AirfieldChinook event definition (stealable CH47)");
                 }
+
+            }
+
+            // ShorePatrol removed. Force off so a leftover config entry does not fire.
+            if (config.Events != null)
+            {
+                for (int i = config.Events.Count - 1; i >= 0; i--)
+                {
+                    var evt = config.Events[i];
+                    if (evt == null || string.IsNullOrEmpty(evt.Type)) continue;
+                    string t = evt.Type.Trim();
+                    if (t.Equals("ShorePatrol", StringComparison.OrdinalIgnoreCase)
+                        || t.Equals("ScientistBoats", StringComparison.OrdinalIgnoreCase)
+                        || t.Equals("PtBoat", StringComparison.OrdinalIgnoreCase))
+                    {
+                        config.Events.RemoveAt(i);
+                        changed = true;
+                        Puts("[Events] Removed ShorePatrol event definition");
+                    }
+                }
             }
 
             // Hot air balloons: despawn-only — never event-spawn (force off even if config Enabled)
@@ -13774,6 +13917,18 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
             if (config.BradleyPatrol == null)
             {
                 config.BradleyPatrol = new BradleyPatrolConfig();
+                changed = true;
+            }
+
+            if (config.BradleyCombat == null)
+            {
+                config.BradleyCombat = new BradleyCombatConfig();
+                changed = true;
+            }
+
+            if (config.PatrolHeliCombat == null)
+            {
+                config.PatrolHeliCombat = new PatrolHeliCombatConfig();
                 changed = true;
             }
 
@@ -13916,7 +14071,7 @@ private List<Vector3> BuildGroundPatrolRoute(string preferMonumentFragment, int 
                 ["NameRailPatrol"] = "Rail Patrol",
                 ["NamePeacekeepers"] = "Peacekeeper Patrol",
                 ["NameBaseRaid"] = "Base Raid Squad",
-                ["NameAirfieldChinook"] = "Airfield Chinook"
+                ["NameAirfieldChinook"] = "Airfield Chinook",
             }, this);
         }
 
