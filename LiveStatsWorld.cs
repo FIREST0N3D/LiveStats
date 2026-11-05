@@ -9,8 +9,8 @@ using Rust;
 
 namespace Oxide.Plugins
 {
-    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.72")]
-    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.72: cargo pins oceanlevel to 0 immediately and logs the pre-hold level.")]
+    [Info("LiveStatsWorld", "FiREST0N3D", "1.1.73")]
+    [Description("World time, real date, moon phases, polar handling, real-solar atmosphere, Open-Meteo weather extension for LiveStats. Requires LiveStats. CONFLICTS when enabled: other time/weather plugins (TimeOfDay, RealTime, Weather), event managers that spawn on time jumps. TimeSystem + UseLocalWeather default OFF. Catch-up event suppress is opt-in. v1.1.73: ocean_scale from wind + biome fog knobs driven by cold/low-vis.")]
     class LiveStatsWorld : RustPlugin
     {
         private enum CloudSwapPhase
@@ -102,6 +102,61 @@ namespace Oxide.Plugins
             public float targetMoonMesh = 1f, currentMoonMesh = 1f;
             public float targetReflection = 1f, currentReflection = 1f;
 
+            // Ocean wave scale (Beaufort 0-10). -1 = vanilla owns it.
+            public float targetOceanScale = -1f, currentOceanScale = -1f;
+            public float appliedOceanScale = float.NaN;
+
+            // Biome fog overrides. -1 = leave to vanilla for that channel.
+            public float targetArcticFogRampStart = -1f, currentArcticFogRampStart = -1f;
+            public float appliedArcticFogRampStart = float.NaN;
+            public float targetArcticFogRampEnd = -1f, currentArcticFogRampEnd = -1f;
+            public float appliedArcticFogRampEnd = float.NaN;
+            public float targetArcticFogAmbientMult = -1f, currentArcticFogAmbientMult = -1f;
+            public float appliedArcticFogAmbientMult = float.NaN;
+            public float targetArcticFogLightBoost = -1f, currentArcticFogLightBoost = -1f;
+            public float appliedArcticFogLightBoost = float.NaN;
+
+            public float targetTundraFogRampStart = -1f, currentTundraFogRampStart = -1f;
+            public float appliedTundraFogRampStart = float.NaN;
+            public float targetTundraFogRampEnd = -1f, currentTundraFogRampEnd = -1f;
+            public float appliedTundraFogRampEnd = float.NaN;
+            public float targetTundraFogAmbientMult = -1f, currentTundraFogAmbientMult = -1f;
+            public float appliedTundraFogAmbientMult = float.NaN;
+            public float targetTundraFogLightBoost = -1f, currentTundraFogLightBoost = -1f;
+            public float appliedTundraFogLightBoost = float.NaN;
+
+            public float targetAridFogRampStart = -1f, currentAridFogRampStart = -1f;
+            public float appliedAridFogRampStart = float.NaN;
+            public float targetAridFogRampEnd = -1f, currentAridFogRampEnd = -1f;
+            public float appliedAridFogRampEnd = float.NaN;
+            public float targetAridFogAmbientMult = -1f, currentAridFogAmbientMult = -1f;
+            public float appliedAridFogAmbientMult = float.NaN;
+            public float targetAridFogLightBoost = -1f, currentAridFogLightBoost = -1f;
+            public float appliedAridFogLightBoost = float.NaN;
+
+            public float targetTemperateFogRampStart = -1f, currentTemperateFogRampStart = -1f;
+            public float appliedTemperateFogRampStart = float.NaN;
+            public float targetTemperateFogRampEnd = -1f, currentTemperateFogRampEnd = -1f;
+            public float appliedTemperateFogRampEnd = float.NaN;
+            public float targetTemperateFogAmbientMult = -1f, currentTemperateFogAmbientMult = -1f;
+            public float appliedTemperateFogAmbientMult = float.NaN;
+            public float targetTemperateFogLightBoost = -1f, currentTemperateFogLightBoost = -1f;
+            public float appliedTemperateFogLightBoost = float.NaN;
+
+            public float targetJungleFogRampStart = -1f, currentJungleFogRampStart = -1f;
+            public float appliedJungleFogRampStart = float.NaN;
+            public float targetJungleFogRampEnd = -1f, currentJungleFogRampEnd = -1f;
+            public float appliedJungleFogRampEnd = float.NaN;
+            public float targetJungleFogAmbientMult = -1f, currentJungleFogAmbientMult = -1f;
+            public float appliedJungleFogAmbientMult = float.NaN;
+            public float targetJungleFogLightBoost = -1f, currentJungleFogLightBoost = -1f;
+            public float appliedJungleFogLightBoost = float.NaN;
+
+            public float targetBiomeFogSatMult = -1f, currentBiomeFogSatMult = -1f;
+            public float appliedBiomeFogSatMult = float.NaN;
+            public float targetBiomeFogDistCurve = -1f, currentBiomeFogDistCurve = -1f;
+            public float appliedBiomeFogDistCurve = float.NaN;
+
             public float lastOmCape = 0f, lastOmShortwave = 0f, lastOmHumidity = 50f, lastOmVisibility = 10000f;
             public bool lastOmIsDay = true;
 
@@ -156,6 +211,13 @@ namespace Oxide.Plugins
                 appliedFogMultiplier = appliedFogRampStart = appliedFogRampEnd = float.NaN;
                 appliedFogHeightFalloff = appliedThunder = appliedRainbow = float.NaN;
                 appliedWetness = appliedWetnessSnow = appliedDust = float.NaN;
+                appliedOceanScale = float.NaN;
+                appliedArcticFogRampStart = appliedArcticFogRampEnd = appliedArcticFogAmbientMult = appliedArcticFogLightBoost = float.NaN;
+                appliedTundraFogRampStart = appliedTundraFogRampEnd = appliedTundraFogAmbientMult = appliedTundraFogLightBoost = float.NaN;
+                appliedAridFogRampStart = appliedAridFogRampEnd = appliedAridFogAmbientMult = appliedAridFogLightBoost = float.NaN;
+                appliedTemperateFogRampStart = appliedTemperateFogRampEnd = appliedTemperateFogAmbientMult = appliedTemperateFogLightBoost = float.NaN;
+                appliedJungleFogRampStart = appliedJungleFogRampEnd = appliedJungleFogAmbientMult = appliedJungleFogLightBoost = float.NaN;
+                appliedBiomeFogSatMult = appliedBiomeFogDistCurve = float.NaN;
             }
         }
 
@@ -2592,6 +2654,13 @@ namespace Oxide.Plugins
             wx.targetFogRampStart = fogRampStart;
             wx.targetFogRampEnd = fogRampEnd;
             wx.targetFogHeightFalloff = fogHeightFalloff;
+
+            // Ocean wave scale from wind
+            ComputeOceanScaleTarget(windKmh);
+
+            // Biome fog knobs from temp / vis / humidity
+            ComputeBiomeFogTargets(temperature, visibilityM, humidity, fogValue);
+
             wx.targetThunder = thunderValue;
             wx.targetRainbow = rainbowValue;
             wx.targetWetness = wetnessRain;
@@ -2632,6 +2701,29 @@ namespace Oxide.Plugins
                 wx.currentFogMultiplier = wx.targetFogMultiplier;
                 wx.currentFogRampStart = wx.targetFogRampStart; wx.currentFogRampEnd = wx.targetFogRampEnd;
                 wx.currentFogHeightFalloff = wx.targetFogHeightFalloff;
+                wx.currentOceanScale = wx.targetOceanScale;
+                wx.currentArcticFogRampStart = wx.targetArcticFogRampStart;
+                wx.currentArcticFogRampEnd = wx.targetArcticFogRampEnd;
+                wx.currentArcticFogAmbientMult = wx.targetArcticFogAmbientMult;
+                wx.currentArcticFogLightBoost = wx.targetArcticFogLightBoost;
+                wx.currentTundraFogRampStart = wx.targetTundraFogRampStart;
+                wx.currentTundraFogRampEnd = wx.targetTundraFogRampEnd;
+                wx.currentTundraFogAmbientMult = wx.targetTundraFogAmbientMult;
+                wx.currentTundraFogLightBoost = wx.targetTundraFogLightBoost;
+                wx.currentAridFogRampStart = wx.targetAridFogRampStart;
+                wx.currentAridFogRampEnd = wx.targetAridFogRampEnd;
+                wx.currentAridFogAmbientMult = wx.targetAridFogAmbientMult;
+                wx.currentAridFogLightBoost = wx.targetAridFogLightBoost;
+                wx.currentTemperateFogRampStart = wx.targetTemperateFogRampStart;
+                wx.currentTemperateFogRampEnd = wx.targetTemperateFogRampEnd;
+                wx.currentTemperateFogAmbientMult = wx.targetTemperateFogAmbientMult;
+                wx.currentTemperateFogLightBoost = wx.targetTemperateFogLightBoost;
+                wx.currentJungleFogRampStart = wx.targetJungleFogRampStart;
+                wx.currentJungleFogRampEnd = wx.targetJungleFogRampEnd;
+                wx.currentJungleFogAmbientMult = wx.targetJungleFogAmbientMult;
+                wx.currentJungleFogLightBoost = wx.targetJungleFogLightBoost;
+                wx.currentBiomeFogSatMult = wx.targetBiomeFogSatMult;
+                wx.currentBiomeFogDistCurve = wx.targetBiomeFogDistCurve;
                 wx.currentThunder = wx.targetThunder; wx.currentRainbow = wx.targetRainbow; wx.currentWetness = wx.targetWetness;
                 wx.currentWetnessSnow = wx.targetWetnessSnow; wx.currentDust = wx.targetDust;
                 wx.currentRayleigh = wx.targetRayleigh; wx.currentContrast = wx.targetContrast;
@@ -3373,6 +3465,32 @@ namespace Oxide.Plugins
             wx.currentFogRampStart = Mathf.Lerp(wx.currentFogRampStart, wx.targetFogRampStart, tFog);
             wx.currentFogRampEnd = Mathf.Lerp(wx.currentFogRampEnd, wx.targetFogRampEnd, tFog);
             wx.currentFogHeightFalloff = Mathf.Lerp(wx.currentFogHeightFalloff, wx.targetFogHeightFalloff, tFog);
+
+            // Ocean scale and biome fog (-1 is a valid target that hands the channel back to vanilla)
+            wx.currentOceanScale = Mathf.Lerp(wx.currentOceanScale, wx.targetOceanScale, tMid);
+            wx.currentArcticFogRampStart = Mathf.Lerp(wx.currentArcticFogRampStart, wx.targetArcticFogRampStart, tFog);
+            wx.currentArcticFogRampEnd = Mathf.Lerp(wx.currentArcticFogRampEnd, wx.targetArcticFogRampEnd, tFog);
+            wx.currentArcticFogAmbientMult = Mathf.Lerp(wx.currentArcticFogAmbientMult, wx.targetArcticFogAmbientMult, tFog);
+            wx.currentArcticFogLightBoost = Mathf.Lerp(wx.currentArcticFogLightBoost, wx.targetArcticFogLightBoost, tFog);
+            wx.currentTundraFogRampStart = Mathf.Lerp(wx.currentTundraFogRampStart, wx.targetTundraFogRampStart, tFog);
+            wx.currentTundraFogRampEnd = Mathf.Lerp(wx.currentTundraFogRampEnd, wx.targetTundraFogRampEnd, tFog);
+            wx.currentTundraFogAmbientMult = Mathf.Lerp(wx.currentTundraFogAmbientMult, wx.targetTundraFogAmbientMult, tFog);
+            wx.currentTundraFogLightBoost = Mathf.Lerp(wx.currentTundraFogLightBoost, wx.targetTundraFogLightBoost, tFog);
+            wx.currentAridFogRampStart = Mathf.Lerp(wx.currentAridFogRampStart, wx.targetAridFogRampStart, tFog);
+            wx.currentAridFogRampEnd = Mathf.Lerp(wx.currentAridFogRampEnd, wx.targetAridFogRampEnd, tFog);
+            wx.currentAridFogAmbientMult = Mathf.Lerp(wx.currentAridFogAmbientMult, wx.targetAridFogAmbientMult, tFog);
+            wx.currentAridFogLightBoost = Mathf.Lerp(wx.currentAridFogLightBoost, wx.targetAridFogLightBoost, tFog);
+            wx.currentTemperateFogRampStart = Mathf.Lerp(wx.currentTemperateFogRampStart, wx.targetTemperateFogRampStart, tFog);
+            wx.currentTemperateFogRampEnd = Mathf.Lerp(wx.currentTemperateFogRampEnd, wx.targetTemperateFogRampEnd, tFog);
+            wx.currentTemperateFogAmbientMult = Mathf.Lerp(wx.currentTemperateFogAmbientMult, wx.targetTemperateFogAmbientMult, tFog);
+            wx.currentTemperateFogLightBoost = Mathf.Lerp(wx.currentTemperateFogLightBoost, wx.targetTemperateFogLightBoost, tFog);
+            wx.currentJungleFogRampStart = Mathf.Lerp(wx.currentJungleFogRampStart, wx.targetJungleFogRampStart, tFog);
+            wx.currentJungleFogRampEnd = Mathf.Lerp(wx.currentJungleFogRampEnd, wx.targetJungleFogRampEnd, tFog);
+            wx.currentJungleFogAmbientMult = Mathf.Lerp(wx.currentJungleFogAmbientMult, wx.targetJungleFogAmbientMult, tFog);
+            wx.currentJungleFogLightBoost = Mathf.Lerp(wx.currentJungleFogLightBoost, wx.targetJungleFogLightBoost, tFog);
+            wx.currentBiomeFogSatMult = Mathf.Lerp(wx.currentBiomeFogSatMult, wx.targetBiomeFogSatMult, tFog);
+            wx.currentBiomeFogDistCurve = Mathf.Lerp(wx.currentBiomeFogDistCurve, wx.targetBiomeFogDistCurve, tFog);
+
             float wetT = wx.targetWetness >= wx.currentWetness ? tWetUp : tWetDown;
             wx.currentWetness = Mathf.Lerp(wx.currentWetness, wx.targetWetness, wetT);
             wx.currentWetnessSnow = Mathf.Lerp(wx.currentWetnessSnow, wx.targetWetnessSnow, wetT);
@@ -3411,6 +3529,29 @@ namespace Oxide.Plugins
             SnapSettled(ref wx.currentFogRampStart, wx.targetFogRampStart, 2f);
             SnapSettled(ref wx.currentFogRampEnd, wx.targetFogRampEnd, 5f);
             SnapSettled(ref wx.currentFogHeightFalloff, wx.targetFogHeightFalloff);
+            SnapSettled(ref wx.currentOceanScale, wx.targetOceanScale);
+            SnapSettled(ref wx.currentArcticFogRampStart, wx.targetArcticFogRampStart, 2f);
+            SnapSettled(ref wx.currentArcticFogRampEnd, wx.targetArcticFogRampEnd, 5f);
+            SnapSettled(ref wx.currentArcticFogAmbientMult, wx.targetArcticFogAmbientMult);
+            SnapSettled(ref wx.currentArcticFogLightBoost, wx.targetArcticFogLightBoost);
+            SnapSettled(ref wx.currentTundraFogRampStart, wx.targetTundraFogRampStart, 2f);
+            SnapSettled(ref wx.currentTundraFogRampEnd, wx.targetTundraFogRampEnd, 5f);
+            SnapSettled(ref wx.currentTundraFogAmbientMult, wx.targetTundraFogAmbientMult);
+            SnapSettled(ref wx.currentTundraFogLightBoost, wx.targetTundraFogLightBoost);
+            SnapSettled(ref wx.currentAridFogRampStart, wx.targetAridFogRampStart, 2f);
+            SnapSettled(ref wx.currentAridFogRampEnd, wx.targetAridFogRampEnd, 5f);
+            SnapSettled(ref wx.currentAridFogAmbientMult, wx.targetAridFogAmbientMult);
+            SnapSettled(ref wx.currentAridFogLightBoost, wx.targetAridFogLightBoost);
+            SnapSettled(ref wx.currentTemperateFogRampStart, wx.targetTemperateFogRampStart, 2f);
+            SnapSettled(ref wx.currentTemperateFogRampEnd, wx.targetTemperateFogRampEnd, 5f);
+            SnapSettled(ref wx.currentTemperateFogAmbientMult, wx.targetTemperateFogAmbientMult);
+            SnapSettled(ref wx.currentTemperateFogLightBoost, wx.targetTemperateFogLightBoost);
+            SnapSettled(ref wx.currentJungleFogRampStart, wx.targetJungleFogRampStart, 2f);
+            SnapSettled(ref wx.currentJungleFogRampEnd, wx.targetJungleFogRampEnd, 5f);
+            SnapSettled(ref wx.currentJungleFogAmbientMult, wx.targetJungleFogAmbientMult);
+            SnapSettled(ref wx.currentJungleFogLightBoost, wx.targetJungleFogLightBoost);
+            SnapSettled(ref wx.currentBiomeFogSatMult, wx.targetBiomeFogSatMult);
+            SnapSettled(ref wx.currentBiomeFogDistCurve, wx.targetBiomeFogDistCurve);
             SnapSettled(ref wx.currentWetness, wx.targetWetness);
             SnapSettled(ref wx.currentWetnessSnow, wx.targetWetnessSnow);
             SnapSettled(ref wx.currentDust, wx.targetDust);
@@ -3528,6 +3669,124 @@ namespace Oxide.Plugins
         /// Atmosphere / cloud scale channels follow vanilla weather.report
         /// (Rayleigh 2, Mie 4, Size 2, Contrast 1.25). Never write -1.
         /// </summary>
+        /// <summary>
+        /// Map Open-Meteo wind to weather.ocean_scale (Beaufort-style wave height).
+        /// -1 leaves the channel to vanilla.
+        /// </summary>
+        private void ComputeOceanScaleTarget(float windKmh)
+        {
+            var os = config?.OceanScale;
+            if (os == null || !os.Enabled)
+            {
+                wx.targetOceanScale = -1f;
+                return;
+            }
+            float minW = Mathf.Max(0f, os.MinWindKmh);
+            float maxW = Mathf.Max(minW + 1f, os.MaxWindKmh);
+            float maxS = Mathf.Clamp(os.MaxScale, 1f, 10f);
+            if (windKmh < minW)
+            {
+                wx.targetOceanScale = 0f;
+                return;
+            }
+            float t = Mathf.InverseLerp(minW, maxW, windKmh);
+            wx.targetOceanScale = Mathf.Clamp(t * maxS, 0f, maxS);
+        }
+
+        /// <summary>
+        /// Drive the per-biome fog override knobs.
+        /// Cold + low visibility pushes arctic/tundra fog closer and denser.
+        /// Hot + dry pushes arid. High humidity pushes temperate/jungle.
+        /// Values of -1 leave that channel to vanilla.
+        /// </summary>
+        private void ComputeBiomeFogTargets(float temperature, float visibilityM, float humidity, float fogValue)
+        {
+            var bf = config?.BiomeFog;
+            if (bf == null || !bf.Enabled)
+            {
+                // Hand everything back to vanilla
+                wx.targetArcticFogRampStart = wx.targetArcticFogRampEnd = wx.targetArcticFogAmbientMult = wx.targetArcticFogLightBoost = -1f;
+                wx.targetTundraFogRampStart = wx.targetTundraFogRampEnd = wx.targetTundraFogAmbientMult = wx.targetTundraFogLightBoost = -1f;
+                wx.targetAridFogRampStart = wx.targetAridFogRampEnd = wx.targetAridFogAmbientMult = wx.targetAridFogLightBoost = -1f;
+                wx.targetTemperateFogRampStart = wx.targetTemperateFogRampEnd = wx.targetTemperateFogAmbientMult = wx.targetTemperateFogLightBoost = -1f;
+                wx.targetJungleFogRampStart = wx.targetJungleFogRampEnd = wx.targetJungleFogAmbientMult = wx.targetJungleFogLightBoost = -1f;
+                wx.targetBiomeFogSatMult = wx.targetBiomeFogDistCurve = -1f;
+                return;
+            }
+
+            float cold = Mathf.Clamp01(Mathf.InverseLerp(10f, -8f, temperature));
+            float lowVis = visibilityM > 0f ? Mathf.Clamp01(Mathf.InverseLerp(12000f, 400f, visibilityM)) : 0f;
+            float humid = Mathf.Clamp01(Mathf.InverseLerp(45f, 92f, humidity));
+            float hotDry = Mathf.Clamp01(Mathf.InverseLerp(22f, 34f, temperature)) * (1f - humid);
+
+            float arcticStr = Mathf.Clamp01(cold * lowVis * bf.ArcticColdVisStrength);
+            float aridStr = Mathf.Clamp01(hotDry * bf.AridHotDryStrength);
+            float humidStr = Mathf.Clamp01(humid * lowVis * bf.HumidStrength);
+
+            // Arctic / Tundra: closer, denser fog when the real location is cold and visibility is poor
+            if (arcticStr > 0.15f)
+            {
+                wx.targetArcticFogRampStart = Mathf.Lerp(90f, 18f, arcticStr);
+                wx.targetArcticFogRampEnd = Mathf.Lerp(700f, 140f, arcticStr);
+                wx.targetArcticFogAmbientMult = Mathf.Lerp(1.05f, 1.75f, arcticStr);
+                wx.targetArcticFogLightBoost = Mathf.Lerp(1.0f, 0.55f, arcticStr);
+
+                wx.targetTundraFogRampStart = Mathf.Lerp(100f, 25f, arcticStr);
+                wx.targetTundraFogRampEnd = Mathf.Lerp(750f, 180f, arcticStr);
+                wx.targetTundraFogAmbientMult = Mathf.Lerp(1.0f, 1.6f, arcticStr);
+                wx.targetTundraFogLightBoost = Mathf.Lerp(1.0f, 0.65f, arcticStr);
+            }
+            else
+            {
+                wx.targetArcticFogRampStart = wx.targetArcticFogRampEnd = wx.targetArcticFogAmbientMult = wx.targetArcticFogLightBoost = -1f;
+                wx.targetTundraFogRampStart = wx.targetTundraFogRampEnd = wx.targetTundraFogAmbientMult = wx.targetTundraFogLightBoost = -1f;
+            }
+
+            // Arid: light dust-haze when hot and dry
+            if (aridStr > 0.2f)
+            {
+                wx.targetAridFogRampStart = Mathf.Lerp(200f, 60f, aridStr);
+                wx.targetAridFogRampEnd = Mathf.Lerp(1200f, 400f, aridStr);
+                wx.targetAridFogAmbientMult = Mathf.Lerp(0.9f, 1.3f, aridStr);
+                wx.targetAridFogLightBoost = Mathf.Lerp(1.1f, 0.85f, aridStr);
+            }
+            else
+            {
+                wx.targetAridFogRampStart = wx.targetAridFogRampEnd = wx.targetAridFogAmbientMult = wx.targetAridFogLightBoost = -1f;
+            }
+
+            // Temperate / Jungle: thicker when humid and visibility is reduced
+            if (humidStr > 0.2f)
+            {
+                wx.targetTemperateFogRampStart = Mathf.Lerp(120f, 40f, humidStr);
+                wx.targetTemperateFogRampEnd = Mathf.Lerp(900f, 300f, humidStr);
+                wx.targetTemperateFogAmbientMult = Mathf.Lerp(1.0f, 1.4f, humidStr);
+                wx.targetTemperateFogLightBoost = Mathf.Lerp(1.0f, 0.75f, humidStr);
+
+                wx.targetJungleFogRampStart = Mathf.Lerp(80f, 25f, humidStr);
+                wx.targetJungleFogRampEnd = Mathf.Lerp(600f, 180f, humidStr);
+                wx.targetJungleFogAmbientMult = Mathf.Lerp(1.05f, 1.55f, humidStr);
+                wx.targetJungleFogLightBoost = Mathf.Lerp(0.95f, 0.6f, humidStr);
+            }
+            else
+            {
+                wx.targetTemperateFogRampStart = wx.targetTemperateFogRampEnd = wx.targetTemperateFogAmbientMult = wx.targetTemperateFogLightBoost = -1f;
+                wx.targetJungleFogRampStart = wx.targetJungleFogRampEnd = wx.targetJungleFogAmbientMult = wx.targetJungleFogLightBoost = -1f;
+            }
+
+            // Global biome fog tweaks when any significant fog is present
+            if (fogValue > 0.25f || lowVis > 0.4f)
+            {
+                float g = Mathf.Max(fogValue, lowVis * 0.7f);
+                wx.targetBiomeFogSatMult = Mathf.Lerp(1.0f, 0.75f, g);
+                wx.targetBiomeFogDistCurve = Mathf.Lerp(1.0f, 0.6f, g);
+            }
+            else
+            {
+                wx.targetBiomeFogSatMult = wx.targetBiomeFogDistCurve = -1f;
+            }
+        }
+
         private void ClampWeatherTargets()
         {
             wx.targetRain = Mathf.Clamp01(wx.targetRain);
@@ -3630,6 +3889,39 @@ namespace Oxide.Plugins
             SetWeatherConvar("weather.atmosphere_fog_ramp_start_distance", wx.currentFogRampStart, ref wx.appliedFogRampStart, 2f, "F0");
             SetWeatherConvar("weather.atmosphere_fog_ramp_end_distance", wx.currentFogRampEnd, ref wx.appliedFogRampEnd, 5f, "F0");
             SetWeatherConvar("weather.atmosphere_fog_height_falloff", wx.currentFogHeightFalloff, ref wx.appliedFogHeightFalloff, eps);
+
+            // Ocean wave scale (Beaufort). -1 hands it back to vanilla.
+            SetWeatherConvar("weather.ocean_scale", wx.currentOceanScale, ref wx.appliedOceanScale, 0.05f, "F1");
+
+            // Biome fog overrides. -1 leaves the channel to vanilla.
+            SetWeatherConvar("weather.arctic_fog_ramp_start", wx.currentArcticFogRampStart, ref wx.appliedArcticFogRampStart, 2f, "F0");
+            SetWeatherConvar("weather.arctic_fog_ramp_end", wx.currentArcticFogRampEnd, ref wx.appliedArcticFogRampEnd, 5f, "F0");
+            SetWeatherConvar("weather.arctic_fog_ambient_intensity_mult", wx.currentArcticFogAmbientMult, ref wx.appliedArcticFogAmbientMult, eps);
+            SetWeatherConvar("weather.arctic_fog_light_boost_mult", wx.currentArcticFogLightBoost, ref wx.appliedArcticFogLightBoost, eps);
+
+            SetWeatherConvar("weather.tundra_fog_ramp_start", wx.currentTundraFogRampStart, ref wx.appliedTundraFogRampStart, 2f, "F0");
+            SetWeatherConvar("weather.tundra_fog_ramp_end", wx.currentTundraFogRampEnd, ref wx.appliedTundraFogRampEnd, 5f, "F0");
+            SetWeatherConvar("weather.tundra_fog_ambient_intensity_mult", wx.currentTundraFogAmbientMult, ref wx.appliedTundraFogAmbientMult, eps);
+            SetWeatherConvar("weather.tundra_fog_light_boost_mult", wx.currentTundraFogLightBoost, ref wx.appliedTundraFogLightBoost, eps);
+
+            SetWeatherConvar("weather.arid_fog_ramp_start", wx.currentAridFogRampStart, ref wx.appliedAridFogRampStart, 2f, "F0");
+            SetWeatherConvar("weather.arid_fog_ramp_end", wx.currentAridFogRampEnd, ref wx.appliedAridFogRampEnd, 5f, "F0");
+            SetWeatherConvar("weather.arid_fog_ambient_intensity_mult", wx.currentAridFogAmbientMult, ref wx.appliedAridFogAmbientMult, eps);
+            SetWeatherConvar("weather.arid_fog_light_boost_mult", wx.currentAridFogLightBoost, ref wx.appliedAridFogLightBoost, eps);
+
+            SetWeatherConvar("weather.temperate_fog_ramp_start", wx.currentTemperateFogRampStart, ref wx.appliedTemperateFogRampStart, 2f, "F0");
+            SetWeatherConvar("weather.temperate_fog_ramp_end", wx.currentTemperateFogRampEnd, ref wx.appliedTemperateFogRampEnd, 5f, "F0");
+            SetWeatherConvar("weather.temperate_fog_ambient_intensity_mult", wx.currentTemperateFogAmbientMult, ref wx.appliedTemperateFogAmbientMult, eps);
+            SetWeatherConvar("weather.temperate_fog_light_boost_mult", wx.currentTemperateFogLightBoost, ref wx.appliedTemperateFogLightBoost, eps);
+
+            SetWeatherConvar("weather.jungle_fog_ramp_start", wx.currentJungleFogRampStart, ref wx.appliedJungleFogRampStart, 2f, "F0");
+            SetWeatherConvar("weather.jungle_fog_ramp_end", wx.currentJungleFogRampEnd, ref wx.appliedJungleFogRampEnd, 5f, "F0");
+            SetWeatherConvar("weather.jungle_fog_ambient_intensity_mult", wx.currentJungleFogAmbientMult, ref wx.appliedJungleFogAmbientMult, eps);
+            SetWeatherConvar("weather.jungle_fog_light_boost_mult", wx.currentJungleFogLightBoost, ref wx.appliedJungleFogLightBoost, eps);
+
+            SetWeatherConvar("weather.biome_fog_ambient_saturation_mult", wx.currentBiomeFogSatMult, ref wx.appliedBiomeFogSatMult, eps);
+            SetWeatherConvar("weather.biome_fog_distance_curve", wx.currentBiomeFogDistCurve, ref wx.appliedBiomeFogDistCurve, eps);
+
             SetWeatherConvar("weather.cloud_coverage", wx.currentClouds, ref wx.appliedClouds, eps);
             SetWeatherConvar("weather.cloud_opacity", wx.currentCloudOpacity, ref wx.appliedCloudOpacity, eps);
             SetWeatherConvar("weather.cloud_attenuation", wx.currentAttenuation, ref wx.appliedAttenuation, eps);
@@ -4846,6 +5138,8 @@ namespace Oxide.Plugins
             [JsonProperty("QuietWeatherConvars")] public bool QuietWeatherConvars { get; set; } = false;
 
             [JsonProperty("Lighting")] public WeatherLightingConfig Lighting { get; set; } = new WeatherLightingConfig();
+            [JsonProperty("OceanScale")] public OceanScaleConfig OceanScale { get; set; } = new OceanScaleConfig();
+            [JsonProperty("BiomeFog")] public BiomeFogConfig BiomeFog { get; set; } = new BiomeFogConfig();
 
             [JsonProperty("TimeSystem")] public TimeSystemConfig TimeSystem { get; set; } = new TimeSystemConfig();
             [JsonProperty("Tide")] public TideConfig Tide { get; set; } = new TideConfig();
@@ -4915,6 +5209,29 @@ namespace Oxide.Plugins
             [JsonProperty("RateBlendHours")] public float RateBlendHours { get; set; } = 0.75f;
             /// <summary>Snap Cycle.Hour back when it drifts this many game hours from the mapped lock.</summary>
             [JsonProperty("HourDriftCorrection")] public float HourDriftCorrection { get; set; } = 0.04f;
+        }
+
+        public class OceanScaleConfig
+        {
+            /// <summary>Drive weather.ocean_scale from Open-Meteo wind/gusts (Beaufort-style 0-10). -1 leaves it to vanilla when disabled.</summary>
+            [JsonProperty("Enabled")] public bool Enabled { get; set; } = true;
+            /// <summary>Wind speed (km/h) that maps to MaxScale. Below MinWindKmh stays calm.</summary>
+            [JsonProperty("MaxWindKmh")] public float MaxWindKmh { get; set; } = 90f;
+            [JsonProperty("MinWindKmh")] public float MinWindKmh { get; set; } = 8f;
+            /// <summary>Maximum Beaufort-like value written (0-10).</summary>
+            [JsonProperty("MaxScale")] public float MaxScale { get; set; } = 8f;
+        }
+
+        public class BiomeFogConfig
+        {
+            /// <summary>Drive the per-biome fog override knobs from temperature, visibility and humidity. -1 leaves a channel to vanilla.</summary>
+            [JsonProperty("Enabled")] public bool Enabled { get; set; } = true;
+            /// <summary>How strongly cold + low-vis conditions push arctic/tundra fog closer and denser.</summary>
+            [JsonProperty("ArcticColdVisStrength")] public float ArcticColdVisStrength { get; set; } = 1.0f;
+            /// <summary>How strongly hot+dry conditions push arid fog.</summary>
+            [JsonProperty("AridHotDryStrength")] public float AridHotDryStrength { get; set; } = 0.8f;
+            /// <summary>How strongly humid conditions push temperate/jungle fog.</summary>
+            [JsonProperty("HumidStrength")] public float HumidStrength { get; set; } = 0.7f;
         }
 
         public class WeatherLightingConfig
@@ -5150,6 +5467,16 @@ namespace Oxide.Plugins
             if (config.Lighting == null)
             {
                 config.Lighting = new WeatherLightingConfig();
+                changed = true;
+            }
+            if (config.OceanScale == null)
+            {
+                config.OceanScale = new OceanScaleConfig();
+                changed = true;
+            }
+            if (config.BiomeFog == null)
+            {
+                config.BiomeFog = new BiomeFogConfig();
                 changed = true;
             }
 
